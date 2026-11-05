@@ -43,7 +43,7 @@ blindly.
 | **An agent you can audit** | Every run is checkpointed step by step. You can pause on a tool call, inspect the exact arguments, approve or reject it, and resume the same run. |
 | **Memory with provenance** | A memory is a claim plus evidence plus a scope. Nothing is silently learned: candidates are reviewed, profile versions keep history, and deletions redact old snapshots. |
 | **A real desktop product** | Frameless window, native file dialogs, workspace folders on disk, NSIS installer, offline data directory, DPAPI-encrypted provider keys. |
-| **Built to be maintained** | Strict layering, deterministic prompt assembly, 221 automated tests, production asset audit, and design notes kept next to the code. |
+| **Built to be maintained** | Strict layering, deterministic prompt assembly, 221 automated tests, production asset audit, and bilingual architecture/API documentation. |
 
 ## Features
 
@@ -166,7 +166,7 @@ npm run production:audit                  # packaged-asset allowlist audit
 ## Roadmap
 
 - [ ] Memory planner graph: scheduled consolidation, summarization, decay and
-  forgetting, automatic profile projection (design notes in progress).
+  forgetting and automatic profile projection.
 - [ ] Richer memory retrieval (optional embeddings, hybrid ranking).
 - [ ] More providers and prompt-cache telemetry in the UI.
 
