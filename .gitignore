@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venv*/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+!.env.example
+core/data/
+node_modules/
+.npm-cache/
+*.tsbuildinfo
+web/release/
+
+# local virtualenv copies and Vite dependency cache
+.vite/
+
+# local-only working material: audit notes, evidence, design drafts, QA captures
+_internal/
+.analysis/
+.publish-docs/
+
+# derived preview rasters
+architecture/*.png
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini

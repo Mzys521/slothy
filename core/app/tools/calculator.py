@@ -1,0 +1,112 @@
+"""浮点计算与字符串金额计算。 / Floating-point arithmetic and string-based money arithmetic."""
+
+import math
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, DecimalException, localcontext
+from typing import Literal
+
+
+def calculate(
+    operation: Literal["add", "subtract", "multiply", "divide", "power", "sqrt"],
+    a: float,
+    b: float | None = None,
+) -> float:
+    """普通运算始终返回 float，不用于金额。 / General arithmetic returns float, never for money.
+
+    Args:
+        operation: 加、减、乘、除、幂或平方根。 / Arithmetic operation or square root.
+        a: 有限浮点数，第一个操作数。 / Finite floating-point first operand.
+        b: 二元运算的第二个有限浮点数；sqrt 不传。 / Second operand, omitted for sqrt.
+    """
+    if type(a) not in (int, float) or not math.isfinite(a):
+        raise ValueError("a 必须是有限浮点数 / must be a finite float")
+    a = float(a)
+    if operation == "sqrt":
+        if b is not None or a < 0:
+            raise ValueError("sqrt 只接受一个非负数 / requires one nonnegative operand")
+        return math.sqrt(a)
+    if type(b) not in (int, float) or not math.isfinite(b):
+        raise ValueError("b 必须是有限浮点数 / must be a finite float")
+    b = float(b)
+    try:
+        match operation:
+            case "add":
+                result = a + b
+            case "subtract":
+                result = a - b
+            case "multiply":
+                result = a * b
+            case "divide":
+                if b == 0:
+                    raise ValueError("除数不能为零 / division by zero")
+                result = a / b
+            case "power":
+                result = math.pow(a, b)
+            case _:
+                raise ValueError("不支持的运算 / unsupported operation")
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise ValueError("计算超出浮点范围 / floating-point range exceeded") from exc
+    if not math.isfinite(result):
+        raise ValueError("计算结果必须有限 / result must be finite")
+    return float(result)
+
+
+def calculate_financial(
+    operation: Literal["add", "subtract", "multiply", "divide"],
+    a: str,
+    b: str,
+    decimal_places: int = 2,
+    rounding: Literal["half_up", "half_even"] = "half_up",
+) -> str:
+    """金额和记账只用字符串输入输出。 / Money/bookkeeping use string inputs and outputs only.
+
+    Args:
+        operation: 加、减、乘、除。 / Add, subtract, multiply or divide.
+        a: 十进制字符串，禁止 float，例如 "0.10"。 / Decimal string, never a float.
+        b: 第二个十进制字符串，例如 "0.20"。 / Second decimal string.
+        decimal_places: 结果小数位数，0～28，默认 2。 / Output decimal places, from 0 to 28.
+        rounding: 四舍五入或半偶数舍入。 / Half-up or half-even rounding.
+    """
+    if not isinstance(a, str) or not isinstance(b, str):
+        raise ValueError("金额必须使用字符串 / financial operands must be strings")
+    if type(decimal_places) is not int or not 0 <= decimal_places <= 28:
+        raise ValueError("小数位数必须为 0～28 / decimal_places must be from 0 to 28")
+    if rounding not in ("half_up", "half_even"):
+        raise ValueError("不支持的舍入方式 / unsupported rounding mode")
+    try:
+        operands = []
+        for value in (a, b):
+            if not value.strip() or len(value) > 128:
+                raise ValueError("金额字符串为空或过长 / financial string is empty or too long")
+            number = Decimal(value.strip())
+            if (
+                not number.is_finite()
+                or len(number.as_tuple().digits) > 80
+                or abs(number.as_tuple().exponent) > 80
+            ):
+                raise ValueError("金额超出支持范围 / financial value is outside supported bounds")
+            operands.append(number)
+        left, right = operands
+        # 中文：足够容纳受限输入的中间结果，只在最后按明确规则舍入。
+        # English: Keep bounded intermediate values precise and round only the final result.
+        with localcontext() as context:
+            context.prec = 512
+            context.rounding = ROUND_HALF_UP if rounding == "half_up" else ROUND_HALF_EVEN
+            match operation:
+                case "add":
+                    result = left + right
+                case "subtract":
+                    result = left - right
+                case "multiply":
+                    result = left * right
+                case "divide":
+                    if right == 0:
+                        raise ValueError("除数不能为零 / division by zero")
+                    result = left / right
+                case _:
+                    raise ValueError("不支持的金额运算 / unsupported financial operation")
+            result = result.quantize(Decimal(1).scaleb(-decimal_places))
+            if result.is_zero():
+                result = abs(result)
+            return format(result, f".{decimal_places}f")
+    except DecimalException as exc:
+        raise ValueError("无效十进制金额 / invalid decimal financial value") from exc

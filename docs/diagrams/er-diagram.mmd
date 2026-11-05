@@ -1,0 +1,13 @@
+erDiagram
+  USERS ||--o{ THREADS : has
+  USERS ||--o{ MESSAGES : writes
+  USERS ||--o{ MEMORY_ITEMS : owns
+  USERS ||--|| USER_PROFILES : has
+  USERS ||--o{ USER_PROFILE_VERSIONS : versions
+  THREADS ||--o{ MESSAGES : contains
+  MEMORY_ITEMS ||--o{ MEMORY_EVIDENCE : supported_by
+  MESSAGES ||--o{ MEMORY_EVIDENCE : source_of
+  USERS ||--o{ RETRIEVAL_LOGS : generates
+  USERS ||--o{ INTERACTION_EVENTS : produces
+  USERS ||--o{ MEMORY_FEEDBACK : gives
+  MEMORY_ITEMS ||--o| MEMORY_EMBEDDING_REFS : indexed_by

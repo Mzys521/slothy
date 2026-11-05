@@ -1,0 +1,22 @@
+sequenceDiagram
+  participant User
+  participant UI
+  participant API as FastAPI
+  participant Graph as LangGraph
+  participant Profile
+  participant Memory
+  participant LLM
+  User->>UI: 输入消息
+  UI->>API: POST /chat
+  API->>Graph: invoke
+  Graph->>Profile: load_profile(user_id)
+  Profile-->>Graph: profile snapshot
+  Graph->>Memory: retrieve(query, user_id)
+  Memory-->>Graph: relevant memories
+  Graph->>Graph: build personalized context
+  Graph->>LLM: prompt + user request
+  LLM-->>Graph: response
+  Graph-->>API: final response
+  API-->>UI: HTTP response
+  UI-->>User: 展示回答
+  API-->>Memory: enqueue memory update (async)

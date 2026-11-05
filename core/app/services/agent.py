@@ -1,0 +1,211 @@
+"""持久化 Agent 的新请求、流式执行和恢复。 / Durable agent requests, streaming and recovery."""
+
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Any, Literal
+
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, StateSnapshot
+
+from app.agent.activity import run_activity
+from app.agent.graph import AgentState, build_graph_config, create_initial_state
+from app.agent.graph.review import ApprovalPolicy, pending_review
+from app.agent.metrics import run_metrics
+from app.config import AgentSettings
+from app.conversations import ConversationTurn, ConversationWriter
+
+
+class AgentRunner:
+    """应用启动时创建一个 Runner。 / Create one runner per application process.
+
+    Args:
+        graph: 已注入 Checkpointer 的在线图。 / Online graph with an injected checkpointer.
+        settings: 调用默认值，不包含具体存储实现。 / Invocation defaults, independent of storage.
+        conversation_writer: 可选的会话归档。 / Optional conversation archive.
+
+    中文：同一 Runner 内按用户/线程串行，SQLite 连接由外部生命周期管理。
+    English: Serialize each user/thread within this runner; external code owns SQLite resources.
+    """
+
+    def __init__(
+        self,
+        graph: CompiledStateGraph,
+        settings: AgentSettings | None = None,
+        *,
+        conversation_writer: ConversationWriter | None = None,
+    ) -> None:
+        if graph.checkpointer is None:
+            raise ValueError("AgentRunner requires a graph with a checkpointer")
+        self.graph = graph
+        self.settings = settings if settings is not None else AgentSettings()
+        self.conversation_writer = conversation_writer
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    async def _archive_completed(self, snapshot: StateSnapshot) -> None:
+        """snapshot：已保存状态，仅归档完成轮次。 / Saved state; archive completed turns only."""
+        if self.conversation_writer is None or snapshot.next or not snapshot.values.get("response"):
+            return
+        values = snapshot.values
+        await self.conversation_writer.save_turn(
+            ConversationTurn(
+                values["user_id"],
+                values["thread_id"],
+                values["run_id"],
+                values["user_input"],
+                values["response"],
+                learn_memory=values.get("personalization_enabled", False),
+                project_id=values.get("project_id"),
+                attachment_ids=tuple(values.get("attachment_ids", ())),
+                activity=tuple(run_activity(values)),
+                metrics=run_metrics(values),
+                used_memory_ids=tuple(values.get("used_memory_ids", ())),
+                profile_version=values.get("profile_version"),
+            )
+        )
+
+    async def ainvoke(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        message: str | None = None,
+        run_id: str | None = None,
+        project_id: str | None = None,
+        personalization_enabled: bool | None = None,
+    ) -> AgentState:
+        """消费状态流并返回最终状态。 / Consume state streaming and return the final state.
+
+        Args:
+            user_id: 已认证的用户 ID。 / Authenticated user ID.
+            thread_id: 业务线程 ID。 / Business conversation ID.
+            message: 新请求；None 表示恢复未完成执行。 / New request, or None to resume.
+            run_id: 新执行 ID，None 时生成；恢复时不传。 / New run ID; omitted when resuming.
+            project_id: 新请求项目作用域。 / Project scope for a new request.
+            personalization_enabled: 新请求的个性化开关。 / New request personalization gate.
+        """
+        result = None
+        async for event in self.astream(
+            user_id=user_id,
+            thread_id=thread_id,
+            message=message,
+            run_id=run_id,
+            project_id=project_id,
+            personalization_enabled=personalization_enabled,
+            stream_mode="values",
+        ):
+            result = event
+        if result is None or not result.get("response"):
+            raise RuntimeError("Agent execution has not produced a completed response")
+        return result
+
+    async def astream(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        message: str | None = None,
+        run_id: str | None = None,
+        project_id: str | None = None,
+        personalization_enabled: bool | None = None,
+        approval_policy: ApprovalPolicy | None = None,
+        attachment_ids: list[str] | None = None,
+        model_selection: dict | None = None,
+        decision: tuple[str, bool] | None = None,
+        stream_mode: Literal["values", "updates", "messages", "custom"]
+        | list[Literal["values", "updates", "messages", "custom"]] = "values",
+    ) -> AsyncIterator[Any]:
+        """新请求或恢复，同步提交快照。 / Stream a new/resumed run with synchronous durability.
+
+        Args:
+            user_id: 已认证的用户 ID。 / Authenticated user ID.
+            thread_id: 业务线程 ID。 / Business thread ID.
+            message: 新请求；None 只恢复已保存输入。 / New request; None uses pending saved input.
+            run_id: 新请求执行 ID，不复用保留历史中的 ID。 / Fresh ID, absent from retained history.
+            project_id: 新请求项目，恢复时沿用保存值。 / New project, or stored project on recovery.
+            personalization_enabled: 新请求开关，恢复时不传。 / New request gate; omit on resume.
+            stream_mode: 状态、更新或消息流。 / State values, node updates or model messages.
+        """
+        config = build_graph_config({"user_id": user_id, "thread_id": thread_id}, self.settings)
+        user_id, thread_id = user_id.strip(), thread_id.strip()
+        if isinstance(run_id, str):
+            run_id = run_id.strip()
+        key = config["configurable"]["thread_id"]
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            snapshot = await self.graph.aget_state(config)
+            if snapshot.values and (
+                snapshot.values.get("user_id") != user_id
+                or snapshot.values.get("thread_id") != thread_id
+            ):
+                raise ValueError("Checkpoint identity does not match this request")
+            # 中文：先补写上一轮，避免快照完成后因退出或写入失败留下归档缺口。
+            # English: Repair a missing archive entry before a newer run advances the checkpoint.
+            await self._archive_completed(snapshot)
+            if message is None:
+                if (
+                    run_id is not None
+                    or project_id is not None
+                    or personalization_enabled is not None
+                    or approval_policy is not None
+                    or attachment_ids is not None
+                    or model_selection is not None
+                ):
+                    raise ValueError(
+                        "Resume preserves saved inputs; do not supply request overrides"
+                    )
+                if not snapshot.values or not snapshot.next:
+                    raise ValueError("No unfinished run exists for this user/thread")
+                config = build_graph_config(snapshot.values, self.settings)
+                review = pending_review(snapshot)
+                if review is None and decision is None and not snapshot.interrupts:
+                    state = None
+                elif (
+                    review is not None
+                    and decision is not None
+                    and decision[0] == review["approval_id"]
+                ):
+                    state = Command(resume={decision[0]: decision[1]})
+                else:
+                    raise ValueError("A matching explicit decision is required to resume review")
+            else:
+                if decision is not None:
+                    raise ValueError("A review decision cannot accompany a new message")
+                if snapshot.next:
+                    raise RuntimeError(
+                        "An unfinished run exists; resume before sending a new request"
+                    )
+                if run_id is not None and (
+                    snapshot.values.get("run_id") == run_id
+                    or any(
+                        message.id == f"{run_id}:user"
+                        for message in snapshot.values.get("messages", [])
+                    )
+                    or (
+                        self.conversation_writer is not None
+                        and await self.conversation_writer.has_turn(
+                            user_id=user_id, thread_id=thread_id, run_id=run_id
+                        )
+                    )
+                ):
+                    raise ValueError("This run_id is already completed; use a new run_id")
+                state = create_initial_state(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    user_input=message,
+                    run_id=run_id,
+                    project_id=project_id,
+                    personalization_enabled=personalization_enabled,
+                    attachment_ids=attachment_ids,
+                    settings=self.settings,
+                )
+                state["approval_policy"] = approval_policy or "ask"
+                state["model_selection"] = model_selection or {}
+                config = build_graph_config(state, self.settings)
+            # 中文：等当前步快照落盘后再前进，避免响应完成后快照仍留在异步写队列中。
+            # English: Commit each step before advancing rather than leave writes queued at return.
+            async for event in self.graph.astream(
+                state, config, stream_mode=stream_mode, durability="sync"
+            ):
+                yield event
+            if self.conversation_writer is not None:
+                await self._archive_completed(await self.graph.aget_state(config))

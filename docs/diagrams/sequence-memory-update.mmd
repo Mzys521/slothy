@@ -1,0 +1,19 @@
+sequenceDiagram
+  participant App
+  participant Observer
+  participant Extractor
+  participant Validator
+  participant MemoryRepo
+  participant ProfileBuilder
+  participant DB
+  App->>Observer: enqueue interaction
+  Observer->>Extractor: extract candidates
+  Extractor-->>Observer: candidate list
+  Observer->>Validator: validate and classify
+  Validator-->>Observer: validated candidates
+  Observer->>MemoryRepo: upsert memory and evidence
+  MemoryRepo->>DB: transaction commit
+  Observer->>ProfileBuilder: update profile
+  ProfileBuilder->>DB: read latest profile
+  ProfileBuilder->>DB: write next version
+  DB-->>ProfileBuilder: committed version

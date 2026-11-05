@@ -1,0 +1,122 @@
+{
+  "method": "offline serialized request common-prefix bytes, not provider cache billing",
+  "turns": 20,
+  "after_turn_10_mean_prefix_share": 0.9162,
+  "provider_cache_read_tokens": null,
+  "requests": [
+    {
+      "turn": 2,
+      "input_bytes": 4742,
+      "stable_prefix_bytes": 3204,
+      "stable_prefix_share": 0.6757
+    },
+    {
+      "turn": 3,
+      "input_bytes": 5843,
+      "stable_prefix_bytes": 4305,
+      "stable_prefix_share": 0.7368
+    },
+    {
+      "turn": 4,
+      "input_bytes": 6944,
+      "stable_prefix_bytes": 5406,
+      "stable_prefix_share": 0.7785
+    },
+    {
+      "turn": 5,
+      "input_bytes": 8045,
+      "stable_prefix_bytes": 6507,
+      "stable_prefix_share": 0.8088
+    },
+    {
+      "turn": 6,
+      "input_bytes": 9146,
+      "stable_prefix_bytes": 7608,
+      "stable_prefix_share": 0.8318
+    },
+    {
+      "turn": 7,
+      "input_bytes": 10247,
+      "stable_prefix_bytes": 8709,
+      "stable_prefix_share": 0.8499
+    },
+    {
+      "turn": 8,
+      "input_bytes": 11348,
+      "stable_prefix_bytes": 9810,
+      "stable_prefix_share": 0.8645
+    },
+    {
+      "turn": 9,
+      "input_bytes": 12449,
+      "stable_prefix_bytes": 10911,
+      "stable_prefix_share": 0.8765
+    },
+    {
+      "turn": 10,
+      "input_bytes": 13553,
+      "stable_prefix_bytes": 12012,
+      "stable_prefix_share": 0.8863
+    },
+    {
+      "turn": 11,
+      "input_bytes": 14655,
+      "stable_prefix_bytes": 13113,
+      "stable_prefix_share": 0.8948
+    },
+    {
+      "turn": 12,
+      "input_bytes": 15757,
+      "stable_prefix_bytes": 14215,
+      "stable_prefix_share": 0.9021
+    },
+    {
+      "turn": 13,
+      "input_bytes": 16859,
+      "stable_prefix_bytes": 15317,
+      "stable_prefix_share": 0.9085
+    },
+    {
+      "turn": 14,
+      "input_bytes": 17961,
+      "stable_prefix_bytes": 16419,
+      "stable_prefix_share": 0.9141
+    },
+    {
+      "turn": 15,
+      "input_bytes": 19063,
+      "stable_prefix_bytes": 17521,
+      "stable_prefix_share": 0.9191
+    },
+    {
+      "turn": 16,
+      "input_bytes": 20165,
+      "stable_prefix_bytes": 18623,
+      "stable_prefix_share": 0.9235
+    },
+    {
+      "turn": 17,
+      "input_bytes": 21267,
+      "stable_prefix_bytes": 19725,
+      "stable_prefix_share": 0.9275
+    },
+    {
+      "turn": 18,
+      "input_bytes": 22369,
+      "stable_prefix_bytes": 20827,
+      "stable_prefix_share": 0.9311
+    },
+    {
+      "turn": 19,
+      "input_bytes": 23471,
+      "stable_prefix_bytes": 21929,
+      "stable_prefix_share": 0.9343
+    },
+    {
+      "turn": 20,
+      "input_bytes": 24573,
+      "stable_prefix_bytes": 23031,
+      "stable_prefix_share": 0.9372
+    }
+  ]
+}

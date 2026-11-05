@@ -1,0 +1,22 @@
+flowchart TB
+  U[User] --> UI[Web / Desktop UI]
+  UI --> API[FastAPI]
+  API --> LG[LangGraph Runtime]
+  subgraph Online[Online Inference]
+    LG --> LP[Load Profile]
+    LP --> MR[Retrieve Memories]
+    MR --> CB[Build Personalized Context]
+    CB --> AN[Agent / LLM]
+    AN --> RESP[Response]
+  end
+  subgraph Evolution[Memory Evolution]
+    RESP --> OBS[Interaction Observer]
+    OBS --> EX[Memory Extractor]
+    EX --> VAL[Validator]
+    VAL --> MU[Memory Updater]
+    MU --> DB[(SQLite WAL)]
+    MU --> PB[Profile Builder]
+    PB --> DB
+  end
+  DB --> LP
+  DB --> MR
