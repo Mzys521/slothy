@@ -10,7 +10,7 @@ import desktop from '../desktop.config.cjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 
-export async function createSmokeBackend() {
+export async function createSmokeBackend({ firstRun = false } = {}) {
   const png = await readFile(path.join(root, 'electron/assets/icon.png'))
   const backend = createServer(async (request, response) => {
     if (request.headers.origin && request.headers.origin !== desktop.apiRequestOrigin) {
@@ -37,7 +37,7 @@ export async function createSmokeBackend() {
       if (request.url?.startsWith('/api/v1/workspaces')) body = { items: [{ id: 'personal', name: 'Personal workspace' }] }
       if (request.url?.startsWith('/api/v1/threads')) body = { items: [], next_offset: null }
       if (request.url === '/api/v1/models') body = { items: [], default: null }
-      if (request.url === '/api/v1/settings/providers') body = { items: [], templates: [], setup_required: false }
+      if (request.url === '/api/v1/settings/providers') body = { items: [], templates: [], setup_required: firstRun }
       if (request.url === '/api/v1/account') body = { display_name: null, handle: null, avatar_version: null }
       response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body))
     }
@@ -47,8 +47,8 @@ export async function createSmokeBackend() {
   return { backend, origin }
 }
 
-export async function runSmoke({ devServer, backend: testBackend } = {}) {
-  const { backend, origin } = testBackend || await createSmokeBackend()
+export async function runSmoke({ devServer, backend: testBackend, firstRun = false } = {}) {
+  const { backend, origin } = testBackend || await createSmokeBackend({ firstRun })
   const userData = await mkdtemp(path.join(tmpdir(), 'slothy-electron-'))
   const env = {
     ...process.env,
@@ -134,7 +134,7 @@ export async function runSmoke({ devServer, backend: testBackend } = {}) {
     let result
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
-        result = await evaluate('(' + verifyRenderer.toString() + ')(' + JSON.stringify(apiBase) + ')')
+        result = await evaluate('(' + verifyRenderer.toString() + ')(' + JSON.stringify(apiBase) + ',' + JSON.stringify(firstRun) + ')')
         break
       } catch (error) {
         if (!/Execution context was destroyed|Cannot find context/.test(error.message) || attempt === 4) throw error
@@ -146,7 +146,7 @@ export async function runSmoke({ devServer, backend: testBackend } = {}) {
     assert.equal(result.platform, process.platform)
     assert.ok(result.info.version)
     const manifest = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'))
-    assert.equal(result.info.version, manifest.version)
+    assert.equal(result.info.version, manifest.displayVersion || manifest.version)
     assert.equal(result.info.name, desktop.productName)
     assert.ok(result.hasVue)
     assert.ok(result.directoryPicker)
@@ -154,9 +154,18 @@ export async function runSmoke({ devServer, backend: testBackend } = {}) {
     assert.equal(result.upload, 6)
     assert.ok(result.streaming)
     assert.ok(result.isolatedFrame)
+    assert.equal(result.onboarding, firstRun)
+    assert.equal(result.backgroundInert, firstRun)
+    assert.equal(result.titlebarControls, 3)
+    if (firstRun) {
+      assert.equal(result.onboardingTop, 40)
+      assert.ok(result.focusInOnboarding)
+      assert.ok(result.cardFits)
+      assert.notEqual(result.hash, '#settings/api')
+    }
     if (!devServer) assert.equal(result.avatarWidth, 512)
     console.log('Desktop smoke passed:', devServer ? 'Vite development' : 'dist/index.html')
-    console.log('Verified Vue, preload whitelist, renderer/frame isolation, JSON API, binary upload, SSE and avatar loading.')
+    console.log('Verified Vue, preload whitelist, renderer/frame isolation, JSON API, binary upload, SSE, avatar loading and ' + (firstRun ? 'first-run overlay below native window controls.' : 'configured startup without onboarding.'))
   } finally {
     clearTimeout(timeout)
     socket?.close()
@@ -171,7 +180,7 @@ export async function runSmoke({ devServer, backend: testBackend } = {}) {
   }
 }
 
-async function verifyRenderer(base) {
+async function verifyRenderer(base, firstRun) {
   for (let attempt = 0; attempt < 100 && (
     !window.desktop || document.readyState !== 'complete' ||
     !document.querySelector('#app')?.children.length
@@ -179,6 +188,10 @@ async function verifyRenderer(base) {
     await new Promise(resolve => setTimeout(resolve, 50))
   }
   const info = await window.desktop.getAppInfo()
+  for (let attempt = 0; attempt < 100 && (document.querySelector('.configuration-startup') ||
+    firstRun && !document.querySelector('[data-testid="onboarding-overlay"]')); attempt++) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
   const response = await fetch(base + '/api/v1/desktop-smoke')
   const json = (await response.json()).ok
   const uploaded = await fetch(base + '/api/v1/desktop-smoke/upload', {
@@ -218,6 +231,13 @@ async function verifyRenderer(base) {
     document.body.append(iframe)
   })
   return {
+    onboarding: Boolean(document.querySelector('[data-testid="onboarding-overlay"]')),
+    backgroundInert: document.querySelector('.app-shell')?.inert ?? false,
+    titlebarControls: document.querySelectorAll('.desktop-window-controls button').length,
+    onboardingTop: document.querySelector('.onboarding-overlay')?.getBoundingClientRect().top,
+    focusInOnboarding: document.querySelector('.onboarding-card')?.contains(document.activeElement),
+    cardFits: (() => { const rect = document.querySelector('.onboarding-card')?.getBoundingClientRect(); return Boolean(rect && rect.top >= 40 && rect.bottom <= innerHeight && rect.left >= 0 && rect.right <= innerWidth) })(),
+    hash: location.hash,
     node: typeof window.require, process: typeof window.process,
     directoryPicker: typeof window.desktop.selectDirectory === 'function',
     platform: window.desktop.platform, info,
@@ -229,7 +249,7 @@ async function verifyRenderer(base) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  runSmoke().catch(error => {
+  runSmoke().then(() => runSmoke({ firstRun: true })).catch(error => {
     console.error(error)
     process.exitCode = 1
   })

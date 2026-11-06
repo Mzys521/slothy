@@ -408,6 +408,10 @@ class AgentNodes:
             reference_update.update(refreshed)
             state = {**state, **refreshed}
         messages: list[AnyMessage] = []
+        if self.services.skill_reader:
+            skills = self.services.skill_reader()
+            if skills:
+                messages.append(reference("skill_reference", {"skills": skills}))
         if state.get("attachment_ids"):
             if self.services.attachment_reader is None:
                 raise ValueError("Attachment reader is unavailable")

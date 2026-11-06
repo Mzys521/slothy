@@ -27,7 +27,7 @@ const months = computed(() => {
 function tokenLabel(tokens: number | null, partial = false) {
   return (partial && tokens != null ? '≥ ' : '') + formatTokenCount(tokens) + ' tokens'
 }
-function dayLabel(day: ActivityCell) { return day.date + ' · ' + tokenLabel(day.tokens) }
+function dayLabel(day: ActivityCell) { return day.date + ' · ' + tokenLabel(day.tokens, (day.unreported ?? 0) > 0) }
 function weekTitle(week: ActivityWeek) {
   return view.value === 'cumulative' ? t('Through ', '截至 ') + week.end : week.date + ' – ' + week.end
 }
@@ -38,7 +38,7 @@ function show(event: Event, key: string, title: string, tokens: number | null, p
     x: Math.max(120, Math.min(window.innerWidth - 120, rect.left + rect.width / 2)),
     y: below ? rect.bottom + 10 : rect.top - 10 }
 }
-function showDay(event: Event, day: ActivityCell) { if (!day.future) show(event, day.date, day.date, day.tokens) }
+function showDay(event: Event, day: ActivityCell) { if (!day.future) show(event, day.date, day.date, day.tokens, (day.unreported ?? 0) > 0) }
 function showBar(event: Event, bar: ActivityWeek) { show(event, bar.date, weekTitle(bar), bar.tokens, bar.partial) }
 function hideTooltip() { tooltip.value = undefined }
 function moveDay(event: KeyboardEvent, index: number) {

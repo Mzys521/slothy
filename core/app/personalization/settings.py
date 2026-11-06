@@ -1,4 +1,4 @@
-"""Public configuration contract for the proposed memory planner."""
+"""Public configuration and actual capabilities of the memory learning engine."""
 
 from typing import Literal
 
@@ -29,9 +29,16 @@ class MemoryConfiguration(BaseModel):
 
 
 class MemoryRuntime(BaseModel):
-    engine: Literal["rule_review"] = "rule_review"
-    planner_available: Literal[False] = False
+    engine: Literal["rule_review", "llm_learning"] = "rule_review"
+    planner_available: bool = False
     personalization_enabled: bool
+    model_available: bool = False
+    effective_model: str | None = None
+    mode: Literal["off", "shadow", "auto", "review"] = "auto"
+    applied_fields: list[str] = Field(default_factory=list)
+    reported_tokens: int = 0
+    estimated_tokens: int = 0
+    budgeted_tokens: int = 0
 
 
 class MemoryConfigurationPublic(BaseModel):

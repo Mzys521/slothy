@@ -16,7 +16,7 @@ const apiProxy: ProxyOptions = {
 
 export default defineConfig({
   base: './',
-  define: { __APP_VERSION__: JSON.stringify(metadata.version) },
+  define: { __APP_VERSION__: JSON.stringify(metadata.displayVersion || metadata.version) },
   plugins: [
     vue(),
     tailwindcss(),

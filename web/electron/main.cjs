@@ -1,9 +1,10 @@
-const { app, BrowserWindow, dialog, ipcMain, net, screen, session, shell } = require('electron')
+const { app, BrowserWindow, clipboard, dialog, ipcMain, net, screen, session, shell } = require('electron')
 const path = require('node:path')
 const { fileURLToPath } = require('node:url')
 const { startBackend, stopBackend } = require('./backend.cjs')
 const { selectWorkingDirectory } = require('./directory.cjs')
 const desktop = require('../desktop.config.cjs')
+const { displayVersion } = require('../package.json')
 
 const distDirectory = path.join(__dirname, '..', 'dist')
 const indexFile = path.join(distDirectory, 'index.html')
@@ -178,7 +179,7 @@ app.whenReady().then(async () => {
   configureProductionRequests()
   ipcMain.handle('desktop:get-app-info', event => {
     if (!isAppFrame(event.senderFrame)) throw new Error('Untrusted IPC sender.')
-    return { name: desktop.productName, version: app.getVersion(), platform: process.platform }
+    return { name: desktop.productName, version: displayVersion || app.getVersion(), platform: process.platform }
   })
   const fromWindow = event => {
     if (!isAppFrame(event.senderFrame)) throw new Error('Untrusted IPC sender.')
@@ -195,6 +196,11 @@ app.whenReady().then(async () => {
   ipcMain.handle('desktop:close', event => { fromWindow(event)?.close() })
   ipcMain.handle('desktop:select-directory', async event => {
     return selectWorkingDirectory(dialog, fromWindow(event))
+  })
+  ipcMain.handle('desktop:write-clipboard', (event, text) => {
+    fromWindow(event)
+    if (typeof text !== 'string' || text.length > 2_000_000) throw new Error('Invalid clipboard text.')
+    clipboard.writeText(text)
   })
   await createWindow()
   app.on('activate', () => {

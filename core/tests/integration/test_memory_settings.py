@@ -6,9 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
-from app.api import create_app
 from app.config import CheckpointSettings, MemorySettings
 from app.personalization.settings import MemoryConfiguration
+from tests.support.legacy_app import create_app
 
 PATH = "/api/v1/settings/memory"
 
@@ -44,7 +44,10 @@ def test_configuration_roundtrip_conflict_restart_and_legacy_gate(tmp_path):
         assert initial["revision"] == 0
         assert initial["configuration"] == initial["defaults"]
         assert len(initial["configuration"]) == 13
-        assert initial["runtime"] == {
+        assert {
+            key: initial["runtime"][key]
+            for key in ("engine", "planner_available", "personalization_enabled")
+        } == {
             "engine": "rule_review",
             "planner_available": False,
             "personalization_enabled": True,

@@ -312,6 +312,7 @@ class MemoryEvolution:
         self.conversations = conversations
         self.db = store.connection
         self.lock = asyncio.Lock()
+        self.planner = None
 
     async def rows(self, sql: str, args: tuple = ()) -> list[dict]:
         async with self.db.execute(sql, args) as cursor:
@@ -336,6 +337,9 @@ class MemoryEvolution:
                     await self.store.prune_profile_history(row["user_id"])
         except Exception:
             logger.exception("Could not reconcile existing memory metadata")
+        if self.planner is not None:
+            await self.planner.run()
+            return
         while True:
             try:
                 for job in await self.conversations.learning_jobs():
@@ -349,6 +353,9 @@ class MemoryEvolution:
             await asyncio.sleep(1)
 
     async def process(self, job: tuple):
+        if self.planner is not None:
+            await self.planner.process_jobs([job])
+            return
         row_id, user, thread, run, quote, project, recorded_at = job
         candidates = extract_claims(quote, thread, project, recorded_at, run)
         if candidates:
@@ -475,7 +482,9 @@ class MemoryEvolution:
                     "scope_ref": claim["scope_ref"],
                     "source": "conversation",
                     "type": memory_type,
-                    "importance": 0.7,
+                    "importance": claim.get("importance")
+                    if claim.get("importance") is not None
+                    else 0.7,
                 },
             )
         await self.db.execute(
@@ -633,6 +642,11 @@ class MemoryEvolution:
                 return {"status": claim["status"], "memory_id": claim["memory_id"]}
             if action == "ignore":
                 await self.db.execute(
+                    "INSERT OR IGNORE INTO memory_learning_exclusions "
+                    "SELECT ?,thread_id,run_id FROM memory_evidence WHERE claim_id=?",
+                    (user, claim_id),
+                )
+                await self.db.execute(
                     "UPDATE memory_claims SET status='ignored' WHERE id=?", (claim_id,)
                 )
                 return {"status": "ignored", "memory_id": None}
@@ -658,10 +672,11 @@ class MemoryEvolution:
     async def receipts(self, user: str, thread: str, run: str):
         async with self.lock:
             items = await self.rows(
-                """SELECT m.id, m.title, m.scope, m.type FROM workspace_memories m
+                """SELECT DISTINCT m.id, m.title, m.scope, m.type FROM workspace_memories m
                    JOIN memory_claims c ON c.memory_id=m.id
                    JOIN memory_evidence e ON e.claim_id=c.id
-                   WHERE c.user_id=? AND e.thread_id=? AND e.run_id=? AND e.source='remember'
+                   WHERE c.user_id=? AND e.thread_id=? AND e.run_id=?
+                     AND (e.source='remember' OR c.learned_by='llm')
                      AND c.status='confirmed' AND m.status='active'""",
                 (user, thread, run),
             )
@@ -675,6 +690,13 @@ class MemoryEvolution:
     async def edit_memory(self, user: str, memory_id: str, values: dict):
         async with self.transaction():
             result = await self.store.update_memory(user, memory_id, values)
+            if result and values.get("status") == "archived":
+                await self.db.execute(
+                    "INSERT OR IGNORE INTO memory_learning_exclusions "
+                    "SELECT ?,e.thread_id,e.run_id FROM memory_evidence e JOIN memory_claims c "
+                    "ON c.id=e.claim_id WHERE c.user_id=? AND c.memory_id=?",
+                    (user, user, memory_id),
+                )
             claims = await self.rows(
                 "SELECT * FROM memory_claims WHERE user_id=? AND memory_id=?", (user, memory_id)
             )
@@ -687,6 +709,12 @@ class MemoryEvolution:
 
     async def delete_memory(self, user: str, memory_id: str):
         async with self.transaction():
+            await self.db.execute(
+                """INSERT OR IGNORE INTO memory_learning_exclusions
+                   SELECT ?,e.thread_id,e.run_id FROM memory_evidence e JOIN memory_claims c
+                   ON c.id=e.claim_id WHERE c.user_id=? AND c.memory_id=?""",
+                (user, user, memory_id),
+            )
             await self.db.execute(
                 """DELETE FROM memory_evidence WHERE claim_id IN (
                    SELECT id FROM memory_claims WHERE user_id=? AND memory_id=?)""",
@@ -724,6 +752,13 @@ class MemoryEvolution:
     async def forget_thread(self, user: str, thread: str, delete_source: Callable[[], Awaitable]):
         async with self.transaction():
             await self.conversations.discard_thread_learning(user, thread)
+            await self.db.execute(
+                "DELETE FROM memory_learning_turns WHERE user_id=? AND thread_id=?", (user, thread)
+            )
+            await self.db.execute(
+                "DELETE FROM memory_learning_exclusions WHERE user_id=? AND thread_id=?",
+                (user, thread),
+            )
             await self.db.execute(
                 """DELETE FROM memory_evidence WHERE thread_id=? AND claim_id IN (
                    SELECT id FROM memory_claims WHERE user_id=?)""",

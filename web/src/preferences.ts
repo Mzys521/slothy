@@ -1,4 +1,5 @@
 import { computed, reactive, watch } from 'vue'
+import { DEFAULT_ACCENT, customAccentTokens, normalizeAccent, savedPalette } from './appearance'
 
 export function readLocal<T>(key: string, fallback: T): T {
   try {
@@ -19,6 +20,7 @@ export function writeLocal(key: string, value: unknown) {
 const saved = readLocal<Partial<{
   mode: string
   palette: string
+  customAccent: string
   font: string
   language: string
   personalizedMemory: boolean
@@ -29,9 +31,10 @@ export const settings = reactive({
   language: saved.language ?? 'zh-CN',
   personalizedMemory: saved.personalizedMemory ?? readLocal('adaptive.useMemory', true),
   mode: saved.appearanceVersion ? saved.mode ?? 'dark' : 'dark',
-  palette: saved.appearanceVersion === 2 && (saved.palette === 'slate' || saved.palette === 'neutral') ? saved.palette : 'copper',
+  palette: savedPalette(saved.palette),
+  customAccent: normalizeAccent(saved.customAccent) ?? DEFAULT_ACCENT,
   font: saved.font === 'geist' || saved.font === 'serif' ? saved.font : 'system',
-  appearanceVersion: 2,
+  appearanceVersion: 3,
 })
 
 export const zh = computed(() => settings.language === 'zh-CN')
@@ -43,5 +46,6 @@ watch(settings, () => {
   root.dataset.palette = settings.palette
   root.dataset.font = settings.font
   root.lang = settings.language
+  for (const [token, value] of Object.entries(customAccentTokens(settings.customAccent))) root.style.setProperty(token, value)
   writeLocal('adaptive.preferences', settings)
 }, { immediate: true })

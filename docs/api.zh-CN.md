@@ -46,6 +46,16 @@
 
 ## 4. 记忆、画像与图谱
 
+默认后台 LLM 自动判断并沉淀有证据的持久信息。`/settings/memory` 的 `runtime`
+返回实际 `engine=llm_learning`、模型可用性、有效模式、已生效字段、今日已上报与估计用量。
+`auto/review/shadow/off`、模型、批量、置信度、观察来源、有效记忆上限和每日预算立即参与后续批次；
+遗忘/TTL/保留与定期整合字段仍为预配置，不触发自动永久删除。
+
+`/memory-learning` 增加 `engine`、`mode`、`dead`、`last_error`。模型不可用、坏 JSON、
+证据不符和预算耗尽返回真实的持久化任务状态，不伪造画像；可通过重新分析恢复死信。
+`/account/activity` 包含已上报的后台模型消费，新增 `memory_tokens` 与 `unreported_calls`；
+每日数据的 `unreported` 标记缺失报告，前端以 ≥ 显示已知下界。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/memory-learning` | 学习状态：总数/待处理/已处理/失败、待确认数、画像版本 |
@@ -176,3 +186,20 @@ curl "http://127.0.0.1:8000/api/v1/profile/versions?limit=20"
   永远不会被当作授权凭据。
 - SSE 没有心跳与重连协议；连接断开即结束流，运行仍可从检查点恢复。
 - 附件限制：单文件 2 MiB，单会话 24 MiB。
+
+## 9. 连接器
+
+| 方法 | 路径 | 请求 | 成功响应 |
+| --- | --- | --- | --- |
+| GET | `/connectors` | 无 | `200 {items: Connector[]}` |
+| POST | `/connectors/import?kind=local\|mcp\|skill&filename=...` | `application/octet-stream` 原始文件 | `201 {items: Connector[]}`，默认关闭 |
+| PATCH | `/connectors/{id}` | `{enabled: boolean}`，不接受字符串布尔值 | `200 Connector` |
+| DELETE | `/connectors/{id}` | 无，仅可移除导入项 | `204` |
+
+Connector 字段为 `id, kind, name, description, enabled, builtin, tools, transport, file_count`；不公开命令配置、环境变量、headers、凭证或解压路径。
+
+本地工具支持 JSON 或含 `tool.json` 的 ZIP：`{name,description,command,args,input_schema}`。程序在当前工作目录运行，以 JSON stdin/stdout 通信；ZIP 中 `${plugin}` 指向清单目录。需预先安装解释器和依赖。MCP 接受标准 `{mcpServers:{name:{command,args,env}}}` 或 `{mcpServers:{name:{url,type,headers}}}`，HTTP type 为 `streamable-http` 或旧 `sse`。Skill ZIP 包含一个 `SKILL.md` 及参考文件，启用后按需注入，`read_skill_file(skill_id,path,offset=0)` 每次返回 8,000 字符与 `next_offset`；导入/启用不会执行脚本。
+
+新增项默认关闭。MCP 开启时真实连接获取工具，失败保持原状态；关闭再开启可刷新定义。每个导入工具在聊天和工作模式均受审批约束；禁用撤销旧调用，定义改变会改变工具标识。凭证由 Windows DPAPI 保护。
+
+错误沿用 `{code,message,request_id}`：404 `CONNECTOR_NOT_FOUND`；409 `CONNECTOR_EXISTS`；413 `CONNECTOR_TOO_LARGE`；422 `CONNECTOR_INVALID` / `CONNECTOR_LIMIT` / `VALIDATION_ERROR`；502 `CONNECTOR_CONNECTION_FAILED`。最大上传 10 MiB、解压 20 MiB / 512 项、64 个导入项、64 个同时启用的导入工具；Skill 最多启用 8 个、指导合计 64,000 字符。

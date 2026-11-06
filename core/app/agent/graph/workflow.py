@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -72,11 +73,27 @@ def build_agent_graph(
     builder.add_edge("load_profile", "retrieve_memories")
     builder.add_edge("retrieve_memories", "build_personalized_context")
     builder.add_edge("build_personalized_context", "agent")
-    if selected_tools:
+    # Keep approval nodes available to reject/resume a pending call after a connector
+    # is disabled. The current ToolNode returns an error for removed capabilities.
+    if selected_tools or require_tool_review:
+
+        async def observe_enabled_tool(request, execute):
+            async def enabled_execute(call):
+                if services.tool_enabled and not services.tool_enabled(call.tool_call["name"]):
+                    return ToolMessage(
+                        content="This tool has been disabled in Connectors.",
+                        tool_call_id=call.tool_call["id"],
+                        name=call.tool_call["name"],
+                        status="error",
+                    )
+                return await execute(call)
+
+            return await observe_tool(request, enabled_execute)
+
         tool_node = ToolNode(
             selected_tools,
             handle_tool_errors="工具执行失败。 / Tool execution failed.",
-            awrap_tool_call=observe_tool,
+            awrap_tool_call=observe_enabled_tool,
         )
         if require_tool_review:
             if checkpointer is None:

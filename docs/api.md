@@ -49,6 +49,19 @@ the port is assigned at startup.
 
 ## 4. Memory, profile and graph
 
+The default background LLM evaluates and saves eligible evidence-backed information.
+`/settings/memory.runtime` reports `engine=llm_learning`, model availability, effective
+mode, applied fields, and daily reported/estimated usage. Mode, model, batch size,
+confidence, corroborating conversations, active limit and daily budget affect subsequent
+batches. Decay/TTL/retention and scheduled consolidation remain reserved, with no
+automatic permanent deletion.
+
+`/memory-learning` adds `engine`, `mode`, `dead` and `last_error`. Unavailable models,
+invalid JSON, rejected evidence and exhausted budgets stay observable; no fake profile
+is returned. Reanalysis can retry dead letters. `/account/activity` includes reported
+background consumption and adds `memory_tokens` and `unreported_calls`; daily
+`unreported` counts keep partial totals explicit in the UI.
+
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/memory-learning` | learning status: total/pending/processed/failed, suggestions, profile version |
@@ -186,3 +199,20 @@ process.
 - SSE has no heartbeat or retry protocol; a dropped connection ends the stream,
   and the run remains resumable from its checkpoint.
 - Attachment upload limit: 2 MiB per file, 24 MiB per thread.
+
+## 9. Connectors
+
+| Method | Path | Request | Success |
+| --- | --- | --- | --- |
+| GET | `/connectors` | None | `200 {items: Connector[]}` |
+| POST | `/connectors/import?kind=local\|mcp\|skill&filename=...` | Binary `application/octet-stream` | `201 {items: Connector[]}`, initially disabled |
+| PATCH | `/connectors/{id}` | Strict `{enabled: boolean}` | `200 Connector` |
+| DELETE | `/connectors/{id}` | Imported items only | `204` |
+
+Public fields: `id, kind, name, description, enabled, builtin, tools, transport, file_count`. Configuration, credentials, environment variables, headers and extracted paths are never included.
+
+Local tools accept JSON, or ZIP with `tool.json`: `{name,description,command,args,input_schema}`. The command uses JSON stdin/stdout, the active workspace as cwd and `${plugin}` for its bundle directory; interpreters and dependencies must already be installed. MCP accepts standard `mcpServers` JSON with stdio `command,args,env` or HTTP `url,type,headers` (`streamable-http` / legacy `sse`). Enabling discovers tools through the real connection; failure preserves the previous state. Toggle off/on to refresh definitions.
+
+Skills accept ZIP with exactly one SKILL.md and reference files. Enabled instructions are low-trust L3 reference data. `read_skill_file(skill_id,path,offset=0)` pages UTF-8 references, 8,000 characters with `next_offset`. Importing/enabling never runs bundled scripts. Imported tools in both Chat and Work require approval; disabling revokes execution, and changed definitions change their tool identifiers. Windows uses DPAPI to protect the saved configuration.
+
+Errors retain `{code,message,request_id}`: 404 `CONNECTOR_NOT_FOUND`, 409 `CONNECTOR_EXISTS`, 413 `CONNECTOR_TOO_LARGE`, 422 `CONNECTOR_INVALID` / `CONNECTOR_LIMIT` / `VALIDATION_ERROR`, 502 `CONNECTOR_CONNECTION_FAILED`. Limits: 10 MiB import, 20 MiB / 512 extracted entries, 64 imported items and 64 enabled imported tools; 8 enabled skills with 64,000 instruction characters combined.

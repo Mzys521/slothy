@@ -40,6 +40,15 @@ class WorkspaceStore:
     def __init__(self, connection: aiosqlite.Connection):
         self.connection = connection
 
+    async def learning_usage(self, user: str):
+        async with self.connection.execute(
+            "SELECT created_at,total_tokens FROM memory_learning_usage "
+            "WHERE user_id=? ORDER BY created_at,id",
+            (user,),
+        ) as rows:
+            async for row in rows:
+                yield tuple(row)
+
     @classmethod
     @asynccontextmanager
     async def open(cls, path: Path, timeout: float) -> AsyncIterator["WorkspaceStore"]:
@@ -115,6 +124,23 @@ class WorkspaceStore:
                 );
                 CREATE INDEX IF NOT EXISTS memory_evidence_turn
                     ON memory_evidence(thread_id, run_id);
+                CREATE TABLE IF NOT EXISTS memory_learning_turns (
+                    user_id TEXT NOT NULL, thread_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL, outcome TEXT NOT NULL,
+                    PRIMARY KEY(user_id,thread_id,run_id,generation)
+                );
+                CREATE TABLE IF NOT EXISTS memory_learning_exclusions (
+                    user_id TEXT NOT NULL, thread_id TEXT NOT NULL, run_id TEXT NOT NULL,
+                    PRIMARY KEY(user_id,thread_id,run_id)
+                );
+                CREATE TABLE IF NOT EXISTS memory_learning_usage (
+                    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, day TEXT NOT NULL,
+                    model TEXT, reserved_tokens INTEGER NOT NULL,
+                    input_tokens INTEGER, output_tokens INTEGER, total_tokens INTEGER,
+                    state TEXT NOT NULL DEFAULT 'reserved', error TEXT,
+                    created_at TEXT NOT NULL DEFAULT ({NOW})
+                );
+                CREATE INDEX IF NOT EXISTS memory_usage_day ON memory_learning_usage(user_id,day);
                 CREATE TABLE IF NOT EXISTS memory_meta (
                     user_id TEXT PRIMARY KEY, memory_index_version INTEGER NOT NULL DEFAULT 0
                 );
@@ -185,6 +211,19 @@ class WorkspaceStore:
                 columns = {row[1] async for row in rows}
             if "recorded_at" not in columns:
                 await connection.execute("ALTER TABLE memory_evidence ADD COLUMN recorded_at TEXT")
+            async with connection.execute("PRAGMA table_info(memory_claims)") as rows:
+                claim_columns = {row[1] async for row in rows}
+            for name, declaration in (
+                ("confidence", "REAL"),
+                ("importance", "REAL"),
+                ("learned_by", "TEXT"),
+                ("sensitivity", "TEXT"),
+                ("last_source_at", "TEXT"),
+            ):
+                if name not in claim_columns:
+                    await connection.execute(
+                        f"ALTER TABLE memory_claims ADD COLUMN {name} {declaration}"
+                    )
             # Retrieval also reads claim keys and evidence dates. All writers share these triggers.
             for table in ("memory_claims", "memory_evidence"):
                 for event in ("INSERT", "UPDATE", "DELETE"):

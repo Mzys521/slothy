@@ -51,6 +51,8 @@ from app.config import (
     PromptSettings,
     ToolSettings,
 )
+from app.connectors.api import router as connectors_router
+from app.connectors.registry import ConnectorRegistry
 from app.infrastructure.checkpoints import SQLiteCheckpointStore
 from app.infrastructure.conversations import SQLiteConversationStore
 from app.infrastructure.directories import WorkspaceDirectories
@@ -62,6 +64,7 @@ from app.infrastructure.workspace import (
     BoundedWorkspaceContext,
     WorkspaceStore,
 )
+from app.memory.learning import MemoryLearner
 from app.personalization.evolution import SENSITIVE, MemoryEvolution
 from app.personalization.settings import (
     MemoryConfiguration,
@@ -476,6 +479,10 @@ class LearningStatus(BaseModel):
     suggestions: int
     observed: int
     profile_version: int
+    dead: int = 0
+    last_error: str | None = None
+    engine: str = "rule_review"
+    mode: str = "review"
 
 
 def problem(status: int, code: str, message: str) -> HTTPException:
@@ -621,7 +628,12 @@ async def memory_settings_result(request: Request) -> MemoryConfigurationPublic:
         configuration=MemoryConfiguration.model_validate(saved[1]) if saved else defaults,
         defaults=defaults,
         runtime=MemoryRuntime(
-            personalization_enabled=await store(request).personalization_enabled(LOCAL_USER)
+            personalization_enabled=await store(request).personalization_enabled(LOCAL_USER),
+            **(
+                await request.app.state.memory_evolution.planner.runtime(LOCAL_USER)
+                if request.app.state.memory_evolution.planner
+                else {}
+            ),
         ),
     )
 
@@ -645,7 +657,8 @@ async def update_memory_settings(
                 "VERSION_CONFLICT",
                 "Memory configuration changed. Reload the latest settings before saving.",
             )
-        return await memory_settings_result(request)
+    await store(request).wake_learning(LOCAL_USER)
+    return await memory_settings_result(request)
 
 
 @router.get("/account", response_model=AccountProfile)
@@ -661,7 +674,9 @@ async def update_account(request: Request, body: AccountInput):
 
 @router.get("/account/activity", response_model=AccountActivity)
 async def account_activity(request: Request):
-    return await summarize_activity(store(request).account_runs(LOCAL_USER))
+    return await summarize_activity(
+        store(request).account_runs(LOCAL_USER), workspace(request).learning_usage(LOCAL_USER)
+    )
 
 
 @router.get("/account/avatar", response_class=Response)
@@ -736,6 +751,10 @@ async def memory_learning(request: Request):
         "suggestions": counts.get("pending", 0),
         "observed": counts.get("observed", 0),
         "profile_version": (profile or {}).get("version", 0),
+        "engine": "llm_learning" if evolution.planner else "rule_review",
+        "mode": (await evolution.planner.configuration(LOCAL_USER))[1].mode
+        if evolution.planner
+        else "review",
     }
 
 
@@ -1564,6 +1583,8 @@ def create_app(
     model_provider: ModelProvider | None = None,
     work_tools: Sequence[BaseTool] | None = None,
     tool_factory: Callable[[ToolSettings], Sequence[BaseTool]] | None = None,
+    memory_model_provider: ModelProvider | None = None,
+    memory_processing: Literal["llm", "rules"] = "llm",
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -1621,6 +1642,10 @@ def create_app(
                 (*selected_tools, *create_attachment_tools(conversations)) if selected_tools else ()
             )
             chat_tools = tuple(tool for tool in work_tools_for_runner if tool.name in SAFE_TOOLS)
+            connectors = ConnectorRegistry(
+                checkpoint.sqlite_path.parent / "connectors", list(work_tools_for_runner)
+            )
+            app.state.connectors = connectors
 
             async def summarize_history(messages, previous, *, summary_provider):
                 if prompt_settings.history_summary_model:
@@ -1688,6 +1713,9 @@ def create_app(
                     if mode == "work"
                     else tuple(tool for tool in scoped_tools if tool.name in SAFE_TOOLS)
                 )
+                tools = tuple(tool for tool in tools if tool.name not in connectors.disabled)
+                # Imported tools are visible in both modes, and always require approval.
+                tools = (*tools, *connectors.tools(directory))
                 services = AgentServices(
                     model_provider=provider,
                     profile_reader=workspace_store,
@@ -1698,6 +1726,8 @@ def create_app(
                     profile_snapshot_reader=app.state.profile_snapshots,
                     history_summarizer=partial(summarize_history, summary_provider=provider),
                     prompt_observer=app.state.prompt_telemetry.observe,
+                    skill_reader=connectors.skill_references,
+                    tool_enabled=lambda name: name not in connectors.disabled,
                 )
                 graph = build_agent_graph(
                     services,
@@ -1705,7 +1735,7 @@ def create_app(
                     prompt_settings=prompt_settings,
                     checkpointer=checkpointer,
                     tools=tools,
-                    require_tool_review=bool(tools),
+                    require_tool_review=True,
                     system_prompt=BASE_SYSTEM_PROMPT
                     + tool_instructions([tool.name for tool in tools]),
                 )
@@ -1718,12 +1748,58 @@ def create_app(
                         catalog.update(configured_models())
                     catalog.update(providers.catalog())
                 runner_for.cache_clear()
+                memory_model_for.cache_clear()
                 model_name = next(iter(catalog), None)
                 app.state.model_name = model_name
                 app.state.model_items = {key: item for key, (item, _) in catalog.items()}
                 effort = catalog[model_name][0].default_effort if model_name else None
                 app.state.runner = runner_for("chat", model_name, effort)
                 app.state.work_runner = runner_for("work", model_name, effort)
+                imported_names = [tool.name for tool in connectors.tools(None)]
+                app.state.chat_tool_names = [
+                    tool.name for tool in chat_tools if tool.name not in connectors.disabled
+                ] + imported_names
+                app.state.work_tool_names = [
+                    tool.name for tool in work_tools_for_runner
+                    if tool.name not in connectors.disabled
+                ] + imported_names
+                conversations.learning_wakeup.set()
+
+            @cache
+            def memory_model_for(model_id: str | None):
+                if model_id is None and (memory_model_provider or model_provider):
+                    provider = memory_model_provider or model_provider
+                    return (
+                        "main",
+                        provider.get_chat_model(),
+                        getattr(provider, "prompt_cache_protocol", "openai"),
+                    )
+                resolved_id = model_id or app.state.model_name
+                entry = catalog.get(resolved_id)
+                if entry is None:
+                    return None
+                item, connection = entry
+                provider = (
+                    connection.build_provider(None)
+                    if isinstance(connection, ProviderConnection)
+                    else OpenAICompatibleProvider(connection, effort=None)
+                )
+                return (
+                    resolved_id,
+                    provider.get_chat_model(),
+                    getattr(provider, "prompt_cache_protocol", "openai"),
+                )
+
+            async def memory_configuration(user):
+                saved = await conversations.memory_configuration(user)
+                return (
+                    (saved[0], MemoryConfiguration.model_validate(saved[1]))
+                    if saved
+                    else (0, app.state.memory_defaults)
+                )
+
+            if memory_processing == "llm":
+                evolution.planner = MemoryLearner(evolution, memory_configuration, memory_model_for)
 
             app.state.runner_for = runner_for
             app.state.reload_models = reload_models
@@ -1811,6 +1887,7 @@ def create_app(
         )
 
     app.include_router(router, prefix="/api/v1")
+    app.include_router(connectors_router, prefix="/api/v1")
     return app
 
 

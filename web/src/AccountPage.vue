@@ -23,6 +23,8 @@ interface AccountActivity {
   reasoning_share: number | null
   distinct_tools: number
   tool_calls: number
+  memory_tokens: number
+  unreported_calls: number
 }
 const usage = ref<AccountActivity>()
 const loading = ref(false)
@@ -142,7 +144,7 @@ async function uploadAvatar(event: Event) {
     <p v-if="error" class="account-notice" role="alert">{{ error }} <button class="text-link" :disabled="loading" @click="load">{{ t('Retry', '重试') }}</button></p>
 
     <section class="account-totals" :aria-label="t('Usage overview', '用量概览')">
-      <div><strong :title="number(usage?.total_tokens)">{{ compact(usage?.total_tokens) }}</strong><span>{{ t('Total tokens', '累计 Token 数') }}</span></div>
+      <div><strong :title="number(usage?.total_tokens)">{{ usage?.unreported_calls && usage?.total_tokens != null ? '≥ ' : '' }}{{ compact(usage?.total_tokens) }}</strong><span>{{ t('Total tokens', '累计 Token 数') }}</span></div>
       <div><strong :title="number(usage?.peak_daily_tokens)">{{ compact(usage?.peak_daily_tokens) }}</strong><span>{{ t('Peak daily tokens', '每日 Token 峰值') }}</span></div>
       <div><strong>{{ duration(usage?.longest_model_seconds) }}</strong><span>{{ t('Longest model time', '最长模型耗时') }}</span></div>
       <div><strong>{{ usage ? t(usage.longest_streak + ' days', usage.longest_streak + ' 天') : '—' }}</strong><span>{{ t('Longest streak', '最长连续天数') }}</span></div>

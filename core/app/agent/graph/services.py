@@ -103,3 +103,5 @@ class AgentServices:
         Callable[[list, dict | None], Awaitable[str | HistorySummaryResult]] | None
     ) = None
     prompt_observer: Callable | None = None
+    skill_reader: Callable[[], list[dict]] | None = None
+    tool_enabled: Callable[[str], bool] | None = None

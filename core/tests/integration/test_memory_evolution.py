@@ -5,8 +5,8 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
-from app.api import create_app
 from app.config import CheckpointSettings
+from tests.support.legacy_app import create_app
 
 
 def flush_learning(client, app):

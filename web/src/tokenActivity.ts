@@ -1,4 +1,4 @@
-export interface ActivityDay { date: string; turns: number; tokens: number | null }
+export interface ActivityDay { date: string; turns: number; tokens: number | null; unreported?: number }
 export interface ActivityInput { as_of: string; daily: ActivityDay[]; prior_tokens: number }
 export interface ActivityCell extends ActivityDay { future: boolean }
 export interface ActivityWeek {
@@ -29,13 +29,13 @@ export function buildTokenActivity(input: ActivityInput) {
     const time = start + index * dayMs
     const date = new Date(time).toISOString().slice(0, 10)
     const entry = activity.get(date)
-    return { date, future: time > end, turns: entry?.turns ?? 0, tokens: entry ? entry.tokens : 0 }
+    return { date, future: time > end, turns: entry?.turns ?? 0, tokens: entry ? entry.tokens : 0, unreported: entry?.unreported ?? 0 }
   })
   const weeks: ActivityWeek[] = Array.from({ length: 53 }, (_, index) => {
     const current = days.slice(index * 7, index * 7 + 7)
     const valid = current.filter(day => !day.future)
-    const partial = valid.some(day => day.tokens == null)
-    const reported = valid.some(day => day.turns > 0 && day.tokens != null)
+    const partial = valid.some(day => day.tokens == null || (day.unreported ?? 0) > 0)
+    const reported = valid.some(day => day.tokens != null && (day.turns > 0 || day.tokens > 0))
     return { date: current[0]!.date, end: valid.at(-1)!.date, days: current, partial, reported,
       tokens: partial && !reported ? null : valid.reduce((total, day) => total + (day.tokens ?? 0), 0) }
   })

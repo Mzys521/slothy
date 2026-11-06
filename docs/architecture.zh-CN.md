@@ -45,6 +45,9 @@ Electron 主进程                        Electron 渲染进程（Vue 3）
 - 主进程监控后端进程；异常退出会提示并退出应用。安装版后端是冻结的可执行文件
   （`resources/backend/slothy-service.exe`）。
 - Python 入口（`core/desktop/entry.py`）在桌面进程消失后自动退出，不残留孤儿进程。
+- 渲染层在应用外壳之上保留首次启动引导层：仅当 `GET /api/v1/settings/providers` 返回
+  `setup_required`（尚未配置 runner）时显示，保存服务商后关闭；配置读取失败时显示重试，
+  而不是误判为“未配置”。
 
 ## 3. 后端分层
 
@@ -95,11 +98,11 @@ START → prepare_run → load_profile → retrieve_memories
 ```
 完成一轮 ──▶ 归档（sessions.sqlite）──▶ 学习队列
                                         │
-                 规则抽取（偏好/习惯/目标/事实/情景）
+                 独立 memory_learning 图：LLM 判断与原文校验
                                         ▼
                         memory_claims + memory_evidence（workspace.sqlite）
                                         │
-                     审核（确认/修改/忽略）──▶ 已确认记忆
+                     auto 自动应用 / review 审核 ──▶ 已确认记忆
                                         │
                   画像投影（偏好/习惯/目标）──▶ 画像新版本 +1
                                         │
@@ -107,6 +110,14 @@ START → prepare_run → load_profile → retrieve_memories
 ```
 
 - claim 带作用域（`global` / `project` / `thread`）、维度、尽可能稳定的主题键与证据原文。
+- `app/memory/learning.py` 是后台编排层，LLM 只输出严格 JSON，不绑定执行工具；
+  `app/personalization/evolution.py` 继续拥有确认、画像投影、删除及关系维护的领域事务。
+- 模型调用不持有写锁，不阻塞聊天；持久队列通过 Event 唤醒并在启动恢复。配置、来源、
+  版本和总开关在落库前重查；跨库完成标记防止崩溃后的重复应用。
+- 默认 auto 自动应用可信、有原话的持久信息。review 全人工确认，shadow 只评估，off 暂停；
+  推断需要跨会话佐证，敏感或不确定候选仍可审查。删除/忽略的来源不因重新分析复活。
+- 每日预算以保守上界预留并用实际 usage 结算，长批次自动拆小；后台已上报用量计入账户
+  Token 活动，不增加对话轮数，未上报显示为不完整统计。遗忘、TTL 和定期整合仍为明确标注的预配置。
 - 画像是不可变版本链；编辑使用乐观并发（`expected_version`），删除会擦除旧快照原文，只有
   内容变化才产生新版本（保留最近 200 版）。
 - 记忆关系（`shared_conversation`、手工连线）保存在同一工作区库；图谱 API 支持有向/无向
@@ -154,7 +165,23 @@ START → prepare_run → load_profile → retrieve_memories
 子进程使用 `create_subprocess_exec`（仅 argv）、最小环境白名单、合并 stderr、输出上限与超时
 终止。文档生成有策略检查，但**不是**操作系统沙箱；这是明确的设计边界。
 
-## 9. 安全模型
+## 9. 连接器
+
+连接器让工具面可扩展且无需重启应用。
+
+| 类型 | 导入格式 | 执行模型 |
+|---|---|---|
+| 本地工具 | JSON，或含 `tool.json` 的 ZIP | argv 命令、JSON stdin/stdout、工作区为 cwd、`${plugin}` 指向包目录 |
+| MCP 服务 | `mcpServers` JSON（stdio `command,args,env`；HTTP `url,type,headers`） | 通过真实连接发现（`streamable-http` 或兼容 `sse`）；调用需审批 |
+| Skills | 含唯一 `SKILL.md` 与引用文件的 ZIP | 低信任 L3 指令；`read_skill_file` 分页读取 UTF-8 引用 |
+
+导入项默认停用；启用时通过真实连接发现工具，失败保留原状态。导入工具在 Chat 与 Work 模式下都
+需要审批，停用立即撤销执行权限，定义变化会改变工具标识。配置、凭据、环境变量与解压路径永远不会
+由 API 返回；Windows 下连接器配置使用 DPAPI 保护。限制：单次导入 10 MiB、解压后 20 MiB / 512
+项、最多 64 个导入项与 64 个启用的导入工具、8 个启用 Skills（指令合计 64,000 字符）。本地工具
+与 MCP 命令所需的解释器和依赖必须已安装；导入或启用不会执行包内脚本。
+
+## 10. 安全模型
 
 | 关注点 | 控制 |
 |---|---|
@@ -165,7 +192,7 @@ START → prepare_run → load_profile → retrieve_memories
 | 数据保留 | 显式删除接口、历史画像擦除、按记忆删除 |
 | 推理隐私 | 只发送到用户自己配置的模型端点 |
 
-## 10. 图表
+## 11. 图表
 
 - [`diagrams/architecture-overall.svg`](diagrams/architecture-overall.svg) — 进程与分层总览
 - [`diagrams/sequence-chat.svg`](diagrams/sequence-chat.svg) — 一次聊天（含工具审批）
@@ -174,9 +201,11 @@ START → prepare_run → load_profile → retrieve_memories
 - [`assets/diagrams/runtime-overview.svg`](assets/diagrams/runtime-overview.svg) — 运行时拓扑
 - [`assets/diagrams/backend-modules.svg`](assets/diagrams/backend-modules.svg) — 后端模块图
 
-## 11. 已知限制
+## 12. 已知限制
 
-- 打包以 Windows 为先；其他平台仅用于开发。
-- 工具沙箱是策略级，不是操作系统级隔离。
+- 打包以 Windows 为先，安装包未签名；其他平台仅用于开发。
+- 工具与连接器执行是策略级约束，不是操作系统沙箱；连接器命令以用户权限运行，且需要预装解释器与依赖。
+- LLM 记忆学习引擎已启用（`auto` / `review` / `shadow` / `off`），但定时整合、衰减、TTL 与
+  永久删除仍是预留配置，不会自动执行。
 - 记忆检索目前是词法匹配；embedding 是明确的后续工作。
-- 记忆规划器（定时整合/遗忘）已设计但尚未启用；配置会被保存，但界面明确标注未接入。
+- 对话分支已有设计文档，尚未实现。

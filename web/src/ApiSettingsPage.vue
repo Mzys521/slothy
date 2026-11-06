@@ -1,107 +1,34 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { Check, ChevronDown, Eye, EyeOff, LoaderCircle, Plus, Trash2, X } from 'lucide-vue-next'
 import { t } from './preferences'
 import { brandAsset } from './brand'
 import { workRequest } from './workApi'
-import { loadProviderSettings, setupRequired, type ProviderConfig, type ProviderModel, type ProviderTemplate } from './providerSettings'
+import { loadProviderSettings, setupRequired, type ProviderConfig } from './providerSettings'
+import { useProviderEditor } from './useProviderEditor'
 
-const providers = ref<ProviderConfig[]>([])
-const templates = ref<ProviderTemplate[]>([])
+const { providers, templates, editing, editId, kind, saving, discovering, error, notice, showKey,
+  addModelOpen, newModel, form, savedKey, canSave, canDiscover, selectTemplate, changeKind,
+  openEditor, closeEditor, save: saveProvider, discover, addModel, showModelForm } = useProviderEditor()
 const loading = ref(true)
-const error = ref('')
-const notice = ref('')
-const editing = ref(false)
-const editId = ref('')
-const kind = ref<'builtin' | 'custom'>('builtin')
-const saving = ref(false)
-const discovering = ref(false)
-const showKey = ref(false)
 const customSettings = ref(true)
 const deleteTarget = ref<ProviderConfig>()
-const addModelOpen = ref(false)
-const newModel = reactive({ id: '', name: '', context: '' })
-const form = reactive({ id: '', name: '', template: 'deepseek', protocol: 'openai', base_url: '', api_key: '', enabled: true, models: [] as ProviderModel[] })
-const savedKey = computed(() => providers.value.find(item => item.id === editId.value)?.has_api_key ?? false)
-const canSave = computed(() => form.id && form.name && form.base_url && (form.api_key.trim() || savedKey.value))
-
 async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    const result = await loadProviderSettings()
-    providers.value = result.items
-    templates.value = result.templates
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
+  loading.value = true; error.value = ''
+  try { await loadProviderSettings() }
+  catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
   finally { loading.value = false }
 }
-
-function selectTemplate() {
-  const template = templates.value.find(item => item.id === form.template)
-  if (!template) return
-  if (!editId.value) form.id = template.id
-  form.name = template.name
-  form.base_url = template.base_url
-  form.protocol = template.protocol
-  form.models = template.model_ids.map(id => ({ id, name: id }))
-}
-function changeKind(value: 'builtin' | 'custom') {
-  if (kind.value === value || editId.value) return
-  kind.value = value
-  form.api_key = ''
-  if (value === 'builtin') selectTemplate()
-  else Object.assign(form, { id: '', name: '', protocol: 'openai', base_url: '', models: [] })
-}
-function openEditor(provider?: ProviderConfig) {
-  error.value = ''; notice.value = ''; showKey.value = false
-  editId.value = provider?.id ?? ''
-  kind.value = provider?.template === null ? 'custom' : 'builtin'
-  if (provider) Object.assign(form, { ...provider, models: provider.models.map(item => ({ ...item })), api_key: '' })
-  else { Object.assign(form, { id: '', name: '', template: 'deepseek', api_key: '', enabled: true, models: [] }); selectTemplate() }
-  editing.value = true
-}
-function closeEditor() { if (!saving.value && !discovering.value) { editing.value = false; form.api_key = ''; error.value = '' } }
-function payload() {
-  return { id: form.id.trim(), name: form.name.trim(), template: kind.value === 'builtin' ? form.template : null,
-    protocol: form.protocol, base_url: form.base_url.trim(), models: form.models, enabled: form.enabled,
-    ...(form.api_key.trim() ? { api_key: form.api_key.trim() } : {}) }
-}
 async function save() {
-  if (!canSave.value || saving.value) return
-  saving.value = true; error.value = ''
-  try {
-    await workRequest('/settings/providers' + (editId.value ? '/' + encodeURIComponent(editId.value) : ''), editId.value ? 'PUT' : 'POST', payload())
-    form.api_key = ''; editing.value = false
-    await load()
-    notice.value = t('Provider saved.', '提供商已保存。')
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { saving.value = false }
+  if (await saveProvider()) { editing.value = false; notice.value = t('Provider saved.', '提供商已保存。') }
 }
-async function discover() {
-  discovering.value = true; error.value = ''; notice.value = ''
-  try {
-    const result = await workRequest<{ items: ProviderModel[] }>('/settings/providers/discover', 'POST', payload())
-    const existing = new Map(form.models.map(item => [item.id, item]))
-    for (const item of result.items) if (!existing.has(item.id)) existing.set(item.id, item)
-    form.models = [...existing.values()]
-    notice.value = result.items.length ? t(`Fetched ${result.items.length} models.`, `已获取 ${result.items.length} 个模型。`) : t('The provider returned an empty model catalog. Add a model ID manually.', '提供商返回了空目录，请手动添加模型 ID。')
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
-  finally { discovering.value = false }
-}
-function addModel() {
-  const id = newModel.id.trim()
-  if (!id || form.models.some(model => model.id === id)) return
-  form.models.push({ id, name: newModel.name.trim() || id, context_window: newModel.context ? Number(newModel.context) : null })
-  addModelOpen.value = false
-}
-function showModelForm() { Object.assign(newModel, { id: '', name: '', context: '' }); addModelOpen.value = true }
 async function remove() {
   if (!deleteTarget.value) return
   saving.value = true; error.value = ''
   try {
     await workRequest('/settings/providers/' + encodeURIComponent(deleteTarget.value.id), 'DELETE')
     deleteTarget.value = undefined
-    await load()
+    await loadProviderSettings({ refresh: true })
   } catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
   finally { saving.value = false }
 }
@@ -152,7 +79,7 @@ onMounted(load)
           <label v-if="customSettings" class="api-field"><span>{{ t('API address', 'API 地址') }}</span><input v-model="form.base_url" type="url" required><small>{{ t('Use the provider’s API base address; do not append /chat/completions.', '填写提供商的 API 根地址，无需追加 /chat/completions。') }}</small></label>
         </template>
         <div class="api-editor-divider"></div>
-        <div class="api-catalog-heading"><div><h2>{{ t('Model catalog', '模型目录') }}</h2><p v-if="!form.models.length">{{ t('Add or fetch the models you want to use.', '添加或获取你希望使用的模型。') }}</p></div><button type="button" :disabled="!canSave || discovering" @click="discover"><LoaderCircle v-if="discovering" class="spin" />{{ t('Fetch available models', '获取可用模型') }}</button></div>
+        <div class="api-catalog-heading"><div><h2>{{ t('Model catalog', '模型目录') }}</h2><p v-if="!form.models.length">{{ t('Add or fetch the models you want to use.', '添加或获取你希望使用的模型。') }}</p></div><button type="button" :disabled="!canDiscover || discovering || saving" @click="discover"><LoaderCircle v-if="discovering" class="spin" />{{ t('Fetch available models', '获取可用模型') }}</button></div>
         <p v-if="!form.models.length" class="api-empty-catalog">{{ t('No models will appear in the model selector until you add a model ID.', '模型选择器中将不显示任何模型；请先获取或添加模型 ID。') }}</p>
         <div v-else class="api-model-list"><div v-for="(item, index) in form.models" :key="item.id"><span><strong>{{ item.name || item.id }}</strong><small v-if="item.name && item.name !== item.id">{{ item.id }}</small></span><button type="button" :aria-label="t('Remove model', '移除模型') + ' ' + item.id" @click="form.models.splice(index, 1)"><X /></button></div></div>
         <button type="button" class="api-button api-add-model" @click="showModelForm"><Plus />{{ t('Add model', '添加模型') }}</button>

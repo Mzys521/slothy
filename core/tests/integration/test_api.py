@@ -10,8 +10,8 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
 from app.agent.graph import build_graph_config
-from app.api import create_app
 from app.config import CheckpointSettings
+from tests.support.legacy_app import create_app
 
 
 def test_workspace_contract_and_legacy_thread_updates(tmp_path):

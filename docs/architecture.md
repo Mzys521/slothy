@@ -55,6 +55,10 @@ Key properties:
   executable (`resources/backend/slothy-service.exe`).
 - The Python entry point (`core/desktop/entry.py`) also exits when the desktop
   process disappears, so no orphan backend survives.
+- The renderer keeps a first-run onboarding overlay above the shell. It is shown
+  only while `GET /api/v1/settings/providers` reports `setup_required` (no runner
+  configured) and closes after a provider is saved; configuration read failures
+  show a retry instead of pretending the app is unconfigured.
 
 ## 3. Backend layering
 
@@ -114,11 +118,11 @@ Execution properties:
 ```
 finished turn ──▶ archive (sessions.sqlite) ──▶ learning queue
                                                 │
-                       rule-based claim extraction (preferences/habits/goals/facts/episodes)
+                       independent memory_learning graph: LLM judgment + evidence validation
                                                 ▼
                               memory_claims + memory_evidence (workspace.sqlite)
                                                 │
-                          review (user confirm/edit/ignore) ──▶ confirmed memory
+                          auto apply / manual review ──▶ confirmed memory
                                                 │
                         profile projection (preference/habit/goal) ──▶ profile version +N
                                                 │
@@ -127,6 +131,20 @@ finished turn ──▶ archive (sessions.sqlite) ──▶ learning queue
 
 - Claims have a scope (`global` / `project` / `thread`), a dimension, a stable
   topic key where possible, and evidence quotes.
+- `app/memory/learning.py` owns background orchestration. The model proposes strict
+  JSON without executable tools; `app/personalization/evolution.py` retains domain
+  transactions for confirmation, projection, deletion and relationships.
+- Network calls hold no memory write lock and do not block chat. An event-driven
+  durable queue recovers on startup; commit markers close the apply/ack crash window.
+  Settings, source state, versions and the personalization gate are rechecked before writes.
+- Auto saves eligible evidence-backed memories; review requires confirmation;
+  shadow evaluates without changing memory; off pauses. Inferences need corroboration,
+  uncertain/sensitive candidates remain reviewable, and historical reanalysis cannot
+  resurrect erased or rejected source material.
+- Daily reservations bound model spending, large batches shrink to fit, and actual
+  reported background usage contributes to account token activity without adding chat
+  turns. Missing usage stays partial. Decay, TTL and periodic consolidation remain
+  explicitly reserved settings.
 - The profile is an immutable version chain; edits use optimistic concurrency
   (`expected_version`), deletions redact old snapshots, and only content changes
   create a new version (last 200 kept).
@@ -186,7 +204,28 @@ allowlist, merged stderr, output caps and timeout kills. Document generation is
 policy-checked but **not** an OS sandbox; the security boundary is documented
 rather than implied.
 
-## 9. Security model
+## 9. Connectors
+
+Connectors extend the tool surface without restarting the app.
+
+| Kind | Import format | Execution model |
+|---|---|---|
+| Local tool | JSON or ZIP with `tool.json` | argv command, JSON stdin/stdout, workspace as cwd, `${plugin}` for the bundle directory |
+| MCP server | `mcpServers` JSON (stdio `command,args,env`; HTTP `url,type,headers`) | real connection discovery (`streamable-http` or legacy `sse`); tool calls reviewed |
+| Skill | ZIP with exactly one `SKILL.md` plus reference files | low-trust L3 instructions; `read_skill_file` pages UTF-8 references |
+
+Imported items start disabled. Enabling discovers tools through the real
+connection; failure preserves the previous state. Imported tools require approval
+in both chat and work modes, disabling revokes execution immediately, and changed
+definitions change their tool identifiers. Configuration, credentials, environment
+variables and extracted paths are never returned by the API; Windows stores
+connector configuration with DPAPI. Limits: 10 MiB import, 20 MiB / 512 extracted
+entries, 64 imported items, 64 enabled imported tools, 8 enabled skills with 64,000
+instruction characters combined. Interpreters and dependencies for local/MCP
+commands must already be installed; importing or enabling never runs bundled
+scripts.
+
+## 10. Security model
 
 | Concern | Control |
 |---|---|
@@ -197,7 +236,7 @@ rather than implied.
 | Data retention | explicit delete endpoints, redaction of historical profiles, per-memory deletion |
 | Inference privacy | requests go only to the model endpoint the user configured |
 
-## 10. Diagrams
+## 11. Diagrams
 
 - [`docs/diagrams/architecture-overall.svg`](diagrams/architecture-overall.svg) — process and layer overview
 - [`docs/diagrams/sequence-chat.svg`](diagrams/sequence-chat.svg) — one chat turn, including tool review
@@ -206,10 +245,15 @@ rather than implied.
 - [`docs/assets/diagrams/runtime-overview.svg`](assets/diagrams/runtime-overview.svg) — runtime topology in detail
 - [`docs/assets/diagrams/backend-modules.svg`](assets/diagrams/backend-modules.svg) — backend module map
 
-## 11. Known limits
+## 12. Known limits
 
-- Packaging is Windows-first; other platforms are development-only.
-- The tool sandbox is policy-based, not an OS-level isolation boundary.
+- Packaging is Windows-first; the installer is unsigned; other platforms are
+  development-only.
+- Tool and connector execution is policy-based, not an OS sandbox; connector
+  commands run with the user's privileges and require preinstalled interpreters
+  and dependencies.
+- The LLM memory-learning engine is enabled (`auto` / `review` / `shadow` /
+  `off`), but scheduled consolidation, decay, TTL and permanent deletion remain
+  reserved settings and are not executed automatically.
 - Memory retrieval is lexical today; embeddings are an explicit future step.
-- The memory planner (scheduled consolidation / forgetting) is designed but not
-  yet enabled; configuration is stored but marked inactive in the UI.
+- Conversation branching is documented but not implemented yet.

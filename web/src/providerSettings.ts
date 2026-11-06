@@ -17,16 +17,36 @@ export interface ProviderList { items: ProviderConfig[]; templates: ProviderTemp
 export const setupRequired = ref(false)
 export const configurationLoaded = ref(false)
 export const configurationError = ref('')
+export const configurationLoading = ref(false)
+export const providerConfigs = ref<ProviderConfig[]>([])
+export const providerTemplates = ref<ProviderTemplate[]>([])
+let pending: Promise<ProviderList> | undefined
+let revision = 0
 
-export async function loadProviderSettings() {
+export function loadProviderSettings(options: { refresh?: boolean } = {}): Promise<ProviderList> {
+  if (pending && !options.refresh) return pending
+  const request = ++revision
   configurationError.value = ''
-  try {
-    const result = await workRequest<ProviderList>('/settings/providers')
-    setupRequired.value = result.setup_required
-    configurationLoaded.value = true
-    return result
-  } catch (error) {
-    configurationError.value = error instanceof Error ? error.message : String(error)
-    throw error
-  }
+  configurationLoading.value = true
+  pending = (async () => {
+    try {
+      const result = await workRequest<ProviderList>('/settings/providers')
+      if (request === revision) {
+        providerConfigs.value = result.items
+        providerTemplates.value = result.templates
+        setupRequired.value = result.setup_required
+        configurationLoaded.value = true
+      }
+      return result
+    } catch (error) {
+      if (request === revision) {
+        configurationLoaded.value = false
+        configurationError.value = error instanceof Error ? error.message : String(error)
+      }
+      throw error
+    } finally {
+      if (request === revision) { pending = undefined; configurationLoading.value = false }
+    }
+  })()
+  return pending
 }

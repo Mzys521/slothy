@@ -49,9 +49,12 @@ both files. `.env` is git-ignored and must never be committed.
 
 You can configure a provider two ways — pick one:
 
-1. **In the app (recommended):** start the app, open **Settings → API**, add a
-   provider (base URL, API key, models). Keys are stored with Windows DPAPI in
-   `providers.json` inside the data directory.
+1. **In the app (recommended):** on first launch a centered onboarding overlay
+   appears while no provider is configured. Pick a template (DeepSeek, MiMo,
+   OpenAI, Anthropic, Kimi, Qwen) or a custom OpenAI/Anthropic-compatible
+   connection, paste the key and save — the app opens the workspace. You can
+   change providers later under **Settings → API**. Keys are stored with Windows
+   DPAPI in `providers.json` inside the data directory.
 2. **In `.env`** for backend-only runs and the CLI examples:
 
 ```ini
@@ -100,12 +103,16 @@ What happens:
 
 First run checklist:
 
-- **Settings → API**: add a provider, run *Discover models*, save.
+- **First-run setup**: the onboarding overlay appears only while no provider is
+  configured. Choose a template or a custom connection, add the API key, save, and
+  the app opens the workspace without a page reload.
 - **New conversation**: send a message and confirm the answer streams.
 - **Tool approval**: ask for a document or a shell command; the run pauses and
   shows the exact call — approve to continue.
-- **Memory**: say something personal such as “我喜欢简洁的回答。”, open the
-  memory page, review the suggestion, confirm it, then check the profile.
+- **Memory**: complete a turn that states a real preference (for example
+  “我喜欢简洁的回答。”), then open the memory page. The background LLM learning
+  engine saves reliable, evidence-backed information automatically in `auto`
+  mode; switch memory mode to `review` if you prefer to confirm candidates first.
 
 ## 5. Data locations
 

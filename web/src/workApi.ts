@@ -157,6 +157,12 @@ export function uploadAccountAvatar<T>(image: Blob) {
   })
 }
 
+export function uploadConnector<T>(kind: 'local' | 'mcp' | 'skill', file: File) {
+  return apiRequest<T>('/connectors/import?kind=' + kind + '&filename=' + encodeURIComponent(file.name), {
+    method: 'POST', body: file, headers: { 'Content-Type': 'application/octet-stream' },
+  })
+}
+
 async function readApiResponse<T>(response: Response): Promise<T> {
   if (response.status === 204) return undefined as T
   const value = await response.json().catch(() => {

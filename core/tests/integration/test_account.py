@@ -9,9 +9,9 @@ from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
 from app.agent.activity import RunActivity
 from app.agent.metrics import RunMetrics
-from app.api import create_app
 from app.config import CheckpointSettings
 from app.conversations import ConversationTurn
+from tests.support.legacy_app import create_app
 
 
 def png(size=2):

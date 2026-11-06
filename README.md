@@ -7,7 +7,7 @@
 <p align="center"><em>Small Steps Toward A Better Future · 小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.3-60DD06" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.3.2--beta-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -22,6 +22,11 @@
   <a href="docs/brand.md">Brand</a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.3.2-beta"><strong>Download Slothy 0.1.3.2 Beta for Windows x64</strong></a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
+
 ---
 
 **Slothy** is a local-first adaptive personal agent for the desktop. It pairs a
@@ -29,10 +34,11 @@ native Electron shell with a FastAPI + LangGraph service running on your own
 machine, so conversations, long-term memory, user profile and artifacts stay in
 local SQLite files instead of a cloud account.
 
-The agent learns the way a careful assistant would: it extracts preferences,
-habits and goals from finished conversations, asks before promoting them into a
-versioned user profile, and retrieves only the memories relevant to the current
-request. Tool calls that change your machine are reviewed by you, not trusted
+An independent background LLM evaluates completed turns for preferences, habits,
+goals, facts and episodes. Reliable, evidence-backed information is saved automatically
+and projected into a versioned profile; uncertain or sensitive candidates remain
+reviewable. Fully manual review is also available. Each request retrieves relevant
+memory. Tool calls that change your machine are reviewed by you, not trusted
 blindly.
 
 ## Why Slothy
@@ -41,9 +47,9 @@ blindly.
 |---|---|
 | **Local-first by design** | Sessions, memory, profiles and artifacts live in local SQLite; the desktop API binds to `127.0.0.1` with a per-launch token that never reaches the renderer. |
 | **An agent you can audit** | Every run is checkpointed step by step. You can pause on a tool call, inspect the exact arguments, approve or reject it, and resume the same run. |
-| **Memory with provenance** | A memory is a claim plus evidence plus a scope. Nothing is silently learned: candidates are reviewed, profile versions keep history, and deletions redact old snapshots. |
+| **Memory with provenance** | A memory is a claim plus evidence plus a scope. Reliable information is saved automatically; you can review, edit, archive or delete it. Deletion redacts references and blocks resurrection during historical reanalysis. |
 | **A real desktop product** | Frameless window, native file dialogs, workspace folders on disk, NSIS installer, offline data directory, DPAPI-encrypted provider keys. |
-| **Built to be maintained** | Strict layering, deterministic prompt assembly, 221 automated tests, production asset audit, and bilingual architecture/API documentation. |
+| **Built to be maintained** | Strict layering, deterministic prompt assembly, 271 backend + 32 frontend tests, production asset audit, and bilingual architecture/API documentation. |
 
 ## Features
 
@@ -53,9 +59,25 @@ blindly.
   recursion.
 - **Human-in-the-loop tools** — risky tool calls pause the graph through an
   `interrupt()`; approve or reject, then resume with `Command(resume=…)`.
-- **Adaptive memory** — rule-based candidate extraction from finished turns,
-  human review, conflict-aware confirmation, scoped retrieval
-  (global / project / thread) and a relationship graph.
+- **First-run onboarding** — a centered, theme-aware glass overlay guides the
+  first launch: pick a provider template (DeepSeek, MiMo, OpenAI, Anthropic, Kimi
+  or Qwen) or connect a custom endpoint, then drop into the workspace. It only
+  appears while no provider is configured; failures offer retry instead of
+  pretending the app is unconfigured.
+- **Connectors** — import local tools (JSON/ZIP), MCP servers (stdio, Streamable
+  HTTP or legacy SSE) and Skills (ZIP with `SKILL.md`). Enabling discovers tools
+  through the real connection; imported tools require approval, and disabling
+  revokes execution immediately.
+- **Message previews & copy** — SVG/HTML previews fill the conversation width with
+  content-driven height and follow the live theme; per-message copy uses the
+  native clipboard bridge with browser fallback.
+- **Appearance** — Slothy green by default, a persistent custom accent with HEX
+  validation and readable light/dark contrast, plus a language switch on the
+  welcome screen.
+- **Adaptive memory** — durable completed-turn queue → independent LLM judgment →
+  evidence/scope validation → automatic merge/update/save → profile and graph projection.
+  Supports auto/review/shadow/off, a dedicated model, confidence thresholds and a daily
+  token budget. Retrieval stays scoped; background usage is included in token activity.
 - **Versioned user profile** — preferences, habits and goals are projected into
   an immutable profile history; the next turn injects the current version with
   source memory IDs.
@@ -133,7 +155,7 @@ core/                  Python backend (FastAPI + LangGraph)
   app/agent/           graph, tools, providers, prompt planning
   app/personalization/ memory extraction, profile projection
   app/infrastructure/  SQLite stores, LLM adapters, subprocess runner
-  tests/               221 automated tests
+  tests/               271 backend automated tests
 web/                   Electron + Vue desktop client
   electron/            main process, preload bridge, backend supervision
   src/                 Vue pages and TypeScript API layer
@@ -144,11 +166,12 @@ docs/                  public documentation (EN + 中文) and diagrams
 
 ```powershell
 cd core
-.\.venv\Scripts\python.exe -m pytest      # 221 tests
+.\.venv\Scripts\python.exe -m pytest      # 271 tests
 .\.venv\Scripts\python.exe -m ruff check app tests
 
 cd ..\web
 npm run typecheck                         # vue-tsc
+node --test tests/*.test.mjs              # 32 frontend/serverless tests
 npm run production:audit                  # packaged-asset allowlist audit
 ```
 
@@ -165,10 +188,11 @@ npm run production:audit                  # packaged-asset allowlist audit
 
 ## Roadmap
 
-- [ ] Memory planner graph: scheduled consolidation, summarization, decay and
-  forgetting and automatic profile projection.
+- [ ] Scheduled memory consolidation with decay and retention enforcement (settings
+  are reserved today; automatic permanent deletion is not enabled).
 - [ ] Richer memory retrieval (optional embeddings, hybrid ranking).
-- [ ] More providers and prompt-cache telemetry in the UI.
+- [ ] Conversation branching (documented plan; not implemented yet).
+- [ ] More providers and richer cache analytics in the UI.
 
 ## Documentation
 

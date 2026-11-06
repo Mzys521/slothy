@@ -12,6 +12,7 @@ const resources = path.resolve(process.argv[2] || path.join(web, 'release/slothy
 let calls = 0
 let fileRead = false
 const sdkRequests = []
+const memoryRequests = []
 const documentCode = [
   'from pathlib import Path', "Path('verification.txt').write_text('SLOTHY_DOCUMENT_OK', encoding='utf-8')",
   'from docx import Document', "d=Document(); d.add_paragraph('slothy'); d.save('verification.docx')",
@@ -28,16 +29,24 @@ const upstream = createServer(async (request, response) => {
   let raw = ''
   for await (const chunk of request) raw += chunk
   const body = JSON.parse(raw)
-  sdkRequests.push(body)
+  const isMemory = String(body.messages[0]?.content).includes('isolated memory-learning planner')
+  ;(isMemory ? memoryRequests : sdkRequests).push(body)
   assert.ok(!raw.includes('cache_control'), 'OpenAI-compatible requests must not receive Anthropic markers')
   calls++
   assert.equal(body.model, 'runtime-model')
-  assert.ok(body.tools.length)
+  if (isMemory) assert.ok(!body.tools?.length, 'memory learning must not receive executable tools')
+  else assert.ok(body.tools.length)
   const prompt = body.messages.filter(message => message.role === 'user').at(-1)?.content || ''
   const toolResults = body.messages.filter(message => message.role === 'tool')
   let content = 'SLOTHY_CONNECTED'
   let toolCall
-  if (String(prompt).includes('CALCULATE') && !toolResults.length) {
+  if (isMemory) {
+    const input = JSON.parse(prompt)
+    const turn = input.turns.find(turn => turn.text.includes('MEMORY_SIGNAL:'))
+    content = JSON.stringify({ candidates: turn ? [{ action: 'add', kind: 'preference', key: 'answer_structure',
+      title: '回答结构', content: '先给结论，再补充说明', scope: 'global', basis: 'explicit', durable: true,
+      confidence: .97, evidence: [{ turn: turn.turn, quote: turn.text }] }] : [] })
+  } else if (String(prompt).includes('CALCULATE') && !toolResults.length) {
     toolCall = { id: 'call-calculator', type: 'function', function: { name: 'calculate', arguments: JSON.stringify({ operation: 'add', a: 2, b: 3 }) } }
   } else if (String(prompt).includes('DOCUMENT') && !toolResults.length) {
     toolCall = { id: 'call-document', type: 'function', function: { name: 'write_document_python', arguments: JSON.stringify({ code: documentCode }) } }
@@ -81,7 +90,9 @@ try {
   assert.deepEqual((await request('/models')).items, [])
   const memoryDefaults = await request('/settings/memory')
   assert.equal(memoryDefaults.revision, 0)
-  assert.equal(memoryDefaults.runtime.planner_available, false)
+  assert.equal(memoryDefaults.runtime.planner_available, true)
+  assert.equal(memoryDefaults.runtime.engine, 'llm_learning')
+  assert.equal(memoryDefaults.runtime.model_available, false)
   const memoryConfig = { ...memoryDefaults.configuration, batch_size: 12, retention_days: 120 }
   const memorySaved = await request('/settings/memory', 'PATCH', { expected_revision: 0, configuration: memoryConfig })
   assert.equal(memorySaved.revision, 1)
@@ -139,6 +150,26 @@ try {
   assert.equal(cacheRuntime.prompt_layout, 'layered')
   assert.equal(cacheRuntime.cache_stats.prefix_hit_ratio, null, 'unreported cache usage stays unknown')
 
+  const learned = await request('/chat', 'POST', { message: 'MEMORY_SIGNAL: Conclusions first are the most useful format for me in my work.' })
+  let learnedProfile
+  for (let attempt = 0; attempt < 100; attempt++) {
+    learnedProfile = await request('/profile')
+    if (learnedProfile.attributes?.some(item => item.key === 'answer_structure')) break
+    await new Promise(resolve => setTimeout(resolve, 100))
+  }
+  const attribute = learnedProfile.attributes?.find(item => item.key === 'answer_structure')
+  assert.ok(attribute, 'the default background LLM path must persist a real profile attribute')
+  assert.ok(memoryRequests.length)
+  const evidence = await request('/memories/' + attribute.memory_id)
+  assert.ok(evidence.evidence.some(item => item.thread_id === learned.thread_id && item.run_id === learned.run_id))
+  const autoReceipt = await request(`/threads/${learned.thread_id}/memory-receipts?run_id=${learned.run_id}`)
+  assert.ok(autoReceipt.items.some(item => item.id === attribute.memory_id))
+  const unrelated = await request('/chat', 'POST', { message: 'Please explain an unrelated example.' })
+  assert.ok(unrelated.used_memory_ids.includes(attribute.memory_id))
+  const learningRuntime = (await request('/settings/memory')).runtime
+  assert.equal(learningRuntime.engine, 'llm_learning')
+  assert.ok(learningRuntime.model_available && learningRuntime.reported_tokens > 0)
+
   await stopBackend(backend)
   backend = await startBackend({ resourcesPath: resources, userData: profile, development: false })
   const persisted = await fetch(backend.origin + '/api/v1/settings/providers', { headers: { 'X-Slothy-Token': backend.token } }).then(response => response.json())
@@ -153,7 +184,8 @@ try {
   assert.equal(sdkRequests.at(-1).messages.find(message => message.name === 'profile_snapshot')?.content, firstPrefix)
   assert.equal(continued.metrics.l1_hash, firstCacheTurn.metrics.l1_hash)
   assert.equal(continued.metrics.l2_turns, 2)
-  console.log('Frozen runtime acceptance passed: clean first run, encrypted API configuration, memory settings, SDK routing, file upload, tools, SSE, approval, 5 document formats, layered prompt ordering, profile delta and frozen prefix persistence after restart.')
+  assert.ok((await request('/profile')).attributes.some(item => item.memory_id === attribute.memory_id))
+  console.log('Frozen runtime acceptance passed: SDK, files/tools/SSE/approval/documents, cache-prefix persistence, default autonomous LLM memory, evidence receipts, cross-thread profile injection and restart persistence.')
 } finally {
   await stopBackend(backend)
   upstream.closeAllConnections()

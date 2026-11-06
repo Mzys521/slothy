@@ -20,10 +20,10 @@ from app.agent.graph import (
 from app.agent.metrics import run_metrics
 from app.agent.prompting.plan import canonical, compose, stable_message
 from app.agent.prompting.telemetry import PromptTelemetry, cache_write_tokens
-from app.api import create_app
 from app.config import AgentSettings, CheckpointSettings, PromptSettings
 from app.infrastructure.prompt_cache import CachedMemoryReader, ProfileSnapshots
 from app.infrastructure.workspace import WorkspaceStore
+from tests.support.legacy_app import create_app
 
 
 def settings(**values):

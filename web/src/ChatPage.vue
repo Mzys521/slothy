@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ChevronDown, ChevronRight, Clipboard, File as FileIcon, History, Layers, LoaderCircle, PanelRight, Plus, Send, ShieldCheck, SquarePlus, Trash2, X } from 'lucide-vue-next'
+import { ChevronDown, ChevronRight, File as FileIcon, History, Layers, LoaderCircle, PanelRight, Plus, Send, ShieldCheck, SquarePlus, Trash2, X } from 'lucide-vue-next'
 import { activeSession, activeWorkspace, clearSession, newChat, runningSessions, selectSession, sessions, sessionWorkspace, syncThreadMessages, type ChatMode, type Session, type Turn, type WorkOptions } from './chat'
 import { readLocal, settings, t, writeLocal } from './preferences'
 import MarkdownText from './MarkdownText.vue'
+import CopyMessage from './CopyMessage.vue'
 import SessionHistory from './SessionHistory.vue'
 import AgentContextPanel from './AgentContextPanel.vue'
 import { memoryScope, streamWorkRequest, threadPath, uploadAttachment, workRequest, type MemoryReceipt, type ModelItem, type ToolReview, type WorkReply } from './workApi'
@@ -49,7 +50,6 @@ function setReasoningEffort(value: string) {
 const transcript = ref<HTMLElement>()
 const composer = ref<HTMLTextAreaElement>()
 const fileInput = ref<HTMLInputElement>()
-const copied = ref('')
 const workBusy = ref(false)
 const liveReplies = ref<Record<string, string>>({})
 const workError = ref('')
@@ -364,15 +364,6 @@ function onComposerKey(event: KeyboardEvent) {
     submit()
   }
 }
-async function copy(turn: Turn) {
-  const value = turn.serverReply ?? ''
-  try {
-    await navigator.clipboard.writeText(value)
-    copied.value = turn.id
-  } catch {
-    copied.value = 'error'
-  }
-}
 </script>
 
 <template>
@@ -407,7 +398,7 @@ async function copy(turn: Turn) {
       <div v-if="!empty" ref="transcript" class="transcript" :aria-label="t('Conversation', '对话记录')">
         <article v-for="turn in turns" :key="turn.id" class="chat-turn" :data-run-id="turn.serverRunId">
           <div class="user-message">
-            <div class="user-content"><div class="user-bubble"><MarkdownText v-if="turn.prompt" :text="turn.prompt" /><div v-if="turn.files.length" class="message-files"><FileIcon />{{ turn.files.join(', ') }}</div></div><time>{{ turn.time }}</time></div>
+            <div class="user-content"><div class="user-bubble"><MarkdownText v-if="turn.prompt" :text="turn.prompt" /><div v-if="turn.files.length" class="message-files"><FileIcon />{{ turn.files.join(', ') }}</div></div><div class="user-message-footer"><CopyMessage v-if="turn.prompt" :text="turn.prompt" /><time>{{ turn.time }}</time></div></div>
             <UserAvatar />
           </div>
           <div v-if="workRunning(turn) || waitingForReview(turn) || turn.serverReply || turn.serverError || turn.activity?.length" class="assistant-message">
@@ -442,7 +433,7 @@ async function copy(turn: Turn) {
                 <button v-if="turn.memorySuggestionIds?.length" class="text-link" @click="emit('memoryReview')">
                   {{ t('Review memory suggestions', '查看记忆建议') }}
                 </button>
-                <button class="quiet-button copy-answer" @click="copy(turn)"><Clipboard />{{ copied === turn.id ? t('Copied', '已复制') : copied === 'error' ? t('Copy failed', '复制失败') : t('Copy', '复制') }}</button>
+                <CopyMessage :key="turn.id" :text="turn.serverReply" />
               </footer>
             </div>
           </div>

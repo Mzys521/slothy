@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { settings, t } from './preferences'
+import { normalizeAccent } from './appearance'
 import MemorySettings from './MemorySettings.vue'
 
 const props = defineProps<{ section: 'appearance' | 'language' | 'memory' }>()
@@ -12,10 +13,24 @@ const pageDescription = computed(() => props.section === 'appearance'
   : t('Control how slothy uses your long-term memories.', '管理 slothy 如何使用和积累你的长期记忆。'))
 
 const palettes = [
+  { id: 'green', label: 'Slothy green · Default', zh: '思洛绿 · 默认' },
   { id: 'copper', label: 'Copper', zh: '铜色' },
   { id: 'neutral', label: 'Neutral', zh: '中性灰' },
   { id: 'slate', label: 'Slate blue', zh: '石板蓝' },
+  { id: 'custom', label: 'Custom', zh: '自定义' },
 ]
+const customDraft = ref(settings.customAccent)
+const invalidAccent = ref(false)
+watch(() => settings.customAccent, value => { customDraft.value = value; invalidAccent.value = false })
+function applyCustomAccent() {
+  const color = normalizeAccent(customDraft.value)
+  invalidAccent.value = !color
+  if (color) { settings.customAccent = color; customDraft.value = color }
+}
+function pickCustomAccent(event: Event) {
+  customDraft.value = (event.target as HTMLInputElement).value
+  applyCustomAccent()
+}
 </script>
 
 <template>
@@ -41,12 +56,19 @@ const palettes = [
       </section>
       <section v-if="section === 'appearance'" class="setting">
         <div><h2 id="palette-label">{{ t('Color palette', '配色') }}</h2><p>{{ t('Choose the accent for selected items and controls.', '选择选中项和控件的高亮色。') }}</p></div>
+        <div class="setting-control">
         <div class="palette-options" role="radiogroup" aria-labelledby="palette-label">
-          <label v-for="palette in palettes" :key="palette.id">
+          <label v-for="palette in palettes" :key="palette.id" :class="{ 'palette-custom-option': palette.id === 'custom' }">
             <input v-model="settings.palette" type="radio" name="palette" :value="palette.id">
             {{ t(palette.label, palette.zh) }}
             <span class="swatch" :class="'swatch-' + palette.id" aria-hidden="true"></span>
           </label>
+        </div>
+        <div v-if="settings.palette === 'custom'" class="custom-palette-fields">
+          <input type="color" :value="settings.customAccent" :aria-label="t('Choose custom accent color', '选择自定义强调色')" @input="pickCustomAccent">
+          <label for="custom-accent">{{ t('HEX color', 'HEX 色值') }}<input id="custom-accent" v-model="customDraft" type="text" maxlength="7" spellcheck="false" autocomplete="off" placeholder="#60DD07" :aria-invalid="invalidAccent" :aria-describedby="invalidAccent ? 'custom-accent-error' : undefined" @change="applyCustomAccent" @keydown.enter.prevent="applyCustomAccent"></label>
+          <p v-if="invalidAccent" id="custom-accent-error" role="alert">{{ t('Enter a HEX color, such as #60DD07.', '请输入 HEX 色值，例如 #60DD07。') }}</p>
+        </div>
         </div>
       </section>
       <section v-if="section === 'language'" class="setting">

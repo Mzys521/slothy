@@ -10,7 +10,7 @@ type Suggestion = { id: string; title: string; scope: MemoryReceipt['scope']; sc
 type Attribute = { key: string; value: string; dimension: string; scope: MemoryReceipt['scope']; scope_ref: string | null; memory_id: string }
 type Profile = { version: number; preferences: Record<string, unknown>; attributes?: Attribute[]; removed_attributes?: number; redacted_attributes?: number }
 type Version = { version: number; change_summary: string; created_at: string; removed_attributes?: number; redacted_attributes?: number }
-type Learning = { enabled: boolean; total_turns: number; pending: number; processed: number; failed: number; suggestions: number; observed: number; profile_version: number }
+type Learning = { enabled: boolean; total_turns: number; pending: number; processed: number; failed: number; suggestions: number; observed: number; profile_version: number; engine: 'rule_review' | 'llm_learning'; mode: string; dead: number; last_error: string | null }
 
 const emit = defineEmits<{ memory: [id: string]; evidence: [thread: string, run: string] }>()
 const suggestions = ref<Suggestion[]>([])
@@ -27,6 +27,13 @@ const loading = ref(false)
 const loadError = ref('')
 const actionError = ref('')
 const learning = ref<Learning>()
+const emptyLearningDescription = computed(() => {
+  if (learning.value?.mode === 'shadow') return t('Shadow mode evaluates conversations without saving memory or profile changes.', '影子运行只评估对话，不保存记忆或画像变更。')
+  if (learning.value?.mode === 'off') return t('Resume background learning in settings to analyze completed conversations.', '在设置中恢复后台学习后，将继续分析已完成的对话。')
+  return learning.value?.engine === 'llm_learning' && learning.value?.mode === 'auto'
+    ? t('The model saves durable, evidence-backed memories automatically. Ordinary task questions do not create a user profile.', '模型会自动沉淀有证据的长期记忆；普通任务提问不会被编造成用户画像。')
+    : t('Preferences, habits and goals become profile attributes after confirmation.', '偏好、习惯和目标经确认后形成画像。')
+})
 const notice = ref('')
 const memoryStatus = ref('active')
 const restoring = ref<MemoryReceipt>()
@@ -153,13 +160,14 @@ async function showVersion(version: number) {
       <div><h2>{{ t('Memory learning', '记忆学习') }}</h2>
         <p v-if="!learning.enabled" class="muted">{{ t('Personalized memory is off.', '定制记忆已关闭。') }}</p>
         <p v-else class="muted">{{ t(`${learning.processed} turns analyzed · ${learning.pending} pending · ${learning.suggestions} to review`, `已分析 ${learning.processed} 轮 · 待处理 ${learning.pending} 轮 · 待确认 ${learning.suggestions} 项`) }}</p>
-        <p v-if="learning.failed" role="alert">{{ t('Some turns could not be analyzed and will retry. You can also reanalyze them now.', '部分轮次分析失败，系统会重试，也可手动重新分析。') }}</p>
-        <p v-else-if="learning.enabled && !learning.pending && !learning.suggestions && !profile?.version" class="muted">{{ t('No confirmed personal information yet. Preferences, habits and goals become profile attributes after review; task questions alone do not create a profile.', '尚无已确认的个人信息。对话中的偏好、习惯和目标经确认后形成画像；普通任务提问不会被编造成画像。') }}</p>
+        <p v-if="learning.mode === 'off' && learning.enabled" class="muted">{{ t('Background learning is paused in settings.', '已在设置中暂停后台学习。') }}</p>
+        <p v-if="learning.failed" role="alert">{{ learning.dead ? t(`${learning.dead} turns reached the retry limit. Reanalyze to try again.`, `${learning.dead} 轮已达到重试上限，可重新分析。`) : t('Some turns could not be analyzed and will retry.', '部分轮次分析失败，系统会重试。') }} <code v-if="learning.last_error">{{ learning.last_error }}</code></p>
+        <p v-else-if="learning.enabled && !learning.pending && !learning.suggestions && !profile?.version" class="muted">{{ emptyLearningDescription }}</p>
       </div>
       <button class="quiet-button" :disabled="busy || loading || !learning.enabled || learning.pending > 0" @click="reprocess">{{ t('Reanalyze conversations', '重新分析已有对话') }}</button>
     </section>
 
-    <section>
+    <section v-if="suggestions.length || learning?.mode === 'review'">
       <h2>{{ t('Suggestions to review', '待审核建议') }}</h2>
       <p v-if="!suggestions.length && !loading" class="muted">{{ t('No suggestions waiting for review.', '暂无待审核建议。') }}</p>
       <article v-for="item in suggestions" :key="item.id" class="memory-review-item">

@@ -9,8 +9,8 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
 from app.agent.tools import create_builtin_tools
-from app.api import create_app
 from app.config import CheckpointSettings
+from tests.support.legacy_app import create_app
 
 BASE = "/api/v1"
 

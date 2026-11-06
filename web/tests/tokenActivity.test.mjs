@@ -56,3 +56,14 @@ test('heat levels grow monotonically with real consumption', () => {
   assert.equal(levels.at(-1), 5)
   assert.ok(levels.every((value, index) => index === 0 || value >= levels[index - 1]))
 })
+
+test('background usage contributes tokens without inventing chat turns and preserves partial totals', () => {
+  const result = buildTokenActivity({ as_of: '2026-11-05', prior_tokens: 0, daily: [
+    { date: '2026-11-05', turns: 0, tokens: 160, unreported: 1 },
+  ] })
+  assert.equal(result.days.find(day => day.date === '2026-11-05').turns, 0)
+  assert.equal(result.weeks.at(-1).tokens, 160)
+  assert.equal(result.weeks.at(-1).reported, true)
+  assert.equal(result.weeks.at(-1).partial, true)
+  assert.equal(result.cumulative.at(-1).tokens, 160)
+})

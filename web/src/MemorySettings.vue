@@ -49,6 +49,17 @@ const modelsError = ref('')
 const payload = computed(() => draft.value ? { ...draft.value, model: draft.value.model?.trim() || null } : undefined)
 const dirty = computed(() => !!state.value && JSON.stringify(payload.value) !== JSON.stringify(state.value.configuration))
 const enabled = computed(() => state.value?.runtime.personalization_enabled ?? false)
+const llmLearning = computed(() => state.value?.runtime.engine === 'llm_learning')
+const appliedFields = computed(() => new Set(state.value?.runtime.applied_fields ?? []))
+const engineDescription = computed(() => {
+  if (!enabled.value) return t('Personalized memory is off', '定制记忆已关闭')
+  if (!llmLearning.value) return t('Rule extraction · user review', '规则提取 · 人工审核')
+  const mode = state.value?.runtime.mode
+  return mode === 'off' ? t('LLM learning · paused', 'LLM 记忆学习 · 已暂停')
+    : mode === 'shadow' ? t('LLM judgment · shadow mode', 'LLM 自主判断 · 影子运行')
+    : mode === 'review' ? t('LLM judgment · user review', 'LLM 自主判断 · 人工审核')
+    : t('LLM judgment · automatic memory', 'LLM 自主判断 · 自动沉淀')
+})
 const modes = computed(() => [
   { id: 'auto', label: t('Auto', '自动'), description: t('Apply eligible memories automatically.', '符合条件的记忆自动应用。') },
   { id: 'review', label: t('Review', '人工审核'), description: t('Apply memory candidates after your confirmation.', '候选经你确认后应用。') },
@@ -90,7 +101,9 @@ async function save() {
   saving.value = true; error.value = ''; notice.value = ''
   try {
     accept(await saveMemorySettings(payload.value, state.value.revision))
-    notice.value = t('Configuration saved. It will be used when the memory planner is connected.', '配置已保存，将在记忆规划器接入后使用。')
+    notice.value = llmLearning.value
+      ? t('Saved. Active settings apply to the next background batch.', '已保存，生效参数将用于下一批后台学习。')
+      : t('Configuration saved for the memory planner.', '记忆规划器配置已保存。')
   } catch (reason) {
     conflict.value = reason instanceof ApiError && reason.status === 409
     error.value = conflict.value
@@ -122,13 +135,19 @@ onMounted(() => { void load(); void loadModels() })
       </section>
       <div class="memory-planner-status">
         <span class="memory-config-label">{{ t('Current engine', '当前引擎') }}</span>
-        <strong>{{ enabled ? t('Rule extraction · user review', '规则提取 · 人工审核') : t('Personalized memory is off', '定制记忆已关闭') }}</strong>
-        <p>{{ t('The independent memory planner is not connected yet. The settings below are saved on the server for that planner; they do not start automatic summarization, forgetting or deletion.', '独立记忆规划器尚未接入。下方参数保存在服务端，供规划器使用；保存不会启动自动总结、遗忘或删除。') }}</p>
+        <strong>{{ engineDescription }}</strong>
+        <template v-if="llmLearning">
+          <p>{{ t('Completed conversations are evaluated in the background. Reliable, evidence-backed memories are saved and projected into your profile. Uncertain or sensitive candidates remain reviewable.', '已完成的对话由 LLM 在后台判断；可靠且有原文证据的记忆自动保存并形成画像，证据不足或敏感候选保留待审。') }}</p>
+          <p v-if="!state.runtime.model_available && enabled" role="alert">{{ t('No memory model is available. Configure an API provider or choose an available model below. Conversations remain queued.', '记忆模型不可用，请配置 API 或在下方选择可用模型；待处理对话会保留。') }}</p>
+          <p v-else class="muted">{{ t('Model', '模型') }} · {{ state.runtime.effective_model || t('Follow conversation model', '跟随会话模型') }} · {{ t('Reported today', '今日已上报用量') }} {{ state.runtime.reported_tokens.toLocaleString() }} tokens<span v-if="state.runtime.estimated_tokens"> · {{ t('Unreported budget reservation', '未上报用量的预算预留') }} {{ state.runtime.estimated_tokens.toLocaleString() }}</span></p>
+          <p class="muted">{{ t('Fields marked “Reserved” are saved for future consolidation and forgetting. They do not trigger automatic deletion.', '标记“预留”的字段供后续整合与遗忘使用，当前不触发自动删除。') }}</p>
+        </template>
+        <p v-else>{{ t('The legacy rule-and-review engine is active.', '当前使用兼容的规则提取与审核引擎。') }}</p>
       </div>
       <form class="memory-config-form" @submit.prevent="save">
         <fieldset :disabled="saving || toggling || conflict">
           <section class="memory-config-section" aria-labelledby="memory-planner-title">
-            <header><h2 id="memory-planner-title">{{ t('Memory planner configuration', '记忆规划器配置') }}</h2><span>{{ t('Preconfiguration', '预配置') }} · v{{ state.revision }}</span></header>
+            <header><h2 id="memory-planner-title">{{ t('Memory planner configuration', '记忆规划器配置') }}</h2><span>{{ llmLearning ? t('Live configuration', '运行配置') : t('Preconfiguration', '预配置') }} · v{{ state.revision }}</span></header>
             <div class="setting">
               <div><h3 id="memory-mode-label">{{ t('Processing mode', '处理模式') }}</h3><p>{{ selectedMode?.description }}</p></div>
               <select v-model="draft.mode" aria-labelledby="memory-mode-label"><option v-for="mode in modes" :key="mode.id" :value="mode.id">{{ mode.label }}</option></select>
@@ -146,7 +165,7 @@ onMounted(() => { void load(); void loadModels() })
           <details v-for="group in groups" :key="group.id" class="memory-config-group" open>
             <summary>{{ t(...group.title) }}</summary>
             <div v-for="field in group.fields" :key="field.key" class="setting">
-              <div><h3 :id="'memory-' + field.key">{{ t(field.en, field.zh) }}</h3><p :id="'memory-help-' + field.key">{{ t(...field.description) }}</p></div>
+              <div><h3 :id="'memory-' + field.key">{{ t(field.en, field.zh) }}<small v-if="llmLearning && !appliedFields.has(field.key)"> · {{ t('Reserved', '预留') }}</small></h3><p :id="'memory-help-' + field.key">{{ t(...field.description) }}</p></div>
               <div class="memory-number-control">
                 <input v-model.number="draft[field.key]" type="number" required :min="field.min" :max="field.max" :step="field.step ?? 1" :aria-labelledby="'memory-' + field.key" :aria-describedby="'memory-help-' + field.key">
                 <span>{{ t(...field.unit) }}</span>

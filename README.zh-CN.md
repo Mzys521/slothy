@@ -7,7 +7,7 @@
 <p align="center"><em>小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.3-60DD06" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.3.2--beta-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -22,14 +22,20 @@
   <a href="docs/brand.md#中文">品牌</a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.3.2-beta"><strong>下载 Slothy 0.1.3.2 Beta（Windows x64）</strong></a> ·
+  <a href="CHANGELOG.md">更新日志</a>
+</p>
+
 ---
 
 **Slothy（思洛）** 是一个桌面端的本地优先自适应个人智能体。它由 Electron 原生外壳和运行在
 本机的 FastAPI + LangGraph 服务组成：会话、长期记忆、用户画像和产物都保存在本地 SQLite，
 不依赖云端账号。
 
-它像一位细心的助理那样学习：从已完成的对话中抽取偏好、习惯与目标，请你确认后才写入版本化的
-用户画像；每轮只检索与当前请求相关的记忆。会改动你机器的工具调用不会被静默执行，而是先暂停、
+它从已完成的对话中通过独立 LLM 判断偏好、习惯、目标、事实与经历，将可靠且有原文证据的信息
+自动保存并投影为版本化用户画像；不确定或敏感候选保留待审，也可切换为全人工审核。每轮只检索
+与当前请求相关的记忆。会改动你机器的工具调用会先暂停、
 由你审批后再恢复同一次运行。
 
 ## 为什么是 Slothy
@@ -38,9 +44,9 @@
 |---|---|
 | **本地优先** | 会话、记忆、画像、产物都在本地 SQLite；桌面 API 只监听 `127.0.0.1`，每次启动生成访问令牌且渲染进程拿不到。 |
 | **可审计的智能体** | 每次运行逐步落检查点；工具调用可暂停、查看参数、批准或拒绝，然后从同一断点恢复。 |
-| **有出处的记忆** | 一条记忆 = claim + 证据 + 作用域。候选必须经你确认，画像版本保留历史，删除会同步擦除旧快照中的原文。 |
+| **有出处的记忆** | 一条记忆 = claim + 证据 + 作用域。可靠信息自动沉淀，用户可审查、编辑、归档或删除；删除会擦除旧快照引用并阻止历史重分析复活。 |
 | **真正的桌面产品** | 无边框窗口、原生目录选择、工作区映射到真实文件夹、NSIS 安装包、离线数据目录、DPAPI 加密的模型密钥。 |
-| **可维护的工程** | 严格分层、确定性的提示词组装、221 个自动化测试、生产资源审查，以及中英双语的架构与 API 文档。 |
+| **可维护的工程** | 严格分层、确定性的提示词组装、271 个后端 + 32 个前端测试、生产资源审查，以及中英双语的架构与 API 文档。 |
 
 ## 能力
 
@@ -49,8 +55,17 @@
   agent →（tools）→ finalize_response`，同步检查点、有界递归步数。
 - **人在回路工具审批**：高风险工具调用通过 `interrupt()` 暂停运行，批准/拒绝后以
   `Command(resume=…)` 恢复。
-- **自适应记忆**：对已完成轮次做规则抽取 → 人工审核 → 冲突感知的确认 → 按作用域检索
-  （global / project / thread），并提供记忆关系图谱。
+- **首次启动引导**：居中的主题自适应液态玻璃引导层，提供内置服务商模板（DeepSeek、MiMo、
+  OpenAI、Anthropic、Kimi、Qwen）与自定义连接两条路径；仅在未配置服务商时出现，读取失败显示
+  重试而不是误判为未配置。
+- **连接器**：导入本地工具（JSON/ZIP）、MCP 服务（stdio、Streamable HTTP、兼容 SSE）与
+  Skills（含 `SKILL.md` 的 ZIP）。启用时通过真实连接发现工具；导入工具调用需审批，停用立即撤销执行。
+- **消息预览与复制**：SVG/HTML 预览按会话宽度与内容高度渲染并跟随实时主题；每条消息的复制走
+  原生剪贴板桥，浏览器环境自动回退。
+- **外观**：默认思洛绿，支持带 HEX 校验的持久自定义强调色与亮/暗可读对比度，欢迎页可切换语言。
+- **自适应记忆**：完成轮次持久入队 → 独立 LLM 判断 → 原文与作用域校验 → 自动合并、更新与保存
+  → 画像投影和关系更新。支持 auto / review / shadow / off、独立模型、置信度与每日预算。
+  记忆按 global / project / thread 检索；后台用量计入 Token 活动，未上报数据明确标记不完整。
 - **版本化用户画像**：偏好、习惯、目标投影为不可变的历史版本；下一轮注入当前版本及来源记忆 ID。
 - **分层提示词与缓存**：L1 稳定系统规则 + 会话冻结画像快照，L2 只追加历史（周期性摘要），
   L3 易变的当轮参考放在尾部；稳定前缀在连续请求间保持字节一致，服务端前缀缓存可持续命中。
@@ -115,7 +130,7 @@ core/                  Python 后端（FastAPI + LangGraph）
   app/agent/           图、工具、Provider、提示词规划
   app/personalization/ 记忆抽取与画像投影
   app/infrastructure/  SQLite 存储、LLM 适配、子进程执行
-  tests/               221 个自动化测试
+  tests/               271 个后端自动化测试
 web/                   Electron + Vue 桌面客户端
   electron/            主进程、preload 桥、后端守护
   src/                 Vue 页面与 TypeScript API 层
@@ -126,11 +141,12 @@ docs/                  公共文档（中英）与图表
 
 ```powershell
 cd core
-.\.venv\Scripts\python.exe -m pytest      # 221 个测试
+.\.venv\Scripts\python.exe -m pytest      # 271 个测试
 .\.venv\Scripts\python.exe -m ruff check app tests
 
 cd ..\web
 npm run typecheck                         # vue-tsc
+node --test tests/*.test.mjs              # 32 个前端/无服务器测试
 npm run production:audit                  # 打包资源白名单审查
 ```
 
@@ -144,9 +160,10 @@ npm run production:audit                  # 打包资源白名单审查
 
 ## 路线图
 
-- [ ] 记忆规划图：定时整合、摘要、衰减与遗忘、自动画像投影（设计稿整理中）。
+- [ ] 定时记忆整合：衰减与保留期策略（当前仅保留配置，尚未启用自动永久删除）。
 - [ ] 更丰富的记忆检索（可选 embedding、混合排序）。
-- [ ] 更多 Provider 与界面中的提示词缓存遥测。
+- [ ] 对话分支（已有设计文档，尚未实现）。
+- [ ] 更多 Provider 与更完整的缓存分析界面。
 
 ## 文档
 

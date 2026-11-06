@@ -1,5 +1,6 @@
 """独立 SQLite 会话归档。 / Independent SQLite conversation archive."""
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ class SQLiteConversationStore:
 
     def __init__(self, connection: aiosqlite.Connection) -> None:
         self._connection = connection
+        self.learning_wakeup = asyncio.Event()
 
     @classmethod
     @asynccontextmanager
@@ -146,6 +148,7 @@ class SQLiteConversationStore:
                 ("profile_version", "INTEGER"),
                 ("learning_attempts", "INTEGER NOT NULL DEFAULT 0"),
                 ("learning_error", "TEXT"),
+                ("learning_generation", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     await connection.execute(
@@ -428,6 +431,7 @@ class SQLiteConversationStore:
                 "WHERE user_id=? AND learning_state=1",
                 (user_id,),
             )
+        self.learning_wakeup.set()
 
     async def save_turn(self, turn: ConversationTurn) -> None:
         """turn：从完成快照提取的轮次。 / A turn from a completed snapshot."""
@@ -447,7 +451,9 @@ class SQLiteConversationStore:
                 learning_state, learning_project_id, attachment_ids, activity, metrics,
                 used_memory_ids, profile_version, recorded_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            VALUES (?, ?, ?, ?, ?, CASE WHEN ?=1 AND coalesce((
+                SELECT personalization_enabled FROM conversation_preferences WHERE user_id=?
+            ),1)=1 THEN 1 ELSE 0 END, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             ON CONFLICT (user_id, thread_id, run_id) DO NOTHING
             """,
             (
@@ -457,6 +463,7 @@ class SQLiteConversationStore:
                 turn.user_input,
                 turn.response,
                 int(turn.learn_memory),
+                user_id,
                 turn.project_id,
                 json.dumps(turn.attachment_ids),
                 json.dumps([entry.model_dump() for entry in turn.activity]),
@@ -464,32 +471,56 @@ class SQLiteConversationStore:
                 json.dumps(turn.used_memory_ids),
                 turn.profile_version,
             ),
-        ):
-            pass
+        ) as cursor:
+            if cursor.rowcount and turn.learn_memory:
+                self.learning_wakeup.set()
 
-    async def learning_jobs(self) -> list[tuple]:
+    async def learning_jobs(self, limit: int = 32) -> list[tuple]:
         async with self._connection.execute(
             """SELECT id, user_id, thread_id, run_id, user_input, learning_project_id, recorded_at
                FROM conversation_turns WHERE learning_state=1
                  AND learning_retry_at <= CAST(strftime('%s', 'now') AS INTEGER)
-               ORDER BY id LIMIT 32"""
+               ORDER BY id LIMIT ?""",
+            (limit,),
         ) as cursor:
             return await cursor.fetchall()
 
-    async def finish_learning(self, row_id: int, user_id: str, thread_id: str, run_id: str):
+    async def finish_learning(
+        self, row_id: int, user_id: str, thread_id: str, run_id: str, generation: int | None = None
+    ):
         await self._connection.execute(
             """UPDATE conversation_turns SET learning_state=2, learning_error=NULL
-               WHERE id=? AND user_id=? AND thread_id=? AND run_id=? AND learning_state=1""",
-            (row_id, user_id, thread_id, run_id),
+               WHERE id=? AND user_id=? AND thread_id=? AND run_id=? AND learning_state=1
+                 AND (? IS NULL OR learning_generation=?)""",
+            (row_id, user_id, thread_id, run_id, generation, generation),
         )
 
-    async def defer_learning(self, row_id: int, user_id: str, thread_id: str, run_id: str):
+    async def defer_learning(
+        self,
+        row_id: int,
+        user_id: str,
+        thread_id: str,
+        run_id: str,
+        error: str = "EXTRACTION_FAILED",
+        delay: int = 30,
+        count_attempt: bool = True,
+    ):
         await self._connection.execute(
             """UPDATE conversation_turns
-               SET learning_retry_at=CAST(strftime('%s', 'now') AS INTEGER)+30,
-                   learning_attempts=learning_attempts+1, learning_error='EXTRACTION_FAILED'
+               SET learning_retry_at=CAST(strftime('%s', 'now') AS INTEGER)+?,
+                   learning_state=CASE WHEN learning_attempts+? >= 5 THEN 3 ELSE 1 END,
+                   learning_attempts=learning_attempts+?, learning_error=?
                WHERE id=? AND user_id=? AND thread_id=? AND run_id=? AND learning_state=1""",
-            (row_id, user_id, thread_id, run_id),
+            (
+                delay,
+                int(count_attempt),
+                int(count_attempt),
+                error,
+                row_id,
+                user_id,
+                thread_id,
+                run_id,
+            ),
         )
 
     async def learning_pending(self, user_id: str, thread_id: str, run_id: str) -> bool:
@@ -504,29 +535,76 @@ class SQLiteConversationStore:
         async with self._connection.execute(
             """SELECT count(*), coalesce(sum(learning_state=1),0),
                       coalesce(sum(learning_state=2),0),
-                      coalesce(sum(learning_state=1 AND learning_error IS NOT NULL),0)
+                      coalesce(sum(learning_state IN (1,3) AND learning_error IS NOT NULL),0),
+                      coalesce(sum(learning_state=3),0),
+                      (SELECT learning_error FROM conversation_turns
+                       WHERE user_id=? AND learning_state IN (1,3) AND learning_error IS NOT NULL
+                       ORDER BY id DESC LIMIT 1)
                FROM conversation_turns WHERE user_id=?""",
-            (user,),
+            (user, user),
         ) as cursor:
-            total, pending, processed, failed = await cursor.fetchone()
+            total, pending, processed, failed, dead, last_error = await cursor.fetchone()
         return {
             "total_turns": total,
             "pending": pending,
             "processed": processed,
             "failed": failed,
             "enabled": await self.personalization_enabled(user),
+            "dead": dead,
+            "last_error": last_error,
         }
 
     async def requeue_learning(self, user: str, thread: str | None = None) -> int:
         async with self._connection.execute(
             """UPDATE conversation_turns SET learning_state=1, learning_retry_at=0,
-                      learning_attempts=0, learning_error=NULL
+                      learning_attempts=0, learning_error=NULL,
+                      learning_generation=learning_generation+1
                WHERE id IN (SELECT id FROM conversation_turns WHERE user_id=?
-                 AND learning_state IN (1,2) AND (? IS NULL OR thread_id=?)
+                 AND learning_state IN (1,2,3) AND (? IS NULL OR thread_id=?)
                  ORDER BY id DESC LIMIT 500)""",
             (user, thread, thread),
         ) as cursor:
+            self.learning_wakeup.set()
             return cursor.rowcount
+
+    async def learning_metadata(self, user: str, thread: str, run: str) -> dict | None:
+        async with self._connection.execute(
+            "SELECT learning_state,learning_generation,metrics,learning_attempts, "
+            "user_input,learning_project_id,recorded_at "
+            "FROM conversation_turns WHERE user_id=? AND thread_id=? AND run_id=?",
+            (user, thread, run),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return (
+            {
+                "state": row[0],
+                "generation": row[1],
+                "metrics": json.loads(row[2]) if row[2] else {},
+                "attempts": row[3],
+                "text": row[4],
+                "project_id": row[5],
+                "recorded_at": row[6],
+            }
+            if row
+            else None
+        )
+
+    async def learning_retry_delay(self) -> float | None:
+        async with self._connection.execute(
+            "SELECT min(learning_retry_at)-CAST(strftime('%s','now') AS INTEGER) "
+            "FROM conversation_turns WHERE learning_state=1 AND learning_error IS NOT NULL"
+        ) as cursor:
+            delay = (await cursor.fetchone())[0]
+        return max(1, delay) if delay is not None else None
+
+    async def wake_learning(self, user: str):
+        await self._connection.execute(
+            "UPDATE conversation_turns SET learning_retry_at=0 "
+            "WHERE user_id=? AND learning_state=1 AND learning_error IN "
+            "('MEMORY_MODEL_UNAVAILABLE','MEMORY_BUDGET_EXCEEDED','MEMORY_STATE_CHANGED')",
+            (user,),
+        )
+        self.learning_wakeup.set()
 
     async def discard_thread_learning(self, user_id: str, thread_id: str):
         await self._connection.execute(

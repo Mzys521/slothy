@@ -7,9 +7,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api import ChatInput, create_app
+from app.api import ChatInput
 from app.config import CheckpointSettings
 from app.providers import ProviderInput, ProviderStore
+from tests.support.legacy_app import create_app
 
 
 @pytest.fixture
@@ -17,15 +18,27 @@ def upstream():
     requests = []
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *_args):
             pass
 
-        def do_GET(self):
-            assert self.headers.get("Authorization") == "Bearer private-config-key"
+        def reply(self, body):
+            data = json.dumps(body).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            # Explicit framing avoids depending on EOF after the test server closes
+            # a Windows socket. Keep the real HTTP + provider SDK path under test.
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(json.dumps({"data": [{"id": "connected-model"}]}).encode())
+            self.wfile.write(data)
+            self.wfile.flush()
+            self.close_connection = True
+
+        def do_GET(self):
+            assert self.headers.get("Authorization") == "Bearer private-config-key"
+            self.reply({"data": [{"id": "connected-model"}]})
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -44,10 +57,7 @@ def upstream():
                 ],
                 "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13},
             }
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(response).encode())
+            self.reply(response)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -88,6 +98,7 @@ def test_first_run_configuration_routes_to_real_sdk_and_persists(tmp_path, monke
         assert client.get("/docs").status_code == 404
         assert client.get("/openapi.json").status_code == 404
         discovered = client.post(base + "/discover", json=config(url))
+        assert discovered.status_code == 200, discovered.text
         assert discovered.json()["items"][0]["id"] == "connected-model"
         saved = client.post(base, json=config(url))
         assert saved.status_code == 201, saved.text

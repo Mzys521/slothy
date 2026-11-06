@@ -11,14 +11,17 @@ import AccountPage from './AccountPage.vue'
 import UserAvatar from './UserAvatar.vue'
 import TitleBar from './TitleBar.vue'
 import ApiSettingsPage from './ApiSettingsPage.vue'
+import OnboardingOverlay from './OnboardingOverlay.vue'
 import AboutPage from './AboutPage.vue'
 import BrandWordmark from './BrandWordmark.vue'
 import SettingsLayout from './SettingsLayout.vue'
-import { configurationError, configurationLoaded, loadProviderSettings, setupRequired } from './providerSettings'
+import { configurationError, configurationLoaded, configurationLoading, loadProviderSettings, setupRequired } from './providerSettings'
+import { developmentOnboarding } from './providerForm'
 import { accountProfile, loadAccount } from './account'
 import { activeSession, activeWorkspace, archiveSession, createWorkspace, forkSession, newChat, personalWorkspaceId, removeWorkspace, renameWorkspace, runningSessions, selectSession, sessions, sessionWorkspace, syncWorkspaceData, workspaceName, workspaceDirectory, workspaces, type Session } from './chat'
 import { t, zh } from './preferences'
 import { threadPath, workRequest } from './workApi'
+import { copyText } from './clipboard'
 
 const account = [
   { id: 'account', en: 'My profile', zh: '用户主页', icon: UserRound },
@@ -36,6 +39,11 @@ function currentPage(): Page {
   return validPages.has(route) ? route as Page : 'workspace'
 }
 const page = ref(currentPage())
+const onboardingPreview = ref(import.meta.env.DEV && developmentOnboarding(true, location.search))
+const onboardingOpen = computed(() => configurationLoaded.value && (setupRequired.value || onboardingPreview.value))
+const onboardingVisible = ref(false)
+const onboardingBlocking = computed(() => onboardingOpen.value || onboardingVisible.value)
+const conversationGeneration = ref(0)
 const settingsPage = computed(() => page.value === 'settings' || page.value.startsWith('settings/'))
 const conversationPage = computed(() => page.value === 'workspace' || page.value === 'chat' || page.value === 'memory-detail')
 const selectedMemory = ref('')
@@ -104,7 +112,6 @@ function sessionTitle(item: Session) {
 watch(page, () => { profileMenu.value = false })
 
 function navigate(target: Page) {
-  if (setupRequired.value && target !== 'settings/api' && target !== 'settings/about') target = 'settings/api'
   page.value = target
   if (location.hash !== '#' + target) location.hash = target
   profileMenu.value = false
@@ -112,16 +119,27 @@ function navigate(target: Page) {
 }
 function updateRoute() {
   if (location.hash === '#sessions') location.replace('#workspace')
-  if (setupRequired.value && location.hash !== '#settings/api' && location.hash !== '#settings/about') location.replace('#settings/api')
   page.value = currentPage()
 }
 async function initializeConfiguration() {
   try {
     await loadProviderSettings()
-    if (setupRequired.value) navigate('settings/api')
   } catch { /* The startup error stays visible with an explicit retry. */ }
 }
-watch(setupRequired, required => { if (required) navigate('settings/api') })
+function finishOnboarding() {
+  onboardingPreview.value = false
+  conversationGeneration.value++
+  const url = new URL(location.href)
+  url.hash = 'workspace'
+  history.replaceState(history.state, '', url)
+  page.value = 'workspace'
+  profileMenu.value = false; sidebarOpen.value = false
+}
+watch(onboardingOpen, open => {
+  if (!open) return
+  profileMenu.value = false; sidebarOpen.value = false; closeRowMenu()
+  if (workspaceDialog.value?.open) workspaceDialog.value.close()
+})
 function openMemory(id: string) {
   if (page.value !== 'memory-detail') memoryOrigin.value = page.value
   selectedMemory.value = id
@@ -287,13 +305,14 @@ async function branchSession(item: Session) {
 async function copySessionId(item: Session) {
   closeRowMenu(true)
   try {
-    await navigator.clipboard.writeText(item.id)
+    await copyText(item.id)
     actionNotice.value = t('Session ID copied.', '已复制会话 ID。')
   } catch {
     actionNotice.value = t('Could not copy session ID.', '无法复制会话 ID。')
   }
 }
 function onGlobalKey(event: KeyboardEvent) {
+  if (onboardingBlocking.value) return
   if (event.key === 'Escape') {
     if (rowMenu.value) {
       closeRowMenu(true)
@@ -340,7 +359,8 @@ onUnmounted(() => {
 
 <template>
   <TitleBar />
-  <div class="app-shell" :class="{ 'desktop-shell': isDesktop }">
+  <OnboardingOverlay :open="onboardingOpen" :desktop="isDesktop" :preview="onboardingPreview" @visibility="onboardingVisible = $event" @complete="finishOnboarding" />
+  <div class="app-shell" :class="{ 'desktop-shell': isDesktop }" :inert="onboardingBlocking">
     <aside ref="sidebar" class="sidebar" :class="{ 'sidebar-expanded': sidebarOpen }" :aria-label="t('Navigation', '导航')">
       <a class="brand" href="#workspace" aria-label="slothy" @click.prevent="navigate('workspace')">
         <BrandWordmark />
@@ -409,7 +429,7 @@ onUnmounted(() => {
     </aside>
 
     <div class="app-content">
-      <div v-if="!configurationLoaded" class="configuration-startup" role="status"><p>{{ configurationError || t('Starting slothy…', '正在启动 slothy…') }}</p><button v-if="configurationError" type="button" class="text-link" @click="initializeConfiguration">{{ t('Retry', '重试') }}</button></div>
+      <div v-if="!configurationLoaded" class="configuration-startup" role="status"><p :role="configurationError ? 'alert' : undefined">{{ configurationError || t('Starting slothy…', '正在启动 slothy…') }}</p><button v-if="configurationError" type="button" class="text-link" :disabled="configurationLoading" @click="initializeConfiguration">{{ t('Retry', '重试') }}</button></div>
       <template v-else>
       <AccountPage v-if="page === 'account'" />
       <GraphPage v-else-if="page === 'graph'" v-model="graphNode" @detail="openMemory" />
@@ -423,7 +443,7 @@ onUnmounted(() => {
           <SessionHistory archived />
         </main>
       </SettingsLayout>
-      <ChatPage v-if="conversationPage" :memory-id="page === 'memory-detail' ? selectedMemory : undefined"
+      <ChatPage v-if="conversationPage" :key="conversationGeneration" :memory-id="page === 'memory-detail' ? selectedMemory : undefined"
         @memory="openMemory" @evidence="openEvidence" @close-context="navigate(memoryOrigin)"
         @memory-review="navigate('memories')">
         <template #memory-actions>

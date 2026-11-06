@@ -12,6 +12,7 @@ declare global {
       isMaximized(): Promise<boolean>
       close(): Promise<void>
       selectDirectory(): Promise<string | null>
+      writeClipboard(text: string): Promise<void>
       onMaximized(listener: (value: boolean) => void): () => void
     }>
   }

@@ -1,5 +1,6 @@
 <script lang="ts">
 import MarkdownIt from 'markdown-it'
+import { replyPreview, previewTheme } from './replyPreview'
 const markdown = new MarkdownIt({ html: false, breaks: true })
 // Chat output must not fetch remote images. Keep their alt text visible.
 markdown.renderer.rules.image = (tokens, index) => markdown.utils.escapeHtml(tokens[index]?.content ?? '')
@@ -9,7 +10,6 @@ interface PreviewLabels {
   demo: string
 }
 
-const escapeHtml = markdown.utils.escapeHtml
 const previewLimit = 200_000
 const svgStart = /^<svg(?=[\s/>])/
 
@@ -30,22 +30,17 @@ function svgImage(source: string, label: string) {
     root.setAttribute('height', String(height))
   }
   const title = root.getElementsByTagName('title')[0]?.textContent?.trim() || label
-  const data = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(root))
-  return '<img class="reply-diagram" alt="' + escapeHtml(title) + '" src="' + data + '">'
+  if (!root.hasAttribute('viewBox')) {
+    const w = parseFloat(root.getAttribute('width') || '600')
+    const h = parseFloat(root.getAttribute('height') || '400')
+    if (w > 0 && h > 0) root.setAttribute('viewBox', `0 0 ${w} ${h}`)
+  }
+  return replyPreview(new XMLSerializer().serializeToString(root), title, 'svg')
 }
 
 function htmlDemo(source: string, label: string) {
   if (!source.trim() || source.length > previewLimit) return ''
-  // The outer frame's policy also blocks the inner frame from navigating to a remote URL.
-  const policy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
-    "img-src data:; frame-src 'none'; base-uri 'none'; form-action 'none'"
-  const wrapper = '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">' +
-    '<meta http-equiv="Content-Security-Policy" content="' + policy + '">' +
-    '<style>html,body,iframe{width:100%;height:100%;margin:0;border:0}iframe{display:block}</style>' +
-    '<iframe sandbox="allow-scripts" title="' + escapeHtml(label) + '" srcdoc="' +
-    escapeHtml(source.trimStart().startsWith('<!') ? source : '<!doctype html>\n' + source) + '"></iframe>'
-  return '<iframe class="reply-demo" sandbox="allow-scripts" referrerpolicy="no-referrer" title="' +
-    escapeHtml(label) + '" srcdoc="' + escapeHtml(wrapper) + '"></iframe>'
+  return replyPreview(source, label, 'html')
 }
 
 const renderFence = markdown.renderer.rules.fence!
@@ -91,8 +86,8 @@ markdown.renderer.rules.reply_svg = (tokens, index) => tokens[index]!.content
 </script>
 
 <script setup lang="ts">
-import { computed } from 'vue'
-import { t } from './preferences'
+import { computed, onMounted, onUnmounted, ref, watch, nextTick } from 'vue'
+import { settings, t } from './preferences'
 const props = defineProps<{ text: string; previews?: boolean }>()
 const rendered = computed(() => markdown.render(props.text, {
   previews: props.previews ? {
@@ -100,8 +95,28 @@ const rendered = computed(() => markdown.render(props.text, {
     demo: t('Interactive demo', '交互演示'),
   } : undefined,
 }))
+const container = ref<HTMLElement>()
+const media = matchMedia('(prefers-color-scheme: dark)')
+function syncTheme() {
+  for (const frame of container.value?.querySelectorAll<HTMLIFrameElement>('iframe[data-preview-id]') ?? []) {
+    const send = () => frame.contentWindow?.postMessage({ kind: 'preview-theme', id: frame.dataset.previewId, theme: previewTheme() }, '*')
+    frame.onload = send
+    send()
+  }
+}
+function resize(event: MessageEvent) {
+  if (event.data?.kind !== 'reply-preview-size' || !Number.isFinite(event.data.height)) return
+  for (const frame of container.value?.querySelectorAll<HTMLIFrameElement>('iframe[data-preview-id]') ?? []) {
+    if (event.source === frame.contentWindow && event.data.id === frame.dataset.previewId) {
+      frame.style.height = Math.max(1, Math.min(100000, event.data.height)) + 'px'
+    }
+  }
+}
+watch([rendered, () => settings.mode, () => settings.palette, () => settings.font], () => { void nextTick(syncTheme) })
+onMounted(() => { window.addEventListener('message', resize); media.addEventListener('change', syncTheme); syncTheme() })
+onUnmounted(() => { window.removeEventListener('message', resize); media.removeEventListener('change', syncTheme) })
 </script>
 
 <template>
-  <div class="markdown-text" v-html="rendered"></div>
+  <div ref="container" class="markdown-text" v-html="rendered"></div>
 </template>

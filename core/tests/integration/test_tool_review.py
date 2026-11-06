@@ -9,9 +9,9 @@ from langchain_core.messages import AIMessage, ToolMessage
 from app import api
 from app.agent.graph import build_graph_config
 from app.agent.tools import create_builtin_tools
-from app.api import create_app
 from app.config import CheckpointSettings, ToolSettings
 from app.infrastructure.llm.catalog import ModelItem
+from tests.support.legacy_app import create_app
 
 
 class ToolModel(FakeMessagesListChatModel):

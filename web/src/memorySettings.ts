@@ -21,9 +21,16 @@ export interface MemoryConfigurationPublic {
   configuration: MemoryConfiguration
   defaults: MemoryConfiguration
   runtime: {
-    engine: 'rule_review'
-    planner_available: false
+    engine: 'rule_review' | 'llm_learning'
+    planner_available: boolean
     personalization_enabled: boolean
+    model_available: boolean
+    effective_model: string | null
+    mode: MemoryConfiguration['mode']
+    applied_fields: string[]
+    reported_tokens: number
+    estimated_tokens: number
+    budgeted_tokens: number
   }
 }
 

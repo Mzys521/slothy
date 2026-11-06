@@ -6,7 +6,8 @@ root = Path(SPECPATH).parent
 datas = []
 for package in ('langchain_core', 'langchain_openai', 'langchain_anthropic', 'langgraph',
                 'langgraph_checkpoint', 'langgraph_checkpoint_sqlite', 'langsmith', 'openai',
-                'anthropic', 'pydantic', 'uvicorn', 'fastapi', 'python-docx', 'tiktoken'):
+                'anthropic', 'pydantic', 'uvicorn', 'fastapi', 'python-docx', 'tiktoken', 'mcp',
+                'jsonschema', 'referencing', 'jsonschema-specifications'):
     datas += copy_metadata(package)
 for package in ('certifi', 'docx', 'openpyxl', 'reportlab', 'pptx', 'tiktoken_ext'):
     datas += collect_data_files(package, include_py_files=False)
@@ -15,6 +16,7 @@ hiddenimports = ['app.tools.python_worker', 'uvicorn.logging', 'uvicorn.loops.as
                  'uvicorn.protocols.http.h11_impl', 'uvicorn.lifespan.on', 'sqlite3',
                  'docx', 'openpyxl', 'reportlab.pdfgen.canvas', 'pptx', 'tiktoken_ext.openai_public']
 hiddenimports += collect_submodules('langgraph', filter=lambda name: '.test' not in name)
+datas += collect_data_files('jsonschema_specifications', include_py_files=False)
 
 analysis = Analysis(
     [str(root / 'desktop' / 'entry.py')], pathex=[str(root)], binaries=[], datas=datas,
