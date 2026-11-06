@@ -118,7 +118,9 @@ npm run dev
 ```
 
 `npm run dev` 会启动 Vite 与 Electron；Electron 主进程从 `core/.venv` 拉起本地后端、注入本次
-启动的令牌并打开窗口。首次运行请在 **设置 → API** 配置模型服务。
+启动的令牌并打开窗口。首次运行时，在尚未配置服务商的情况下会出现配置引导层：选择模板或自定义连接
+（DeepSeek、MiMo、OpenAI、Anthropic、Kimi、Qwen 或任意 OpenAI 兼容端点），填入密钥保存后即可
+进入工作区。之后可在 **设置 → API** 中修改。
 
 安装包构建、环境变量、故障排查见 [快速开始](docs/getting-started.zh-CN.md)。
 

@@ -141,8 +141,10 @@ npm run dev
 
 `npm run dev` starts Vite and Electron; the Electron main process launches the
 local backend from `core/.venv`, injects the per-launch token and opens the
-window. On first run, open **Settings → API** and configure a model provider
-(DeepSeek, MiMo, Anthropic or any OpenAI-compatible endpoint).
+window. On first run the setup overlay appears while no provider is configured —
+pick a template or a custom connection (DeepSeek, MiMo, OpenAI, Anthropic, Kimi,
+Qwen or any OpenAI-compatible endpoint), save the key, and the workspace opens.
+Later changes live under **Settings → API**.
 
 Install and package details, environment variables and troubleshooting live in
 [Getting started](docs/getting-started.md).
