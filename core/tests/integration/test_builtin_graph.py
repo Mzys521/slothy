@@ -65,8 +65,8 @@ async def test_graph_calls_real_float_and_financial_tools(tmp_path: Path):
         for message in result["messages"]
         if message.type == "tool"
     }
-    assert outputs["normal"] == "0.30000000000000004"
-    assert outputs["money"] == "0.30"
+    assert json.loads(outputs["normal"])["data"]["value"] == 0.30000000000000004
+    assert json.loads(outputs["money"])["data"]["value"] == "0.30"
     assert result["response"] == "金额结果为 0.30"
 
 
@@ -77,9 +77,7 @@ async def test_graph_returns_actual_python_document_artifacts(tmp_path: Path):
             AIMessage(
                 id="request",
                 content="",
-                tool_calls=[
-                    {"id": "document", "name": "write_document_python", "args": {"code": code}}
-                ],
+                tool_calls=[{"id": "document", "name": "run_python", "args": {"code": code}}],
             ),
             AIMessage(id="answer", content="文档已生成"),
         ]
@@ -95,8 +93,10 @@ async def test_graph_returns_actual_python_document_artifacts(tmp_path: Path):
     )
     output = next(message for message in result["messages"] if message.type == "tool")
     payload = json.loads(output.content)
-    assert payload["ok"] and len(payload["files"]) == 1
-    assert (tmp_path / payload["files"][0]["path"]).read_text(encoding="utf-8") == "# Report"
+    assert payload["ok"] and len(payload["artifacts"]) == 1, payload
+    assert (tmp_path / payload["artifacts"][0]["rel_path"]).read_text(
+        encoding="utf-8"
+    ) == "# Report"
 
 
 async def test_graph_reports_numeric_money_arguments_as_validation_error(tmp_path: Path):
@@ -126,4 +126,6 @@ async def test_graph_reports_numeric_money_arguments_as_validation_error(tmp_pat
         create_initial_state(user_id="u", thread_id="t", user_input="金额计算", settings=settings)
     )
     output = next(message for message in result["messages"] if message.type == "tool")
-    assert output.status == "error" and "String amounts" in output.content
+    assert (
+        output.status == "error" and json.loads(output.content)["error"]["code"] == "INVALID_ARGS"
+    )

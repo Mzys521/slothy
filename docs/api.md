@@ -33,7 +33,7 @@ the port is assigned at startup.
 | POST | `/settings/providers/discover` | query `{base_url}/models` for the given credentials |
 | GET | `/settings` | global personalization switch |
 | PATCH | `/settings` | set the global personalization switch |
-| GET | `/settings/memory` | memory planner configuration (13 fields, revision) |
+| GET | `/settings/memory` | memory planner configuration (14 fields, revision) |
 | PATCH | `/settings/memory` | update configuration with revision check |
 
 ## 3. Account
@@ -77,10 +77,49 @@ background consumption and adds `memory_tokens` and `unreported_calls`; daily
 | GET | `/graph` | memory graph (`limit`, `focus_id`); returns `nodes`, `edges`, totals |
 | PUT | `/graph/links` | create/update a link (directed or undirected, relation, relevance) |
 | DELETE | `/graph/links` | delete a link |
-| GET | `/profile` | current profile version (preferences + attributes) |
+| GET | `/profile` | current profile version and unified attributes |
 | GET | `/profile/versions` | version history (cursor pagination) |
 | GET | `/profile/versions/{version}` | one historical version |
-| PATCH | `/profile` | edit preferences with `expected_version` (409 on conflict) |
+| PATCH | `/profile` | replace attributes with `expected_version` (409 on conflict) |
+
+### V3 contracts (0.1.4.1-beta)
+
+`PATCH /profile` accepts `{expected_version, attributes: [{key, dimension, value,
+scope?, scope_ref?}], change_summary?}`. Values retain JSON types. Dimensions are
+`identity/skill/preference/habit/goal`; facts are the only write authority, and
+profiles are projections. `preferences` is no longer accepted. Name aliases map to
+`identity.name`; `identity.preferred_name` is separate. Identity is global. Skills
+use `skills.<target>.level` (beginner/intermediate/advanced/expert) or `.learning`
+(boolean), retaining their target. Personal skills default global; explicit project
+statements remain scoped.
+
+Memory records add `memory_key, dimension, value, subject, predicate, concepts,
+concept_ids, source_concept_id, target_concept_id, effective_frequency, strength,
+protected, superseded_by, scoring_version`. States are `active/archived/superseded/
+invalidated`. Corrections return a new fact ID. Strength is `f/(f+strength_c)`;
+`strength_c=4` by default. Only qualified evidence creates reinforcement events;
+each concept/scope/session and fact/session is unique. Capacity archives unprotected
+facts and never deletes them by a weight threshold. No TTL or time decay is applied.
+
+`GET /graph?project_id=...&thread_id=...` returns visible scoped concept nodes with
+independent frequencies, and directed semantic edges with `fact_id, relation,
+effective_frequency, strength, evidence_ids`. Different predicates between the same
+nodes retain separate edges. `GET /concepts/{id}` uses the same visibility checks.
+Manually managed links retain their existing endpoints; co-occurrence creates no
+automatic semantic edge. `/memory-learning.statistics` exposes active/archive counts,
+deduplicated reinforcement events, conflicts and blocked capacity.
+
+Chat, history and approval payloads add `memory_trace` and `response_source`.
+`used_memory_ids` identifies evidence actually supplied to the model or identity
+answerer, not proof of model adoption. Trace stores bounded IDs, scores, relationship
+paths and reason codes without fact bodies. Direct self-identity questions bypass
+generation, use valid global identity facts and report missing/pending/conflicting/
+disabled/unavailable states explicitly.
+
+`/runtime` adds `storage_version=3` and `data_epoch`. First V3 startup resets all
+three business databases once, without replaying old messages. Provider/connector
+configuration files, UI preferences and workspace files remain. The renderer clears
+its old conversation cache on epoch change; it never imports it into the new store.
 
 ## 5. Workspaces, threads, attachments
 
@@ -213,6 +252,106 @@ Public fields: `id, kind, name, description, enabled, builtin, tools, transport,
 
 Local tools accept JSON, or ZIP with `tool.json`: `{name,description,command,args,input_schema}`. The command uses JSON stdin/stdout, the active workspace as cwd and `${plugin}` for its bundle directory; interpreters and dependencies must already be installed. MCP accepts standard `mcpServers` JSON with stdio `command,args,env` or HTTP `url,type,headers` (`streamable-http` / legacy `sse`). Enabling discovers tools through the real connection; failure preserves the previous state. Toggle off/on to refresh definitions.
 
-Skills accept ZIP with exactly one SKILL.md and reference files. Enabled instructions are low-trust L3 reference data. `read_skill_file(skill_id,path,offset=0)` pages UTF-8 references, 8,000 characters with `next_offset`. Importing/enabling never runs bundled scripts. Imported tools in both Chat and Work require approval; disabling revokes execution, and changed definitions change their tool identifiers. Windows uses DPAPI to protect the saved configuration.
+Skills accept ZIP with exactly one SKILL.md and reference files. Enabled instructions are low-trust L3 reference data. `read_skill_file(skill_id,path,offset=0)` pages UTF-8 references, 8,000 characters with `next_offset`. Importing/enabling never runs bundled scripts. Imported executable tools are Work-only and require approval; Skill reference reads are read-only in both modes; disabling revokes execution, and changed definitions change their tool identifiers. Windows uses DPAPI to protect the saved configuration.
 
 Errors retain `{code,message,request_id}`: 404 `CONNECTOR_NOT_FOUND`, 409 `CONNECTOR_EXISTS`, 413 `CONNECTOR_TOO_LARGE`, 422 `CONNECTOR_INVALID` / `CONNECTOR_LIMIT` / `VALIDATION_ERROR`, 502 `CONNECTOR_CONNECTION_FAILED`. Limits: 10 MiB import, 20 MiB / 512 extracted entries, 64 imported items and 64 enabled imported tools; 8 enabled skills with 64,000 instruction characters combined.
+
+## Unified tool contract
+
+`GET /runtime` adds `tool_groups` (read/write/execute/network) and `deprecated_tools`.
+Default desktop tools: 9 in Work, 7 in Chat; `read_skill_file` is conditional, and
+`web_fetch` is optional. Hidden aliases never appear in the visible tool lists.
+Connector records additionally expose `risk`, `platforms`, `available` and per-tool
+`capabilities`; credential/configuration fields remain private.
+
+Tool messages use this envelope:
+
+```json
+{"ok":true,"summary":"Financial calculation completed.","data":{"value":"0.30"},"artifacts":[]}
+```
+
+Failures set `ok=false` and carry `error: {code,message,retryable,hint?}`. Codes include
+`INVALID_ARGS`, `UNKNOWN_TOOL`, `UNAVAILABLE`, `OUT_OF_WORKSPACE`, `OUTPUT_TOO_LARGE`,
+`TIMEOUT`, `DENIED`, `CONNECTOR_DISABLED`, `EXEC_FAILED`, `NETWORK_BLOCKED`,
+`BUDGET_EXCEEDED`, `RECOVERY_REQUIRED`. Read pages may include `next_offset`.
+Artifact metadata contains `id,name,bytes,rel_path,sha256,url`; only real returned
+artifacts are reported. `GET /threads/{thread_id}/artifacts/{artifact_id}` downloads
+an owned, journaled artifact after path/size/hash validation (404 when unavailable).
+
+Each approval call optionally includes `risk` and `review_hint`. The approval ID,
+explicit boolean decision and batch semantics are unchanged. Invalid/unavailable
+calls fail without a new review; `every` reviews every valid available call.
+
+`metrics.tools` accompanies SSE `done`, archived turns and account activity. Rows
+contain `name,calls,ok,errors,rejected,approval_wait_ms,duration_ms,output_bytes,
+output_chars,artifacts,timed_out,reused`. Calls include resolved attempts and rejections;
+`ok + errors + rejected = calls`. Waiting is wall time for the reviewed batch,
+recorded for each affected call, and excluded from execution-time budgets. Reuse
+counts a logical call while preserving the journaled execution duration. Model
+usage may be absent while tool telemetry exists: `usage_reported=false` marks that
+case and does not turn placeholder zero tokens into a reported bill.
+`GET /account/activity` adds `tools` and `tool_daily` for instrumented completed runs;
+historical activity without tool telemetry retains its existing aggregate counters.
+
+Configuration is documented in `.env.example`: workspace/template/time/Python flags,
+network opt-in plus an exact JSON domain allowlist, per-run budgets, file/search
+limits and managed-artifact retention. `web_fetch` needs both enablement and a
+nonempty allowlist, permits only HTTPS/443, and revalidates DNS and redirects.
+
+Golden evaluation: `python -m examples.evaluate_tool_golden` validates 25 fixed
+fixtures without model calls. Add `--live` to request tool proposals from the
+configured provider and compare the historical catalog. Tools are never executed
+by this evaluation. Reports distinguish offline/schema checks, full-set routing
+coverage and accuracy on shared capabilities; they are not end-task execution scores.
+
+## Composer commands and explicit references
+
+The input and plus button share a command/reference menu. Twenty fixed client commands
+reuse the existing session/workspace state, model picker, settings, attachment upload
+and streaming transport. Unknown commands and invalid arguments are not sent to the model.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/references/folders`, `/references/files` | Bounded workspace and current-thread attachment lookup |
+| GET | `/references/sessions`, `/references/plugins` | Owned sessions and public plugin metadata |
+| POST | `/threads/{id}/compact` | Confirmed L2 compression; preserve the last two turns and full archive |
+| POST | `/threads/{id}/export` | Confirmed md/docx template export using managed artifacts |
+| POST | `/commands/events` | Record a closed command identity, without executable arguments |
+| GET | `/commands/usage` | Local command counts and reference preflight outcomes |
+
+Search accepts `q` (120 characters), `limit` (1–8), optional `thread_id`,
+`workspace_id=personal`, and `path=.` for folder browsing. Responses are `{items:[]}`.
+Existing token/Origin checks and ownership policy apply. Search failures use
+`REFERENCE_UNAVAILABLE`; missing sessions retain the existing 404 response.
+
+`POST /chat` adds optional `references` (at most eight distinct entries):
+
+```json
+{"message":"Summarize the selected sources","thread_id":"...","references":[
+  {"kind":"folder","path":"reports"},
+  {"kind":"file","id":"reports/notes.md","source":"workspace"},
+  {"kind":"file","id":"attachment-id","source":"attachment"},
+  {"kind":"session","id":"owned-session-id"},
+  {"kind":"plugin","id":"connector-id"}
+]}
+```
+
+The server resolves identities and rejects invalid references before the model with
+422 `REFERENCE_INVALID`. References are revalidated for every model call, remain
+low-trust L3 data and do not enable plugins or change tool approval. Default aggregate
+budget: `REFERENCES_CONTEXT_CHARS=12000`, separate from memory. Folder/file/session/plugin
+blocks are capped at 4k/8k/4k/2k characters; binary files provide metadata. Sessions prefer
+an existing summary plus two recent excerpts, otherwise at most six recent excerpts.
+`ChatResult`, review and archived turns include `references` metadata and
+`used_reference_ids`. Chips expose missing/disabled/truncated states; full reference
+content is not copied into L1/L2 or the archive.
+Completed replies also include the saved original `message`, so resumed answers can
+be associated with the correct turn even after the local draft was edited.
+
+Compact requires `{"confirmed":true}`; export also accepts `format:"md"|"docx"` and an
+optional UUID `request_id` for journal reuse. False confirmation returns 409
+`CONFIRMATION_REQUIRED`; compression rejects pending runs. Export filenames are generated
+by the server and downloads use the existing artifact endpoint. Commands do not create
+tool calls or model usage. `command_events` and `reference_events` are local metadata;
+reference success rate is unknown until a preflight has occurred. `/stop` aborts the
+active request and `/retry` can use the existing resume endpoint.

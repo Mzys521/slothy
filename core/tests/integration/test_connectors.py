@@ -96,7 +96,7 @@ def test_local_tools_require_review_and_disabled_pending_never_executes(
         enabled = client.patch(BASE + "/connectors/" + item["id"], json={"enabled": True})
         assert enabled.status_code == 200, enabled.text
         (name,) = enabled.json()["tools"]
-        assert name in client.get(BASE + "/runtime").json()[mode + "_tools"]
+        assert (name in client.get(BASE + "/runtime").json()[mode + "_tools"]) == (mode == "work")
         model.responses[:] = [
             AIMessage(
                 content="",
@@ -112,6 +112,14 @@ def test_local_tools_require_review_and_disabled_pending_never_executes(
         ]
         thread = client.post(BASE + "/threads", json={"mode": mode}).json()["thread_id"]
         response = client.post(BASE + "/chat", json={"thread_id": thread, "message": "Run tool"})
+        if mode == "chat":
+            assert response.status_code == 200, response.text
+            activity = next(
+                entry for entry in response.json()["activity"] if entry["kind"] == "tool"
+            )
+            assert activity["error_code"] == "UNAVAILABLE"
+            assert "Isolated tool output" not in (activity["result"] or "")
+            return
         assert response.status_code == 202, response.text
         review = response.json()
         assert review["calls"][0]["name"] == name
@@ -194,7 +202,9 @@ def test_skills_load_reference_files_and_revoke_on_disable(tmp_path):
             ),
             AIMessage(content="Read the guide"),
         ]
-        review = client.post(BASE + "/chat", json={"message": "Use the skill"}).json()
+        review = client.post(
+            BASE + "/chat", json={"message": "Use the skill", "approval_policy": "every"}
+        ).json()
         assert "approval_id" in review
         result = client.post(
             f"{BASE}/threads/{review['thread_id']}/approval/" + review["approval_id"],
@@ -304,7 +314,7 @@ def test_mcp_stdio_discovers_and_calls_real_protocol_after_review(tmp_path):
             ),
             AIMessage(content="MCP done"),
         ]
-        review = client.post(BASE + "/chat", json={"message": "Call MCP"}).json()
+        review = client.post(BASE + "/chat", json={"mode": "work", "message": "Call MCP"}).json()
         assert "approval_id" in review
         result = client.post(
             f"{BASE}/threads/{review['thread_id']}/approval/" + review["approval_id"],
@@ -379,7 +389,9 @@ def test_streamable_http_mcp_can_be_imported_and_invoked(tmp_path):
                 ),
                 AIMessage(content="Done"),
             ]
-            review = client.post(BASE + "/chat", json={"message": "Call HTTP MCP"}).json()
+            review = client.post(
+                BASE + "/chat", json={"mode": "work", "message": "Call HTTP MCP"}
+            ).json()
             assert "approval_id" in review
             completed = client.post(
                 f"{BASE}/threads/{review['thread_id']}/approval/" + review["approval_id"],
@@ -469,7 +481,8 @@ async def test_mcp_pagination_is_used_for_discovery_and_execution(tmp_path, monk
     pages[1] = Tool(name="second", description="Changed operation", inputSchema=schema)
     await registry.toggle(imported[0]["id"], True)
     assert registry.tools(str(tmp_path))[1].name != original_name
-    assert "changed" in (await tool.ainvoke({})).lower()
+    with pytest.raises(Exception, match="changed"):
+        await tool.ainvoke({})
     assert calls == ["second"]
     pages[1] = pages[0]
     with pytest.raises(ValueError, match="duplicate"):

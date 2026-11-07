@@ -37,21 +37,40 @@ def test_selected_model_survives_approval_and_archives_usage(tmp_path, monkeypat
     }
     models = {
         "deepseek-flash": ToolModel(responses=[AIMessage(content="DeepSeek")]),
-        "mimo-v2.6-flash": ToolModel(responses=[
-            AIMessage(content="", tool_calls=[{
-                "name": "calculate", "args": {"operation": "add", "a": 1, "b": 2}, "id": "sum",
-            }], usage_metadata=usage),
-            AIMessage(content="MiMo: 3", usage_metadata=usage),
-        ]),
+        "mimo-v2.6-flash": ToolModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "calculate",
+                            "args": {"operation": "add", "a": 1, "b": 2},
+                            "id": "sum",
+                        }
+                    ],
+                    usage_metadata=usage,
+                ),
+                AIMessage(content="MiMo: 3", usage_metadata=usage),
+            ]
+        ),
     }
-    monkeypatch.setattr(api, "configured_models", lambda: {
-        model: (
-            ModelItem(id=model, provider=provider, context_window=1_000_000,
-                      reasoning_levels=("none", "high"), default_effort="none"),
-            model,
-        )
-        for model, provider in (("deepseek-flash", "deepseek"), ("mimo-v2.6-flash", "mimo"))
-    })
+    monkeypatch.setattr(
+        api,
+        "configured_models",
+        lambda: {
+            model: (
+                ModelItem(
+                    id=model,
+                    provider=provider,
+                    context_window=1_000_000,
+                    reasoning_levels=("none", "high"),
+                    default_effort="none",
+                ),
+                model,
+            )
+            for model, provider in (("deepseek-flash", "deepseek"), ("mimo-v2.6-flash", "mimo"))
+        },
+    )
     selected = []
 
     def provider(model, *, effort):
@@ -65,14 +84,24 @@ def test_selected_model_survives_approval_and_archives_usage(tmp_path, monkeypat
     )
     with TestClient(app) as client:
         base = "/api/v1"
-        invalid = client.post(base + "/chat", json={
-            "message": "test", "model": "mimo-v2.6-flash", "reasoning_effort": "max",
-        })
+        invalid = client.post(
+            base + "/chat",
+            json={
+                "message": "test",
+                "model": "mimo-v2.6-flash",
+                "reasoning_effort": "max",
+            },
+        )
         assert invalid.status_code == 422
-        initial = client.post(base + "/chat", json={
-            "message": "Calculate 1 + 2", "model": "mimo-v2.6-flash",
-            "reasoning_effort": "high", "approval_policy": "every",
-        })
+        initial = client.post(
+            base + "/chat",
+            json={
+                "message": "Calculate 1 + 2",
+                "model": "mimo-v2.6-flash",
+                "reasoning_effort": "high",
+                "approval_policy": "every",
+            },
+        )
         assert initial.status_code == 202, initial.text
         review = initial.json()
         assert review["metrics"]["total_tokens"] == 125
@@ -100,7 +129,13 @@ def test_agent_can_read_previously_uploaded_file(tmp_path, mode):
         base = "/api/v1"
         runtime = client.get(base + "/runtime").json()
         assert runtime["chat_tools"] == [
-            "calculate", "calculate_financial", "list_uploaded_files", "read_uploaded_file",
+            "calculate",
+            "calculate_financial",
+            "workspace_read",
+            "export_document",
+            "get_datetime",
+            "list_uploaded_files",
+            "read_uploaded_file",
         ]
         thread = client.post(base + "/threads", json={"mode": mode}).json()["thread_id"]
         upload = client.post(
@@ -109,10 +144,16 @@ def test_agent_can_read_previously_uploaded_file(tmp_path, mode):
             content=b"x" * 60_000 + b"Only the scoped reader may return this.",
         ).json()
         model.responses[:] = [
-            AIMessage(content="", tool_calls=[{
-                "name": "read_uploaded_file",
-                "args": {"file_id": upload["id"], "offset": 60_000}, "id": "read",
-            }]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_uploaded_file",
+                        "args": {"file_id": upload["id"], "offset": 60_000},
+                        "id": "read",
+                    }
+                ],
+            ),
             AIMessage(content="Read it.", additional_kwargs={"reasoning_content": "Private"}),
         ]
         reply = client.post(
@@ -122,20 +163,23 @@ def test_agent_can_read_previously_uploaded_file(tmp_path, mode):
         progress = events(reply, "activity")
         assert any(
             entry["kind"] == "model" and entry["status"] == "running"
-            for frame in progress for entry in frame["items"]
+            for frame in progress
+            for entry in frame["items"]
         )
         assert [
             entry["status"]
-            for frame in progress for entry in frame["items"] if entry["kind"] == "tool"
+            for frame in progress
+            for entry in frame["items"]
+            if entry["kind"] == "tool"
         ][:3] == ["requested", "running", "done"]
-        done, = events(reply, "done")
+        (done,) = events(reply, "done")
         assert done["response"] == "Read it."
         read = next(entry for entry in done["activity"] if entry["kind"] == "tool")
         assert read["name"] == "read_uploaded_file"
         assert json.loads(read["arguments"]) == {"file_id": upload["id"], "offset": 60_000}
         assert "Only the scoped reader may return this." in read["result"]
         assert "Private" not in reply.text
-        saved, = client.get(f"{base}/threads/{thread}/messages").json()["items"]
+        (saved,) = client.get(f"{base}/threads/{thread}/messages").json()["items"]
         assert saved["activity"] == done["activity"]
         config = build_graph_config(
             {"user_id": "local-user", "thread_id": thread}, app.state.agent_settings
@@ -145,16 +189,28 @@ def test_agent_can_read_previously_uploaded_file(tmp_path, mode):
         output = next(item for item in snapshot.values["messages"] if isinstance(item, ToolMessage))
         assert "Only the scoped reader may return this." in output.content
         model.responses[:] = [
-            AIMessage(content="", tool_calls=[{
-                "name": "read_uploaded_file", "args": {"file_id": "missing"}, "id": "missing",
-            }]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_uploaded_file",
+                        "args": {"file_id": "missing"},
+                        "id": "missing",
+                    }
+                ],
+            ),
             AIMessage(content="The file could not be read."),
         ]
-        failed = client.post(base + "/chat", json={
-            "thread_id": thread, "message": "Read the other file", "stream": True,
-        })
-        completed, = events(failed, "done")
-        failed_tool, = [entry for entry in completed["activity"] if entry["kind"] == "tool"]
+        failed = client.post(
+            base + "/chat",
+            json={
+                "thread_id": thread,
+                "message": "Read the other file",
+                "stream": True,
+            },
+        )
+        (completed,) = events(failed, "done")
+        (failed_tool,) = [entry for entry in completed["activity"] if entry["kind"] == "tool"]
         assert failed_tool["status"] == "error"
         assert "Only the scoped reader may return this." not in failed.text
 
@@ -163,7 +219,7 @@ def request_mkdir(path):
     return AIMessage(
         content="",
         tool_calls=[
-            {"name": "run_command", "args": {"command": "mkdir", "arguments": [path]}, "id": path}
+            {"name": "workspace_write", "args": {"action": "mkdir", "path": path}, "id": path}
         ],
     )
 
@@ -190,7 +246,13 @@ def test_pending_review_persists_and_cannot_be_bypassed(tmp_path):
         assert runtime.status_code == 200
         assert runtime.json()["ready"] is True
         assert runtime.json()["work_tools"] == [
-            *(tool.name for tool in tools), "list_uploaded_files", "read_uploaded_file"
+            *(
+                tool.name
+                for tool in tools
+                if tool.descriptor.enabled and not tool.descriptor.deprecated
+            ),
+            "list_uploaded_files",
+            "read_uploaded_file",
         ]
         response = client.post("/api/v1/chat", json={"mode": "work", "message": "Make a folder"})
         assert response.status_code == 202, response.text
@@ -208,9 +270,10 @@ def test_pending_review_persists_and_cannot_be_bypassed(tmp_path):
         assert client.post(decision_path, json={"approved": "true"}).status_code == 422
         denied = client.post(decision_path, json={"approved": False})
         assert denied.status_code == 200, denied.text
-        assert next(
-            entry for entry in denied.json()["activity"] if entry["kind"] == "tool"
-        )["status"] == "rejected"
+        assert (
+            next(entry for entry in denied.json()["activity"] if entry["kind"] == "tool")["status"]
+            == "rejected"
+        )
         assert not (tool_settings.workspace_path / "rejected").exists()
         again = client.post(
             "/api/v1/chat",
@@ -233,12 +296,13 @@ def test_pending_review_persists_and_cannot_be_bypassed(tmp_path):
             },
         )
         assert approved.status_code == 200, approved.text
-        completed, = events(approved, "done")
+        (completed,) = events(approved, "done")
         assert completed["response"] == "Created."
         assert next(entry for entry in completed["activity"] if entry["kind"] == "tool")["approved"]
         assert any(
             entry["kind"] == "tool" and entry["status"] == "running"
-            for frame in events(approved, "activity") for entry in frame["items"]
+            for frame in events(approved, "activity")
+            for entry in frame["items"]
         )
         assert (tool_settings.workspace_path / "approved").is_dir()
         assert client.get(thread + "/approval").json() is None

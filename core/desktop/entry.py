@@ -1,4 +1,7 @@
-"""slothy's bundled backend. No development configuration is read here."""
+"""slothy's bundled backend. No development configuration is read here.
+
+slothy 的打包后端；此处不读取开发配置。
+"""
 
 import json
 import os
@@ -9,7 +12,10 @@ from pathlib import Path
 
 
 def watch_desktop():
-    """Exit if the desktop crashes; child document workers share this job's lifecycle."""
+    """Exit if the desktop crashes; child document workers share this job's lifecycle.
+
+    桌面进程崩溃时退出；子文档进程与本进程共享同一生命周期。
+    """
     if sys.platform != "win32":
         return
     import ctypes
@@ -25,6 +31,9 @@ def watch_desktop():
         raise RuntimeError("The slothy desktop process is no longer available.")
 
     def wait():
+        """Block until the desktop process exits, then terminate this process.
+        / 阻塞等待桌面进程退出，然后终止本进程。
+        """
         kernel.WaitForSingleObject(parent, 0xFFFFFFFF)
         kernel.CloseHandle(parent)
         os._exit(0)
@@ -33,6 +42,13 @@ def watch_desktop():
 
 
 def main():
+    """Start the bundled backend or run the document worker in place.
+    / 启动内置后端，或就地运行文档工作进程。
+
+    Raises:
+        RuntimeError: If required desktop environment variables are missing.
+            / 缺少必需的桌面环境变量时抛出。
+    """
     for stream in (sys.stdout, sys.stderr):
         if stream and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")

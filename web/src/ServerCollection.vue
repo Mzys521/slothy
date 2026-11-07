@@ -10,6 +10,14 @@ const offset = ref<number | null>(null)
 const loading = ref(false)
 const error = ref('')
 
+/**
+ * Loads the attachment library, optionally appending the next page.
+ *
+ * 加载附件资料库，可选择追加下一页。
+ *
+ * @param more - True to append the next page instead of replacing the list. / 为 true 时追加下一页而非替换列表。
+ * @returns Resolves when the request finishes. / 请求完成后结束。
+ */
 async function load(more = false) {
   if (props.kind !== 'library') return
   loading.value = true
@@ -28,6 +36,7 @@ async function load(more = false) {
     loading.value = false
   }
 }
+// Reload whenever the active collection switches between plugins and library. / 在插件与资料库之间切换时重新加载。
 watch(() => props.kind, () => { void load() }, { immediate: true })
 </script>
 

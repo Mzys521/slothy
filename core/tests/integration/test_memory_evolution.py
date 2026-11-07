@@ -118,14 +118,17 @@ def test_confirmed_episode_reaches_model_only_in_its_workspace(tmp_path):
     with TestClient(app) as client:
         base = "/api/v1"
         for workspace in ("alpha", "beta"):
-            assert client.post(
-                base + "/workspaces", json={"id": workspace, "name": workspace}
-            ).status_code == 201
+            assert (
+                client.post(
+                    base + "/workspaces", json={"id": workspace, "name": workspace}
+                ).status_code
+                == 201
+            )
 
         def thread_in(workspace):
-            return client.post(
-                base + "/threads", json={"workspace_id": workspace}
-            ).json()["thread_id"]
+            return client.post(base + "/threads", json={"workspace_id": workspace}).json()[
+                "thread_id"
+            ]
 
         source = thread_in("alpha")
         report = "昨天我们完成了附件索引迁移，数据库换成了 SQLite。"
@@ -135,19 +138,26 @@ def test_confirmed_episode_reaches_model_only_in_its_workspace(tmp_path):
             f"{base}/threads/{source}/memory-receipts", params={"run_id": turn["run_id"]}
         ).json()
         assert not receipt["pending"] and receipt["items"] == []
-        suggestion_id, = receipt["suggestion_ids"]
-        suggestion, = client.get(base + "/memory-suggestions").json()["items"]
+        (suggestion_id,) = receipt["suggestion_ids"]
+        (suggestion,) = client.get(base + "/memory-suggestions").json()["items"]
         assert suggestion["id"] == suggestion_id
         assert suggestion["dimension"] == "episodic"
         assert (suggestion["scope"], suggestion["scope_ref"]) == ("project", "alpha")
-        evidence, = suggestion["evidence"]
+        (evidence,) = suggestion["evidence"]
         assert evidence["quote"] == report and evidence["recorded_at"]
 
         sibling = thread_in("alpha")
         query = "你还记得上次的附件索引迁移吗？"
-        assert client.post(base + "/chat", json={
-            "thread_id": sibling, "message": query,
-        }).json()["used_memory_ids"] == []
+        assert (
+            client.post(
+                base + "/chat",
+                json={
+                    "thread_id": sibling,
+                    "message": query,
+                },
+            ).json()["used_memory_ids"]
+            == []
+        )
         confirmed = client.post(
             f"{base}/memory-suggestions/{suggestion_id}/review", json={"action": "confirm"}
         ).json()
@@ -155,25 +165,52 @@ def test_confirmed_episode_reaches_model_only_in_its_workspace(tmp_path):
         memory = client.get(f"{base}/memories/{memory_id}").json()
         assert memory["type"] == "episodic" and memory["evidence"] == [evidence]
         assert client.get(base + "/profile").json()["version"] == 0
-        assert client.get(base + "/graph").json()["nodes"][0]["type"] == "episodic"
+        assert client.get(base + "/graph?project_id=alpha").json()["nodes"][0]["type"] == "episodic"
 
-        assert client.post(base + "/chat", json={
-            "thread_id": sibling, "message": query,
-        }).json()["used_memory_ids"] == [memory_id]
-        reference = next(message for message in model_inputs[-1]
-                         if message.name == "personalization_reference")
+        assert client.post(
+            base + "/chat",
+            json={
+                "thread_id": sibling,
+                "message": query,
+            },
+        ).json()["used_memory_ids"] == [memory_id]
+        reference = next(
+            message for message in model_inputs[-1] if message.name == "personalization_reference"
+        )
         assert "附件索引迁移" in reference.text
         assert f"Episode reported on {evidence['recorded_at'][:10]}" in reference.text
         other = thread_in("beta")
-        assert client.post(base + "/chat", json={
-            "thread_id": other, "message": query,
-        }).json()["used_memory_ids"] == []
-        assert client.post(base + "/chat", json={
-            "thread_id": other, "message": query, "project_id": "alpha",
-        }).status_code == 409
-        assert client.post(base + "/chat", json={
-            "thread_id": sibling, "message": "你还记得上次的字体调整吗？",
-        }).json()["used_memory_ids"] == []
+        assert (
+            client.post(
+                base + "/chat",
+                json={
+                    "thread_id": other,
+                    "message": query,
+                },
+            ).json()["used_memory_ids"]
+            == []
+        )
+        assert (
+            client.post(
+                base + "/chat",
+                json={
+                    "thread_id": other,
+                    "message": query,
+                    "project_id": "alpha",
+                },
+            ).status_code
+            == 409
+        )
+        assert (
+            client.post(
+                base + "/chat",
+                json={
+                    "thread_id": sibling,
+                    "message": "你还记得上次的字体调整吗？",
+                },
+            ).json()["used_memory_ids"]
+            == []
+        )
         assert client.delete(f"{base}/threads/{source}").status_code == 204
         assert client.get(f"{base}/memories/{memory_id}").status_code == 404
 
@@ -187,14 +224,16 @@ def test_explicit_episode_deduplicates_and_unfinished_work_is_not_learned(tmp_pa
     with TestClient(app) as client:
         base = "/api/v1"
         for text in (
-            "我计划明天完成 Orion 部署", "如果我修复了 Orion，你会怎么做？", "我修复了 Orion 吗",
+            "我计划明天完成 Orion 部署",
+            "如果我修复了 Orion，你会怎么做？",
+            "我修复了 Orion 吗",
         ):
             assert client.post(base + "/chat", json={"message": text}).is_success
         report = "Remember that we deployed Orion to the staging cluster."
         turns = [client.post(base + "/chat", json={"message": report}).json() for _ in range(2)]
         flush_learning(client, app)
         assert client.get(base + "/memory-suggestions").json()["items"] == []
-        memory, = client.get(base + "/memories?type=episodic").json()["items"]
+        (memory,) = client.get(base + "/memories?type=episodic").json()["items"]
         detail = client.get(f"{base}/memories/{memory['id']}").json()
         assert len(detail["evidence"]) == 2
         receipt = client.get(
@@ -202,8 +241,11 @@ def test_explicit_episode_deduplicates_and_unfinished_work_is_not_learned(tmp_pa
             params={"run_id": turns[0]["run_id"]},
         ).json()
         assert receipt["items"][0]["type"] == "episodic"
-        assert client.post(base + "/chat", json={
-            "message": "Where did we deploy Orion?",
-        }).json()["used_memory_ids"] == [memory["id"]]
+        assert client.post(
+            base + "/chat",
+            json={
+                "message": "Where did we deploy Orion?",
+            },
+        ).json()["used_memory_ids"] == [memory["id"]]
         assert client.delete(f"{base}/threads/{turns[0]['thread_id']}").status_code == 204
         assert len(client.get(f"{base}/memories/{memory['id']}").json()["evidence"]) == 1

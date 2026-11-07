@@ -4,6 +4,8 @@ import { t } from './preferences'
 import { brandAsset } from './brand'
 const version = ref(__APP_VERSION__)
 const isDesktop = !!window.desktop
+// Desktop builds report the packaged app version; the web build keeps the build-time constant.
+// 桌面端读取打包后的应用版本号，网页端沿用构建期常量。
 onMounted(async () => { if (window.desktop) version.value = (await window.desktop.getAppInfo()).version })
 </script>
 <template>

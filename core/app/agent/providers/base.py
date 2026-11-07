@@ -1,4 +1,4 @@
-"""应用依赖此接口，隔离具体服务 SDK。 / Application contract independent of vendor SDKs."""
+"""Chat-model contract independent of vendor SDKs. / 与具体服务 SDK 解耦的聊天模型契约。"""
 
 from typing import Protocol
 
@@ -6,8 +6,14 @@ from langchain_core.language_models import BaseChatModel
 
 
 class ModelProvider(Protocol):
-    """提供可注入、可复用的聊天模型。 / Supply a reusable injectable LangChain chat model."""
+    """Supply a reusable injectable LangChain chat model. / 提供可注入、可复用的聊天模型。"""
 
     def get_chat_model(self) -> BaseChatModel:
-        """返回同一实例供同步、异步及流式调用。 / Reuse one instance for sync/async/stream calls."""
+        """Return one shared model instance for sync, async and streaming calls.
+
+        返回共享模型实例，供同步、异步与流式调用复用。
+
+        Returns:
+            English: The configured chat model instance. / 中文：已配置的聊天模型实例。
+        """
         ...

@@ -1,0 +1,391 @@
+{
+  "work": [
+    {
+      "type": "function",
+      "function": {
+        "name": "calculate",
+        "description": "普通加减乘除、幂和平方根，参数与返回值为 float。金额、记账使用 calculate_financial。 / General float arithmetic; money uses calculate_financial.",
+        "parameters": {
+          "properties": {
+            "operation": {
+              "description": "运算类型；金额不要使用此工具 / Operation; never use this tool for money",
+              "enum": [
+                "add",
+                "subtract",
+                "multiply",
+                "divide",
+                "power",
+                "sqrt"
+              ],
+              "type": "string"
+            },
+            "a": {
+              "description": "有限浮点操作数 / Finite float operand",
+              "type": "number"
+            },
+            "b": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "二元运算第二个操作数，sqrt 不传 / Second float operand; omit for sqrt"
+            }
+          },
+          "required": [
+            "operation",
+            "a"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "calculate_financial",
+        "description": "金融/记账计算。a、b 必须是十进制字符串，返回定点字符串；禁止将金额传为 float。 / Financial arithmetic with strict string inputs and output.",
+        "parameters": {
+          "properties": {
+            "operation": {
+              "description": "金额运算类型 / Financial arithmetic operation",
+              "enum": [
+                "add",
+                "subtract",
+                "multiply",
+                "divide"
+              ],
+              "type": "string"
+            },
+            "a": {
+              "description": "十进制字符串，如 \"0.10\" / Decimal string",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "b": {
+              "description": "第二个十进制字符串 / Second decimal string",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "decimal_places": {
+              "default": 2,
+              "description": "结果小数位数 / Output decimal places",
+              "maximum": 28,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rounding": {
+              "default": "half_up",
+              "description": "四舍五入或半偶数舍入 / Half-up or half-even rounding",
+              "enum": [
+                "half_up",
+                "half_even"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "a",
+            "b"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_command",
+        "description": "工作区内的 pwd/ls/cat/mkdir/echo 与只读 rg；参数是字面列表，不能删除或运行 Shell/解释器。 / Workspace commands; no deletion or shells.",
+        "parameters": {
+          "properties": {
+            "command": {
+              "description": "命令名称；无删除命令 / Command name; no deletion command",
+              "enum": [
+                "pwd",
+                "ls",
+                "cat",
+                "mkdir",
+                "echo",
+                "rg"
+              ],
+              "type": "string"
+            },
+            "arguments": {
+              "description": "字面参数；rg: pattern, 可选 path / Literal argv; rg: pattern, optional path",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "type": "array"
+            },
+            "cwd": {
+              "default": ".",
+              "description": "工具工作区内的目录 / Directory inside the tool workspace",
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_document_python",
+        "description": "直接编写 Python 生成 Word/文本/CSV/JSON 等文档，默认支持 docx；openpyxl/reportlab/pptx 需可选 documents 依赖。相对路径写本次产物目录，workspace 是输出目录，input_dir 是只读输入目录。禁止删除、网络和进程调用。 / Execute local document Python code in a new output directory; returns artifact paths. 代码上限 / Source cap: 20000 characters; 执行时限 / Timeout: 30s.",
+        "parameters": {
+          "properties": {
+            "code": {
+              "description": "Python 文档代码；相对路径输出，input_dir 只读；金额用 Decimal 字符串 / Python code; relative outputs; read-only input_dir; Decimal strings for money",
+              "maxLength": 100000,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_uploaded_files",
+        "description": "List uploaded files and their IDs in the current conversation.",
+        "parameters": {
+          "properties": {},
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_uploaded_file",
+        "description": "Read a page of text from an uploaded file in the current conversation.",
+        "parameters": {
+          "properties": {
+            "file_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "offset": {
+              "default": 0,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "file_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_skill_file",
+        "description": "Read an enabled Skill reference file.",
+        "parameters": {
+          "properties": {
+            "skill_id": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "offset": {
+              "default": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "skill_id",
+            "path"
+          ],
+          "type": "object"
+        }
+      }
+    }
+  ],
+  "chat": [
+    {
+      "type": "function",
+      "function": {
+        "name": "calculate",
+        "description": "普通加减乘除、幂和平方根，参数与返回值为 float。金额、记账使用 calculate_financial。 / General float arithmetic; money uses calculate_financial.",
+        "parameters": {
+          "properties": {
+            "operation": {
+              "description": "运算类型；金额不要使用此工具 / Operation; never use this tool for money",
+              "enum": [
+                "add",
+                "subtract",
+                "multiply",
+                "divide",
+                "power",
+                "sqrt"
+              ],
+              "type": "string"
+            },
+            "a": {
+              "description": "有限浮点操作数 / Finite float operand",
+              "type": "number"
+            },
+            "b": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "二元运算第二个操作数，sqrt 不传 / Second float operand; omit for sqrt"
+            }
+          },
+          "required": [
+            "operation",
+            "a"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "calculate_financial",
+        "description": "金融/记账计算。a、b 必须是十进制字符串，返回定点字符串；禁止将金额传为 float。 / Financial arithmetic with strict string inputs and output.",
+        "parameters": {
+          "properties": {
+            "operation": {
+              "description": "金额运算类型 / Financial arithmetic operation",
+              "enum": [
+                "add",
+                "subtract",
+                "multiply",
+                "divide"
+              ],
+              "type": "string"
+            },
+            "a": {
+              "description": "十进制字符串，如 \"0.10\" / Decimal string",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "b": {
+              "description": "第二个十进制字符串 / Second decimal string",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "decimal_places": {
+              "default": 2,
+              "description": "结果小数位数 / Output decimal places",
+              "maximum": 28,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rounding": {
+              "default": "half_up",
+              "description": "四舍五入或半偶数舍入 / Half-up or half-even rounding",
+              "enum": [
+                "half_up",
+                "half_even"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "a",
+            "b"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_uploaded_files",
+        "description": "List uploaded files and their IDs in the current conversation.",
+        "parameters": {
+          "properties": {},
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_uploaded_file",
+        "description": "Read a page of text from an uploaded file in the current conversation.",
+        "parameters": {
+          "properties": {
+            "file_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "offset": {
+              "default": 0,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "file_id"
+          ],
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_skill_file",
+        "description": "Read an enabled Skill reference file.",
+        "parameters": {
+          "properties": {
+            "skill_id": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "offset": {
+              "default": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "skill_id",
+            "path"
+          ],
+          "type": "object"
+        }
+      }
+    }
+  ]
+}

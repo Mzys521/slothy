@@ -761,3 +761,9 @@ code, kbd, pre, samp { font-family: var(--mono); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; }
 }
+
+/* V3 concepts reuse the existing graph palette. / V3 概念复用既有图谱配色。 */
+[data-memory-type="identity"] { --memory-color: var(--accent); }
+[data-memory-type="skill"] { --memory-color: light-dark(#856016, #d9a337); }
+.memory-trace small { display: block; overflow-wrap: anywhere; }
+.memory-trace ul { padding-inline-start: 16px; }

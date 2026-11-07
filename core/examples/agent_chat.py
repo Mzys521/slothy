@@ -13,8 +13,7 @@ from app.agent.graph import (
 )
 from app.agent.graph.review import pending_review
 from app.agent.prompts.system import BASE_SYSTEM_PROMPT
-from app.agent.prompts.tools import BUILTIN_TOOL_INSTRUCTIONS
-from app.agent.tools import create_builtin_tools
+from app.agent.tools import ToolRegistry, create_builtin_tools
 from app.config import AgentSettings, CheckpointSettings
 from app.infrastructure.checkpoints import SQLiteCheckpointStore
 from app.infrastructure.conversations import SQLiteConversationStore
@@ -40,13 +39,14 @@ async def main(args: argparse.Namespace) -> None:
         SQLiteCheckpointStore(checkpoint_settings) as checkpointer,
         SQLiteConversationStore.open(checkpoint_settings) as conversations,
     ):
+        registry = ToolRegistry.from_tools(create_builtin_tools())
         graph = build_agent_graph(
             services,
             settings=settings,
             checkpointer=checkpointer,
-            tools=create_builtin_tools(),
+            tools=registry.for_mode("work"), tool_registry=registry, mode="work",
             require_tool_review=True,
-            system_prompt=BASE_SYSTEM_PROMPT + "\n" + BUILTIN_TOOL_INSTRUCTIONS,
+            system_prompt=BASE_SYSTEM_PROMPT + registry.instructions("work"),
         )
         runner = AgentRunner(graph, settings, conversation_writer=conversations)
         config = build_graph_config({"user_id": args.user_id, "thread_id": thread_id}, settings)

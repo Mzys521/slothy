@@ -1,7 +1,13 @@
+/**
+ * Development smoke harness: boots a fake API, launches Electron and verifies the renderer over the DevTools protocol.
+ *
+ * 开发冒烟测试工具：启动伪 API、拉起 Electron，并通过 DevTools 协议校验渲染进程。
+ */
+
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,8 +16,19 @@ import desktop from '../desktop.config.cjs'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 
-export async function createSmokeBackend({ firstRun = false } = {}) {
+/**
+ * Creates a loopback fake API that answers the endpoints the renderer needs.
+ *
+ * 创建一个回环地址的伪 API，用于响应渲染进程需要的接口。
+ *
+ * @param options - Harness options. / 测试参数。
+ * @param options.firstRun - Return `setup_required: true` so the onboarding overlay appears. / 为 true 时返回 `setup_required: true`，触发首次运行引导。
+ * @returns Fake server handle with `backend` and `origin`. / 伪服务器句柄，包含 `backend` 与 `origin`。
+ */
+export async function createSmokeBackend({ firstRun = false, handle } = {}) {
   const png = await readFile(path.join(root, 'electron/assets/icon.png'))
+  // A single handler mimics the real API surface: SSE, avatar bytes, uploads and JSON reads.
+  // 单个处理器模拟真实 API 面：SSE、头像字节、上传与 JSON 读取。
   const backend = createServer(async (request, response) => {
     if (request.headers.origin && request.headers.origin !== desktop.apiRequestOrigin) {
       response.writeHead(403).end('Origin rejected by the test API.')
@@ -20,6 +37,7 @@ export async function createSmokeBackend({ firstRun = false } = {}) {
     response.setHeader('Access-Control-Allow-Origin', request.headers.origin || 'null')
     response.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
     response.setHeader('Access-Control-Allow-Headers', 'content-type')
+    if (handle && await handle(request, response)) return
     if (request.method === 'OPTIONS') {
       response.writeHead(204).end()
     } else if (request.url === '/api/v1/desktop-smoke/stream') {
@@ -32,9 +50,11 @@ export async function createSmokeBackend({ firstRun = false } = {}) {
       let size = 0
       for await (const chunk of request) size += chunk.length
       response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ size }))
+    } else if (request.url === '/api/v1/threads/smoke/artifacts/' + 'a'.repeat(64)) {
+      response.writeHead(200, { 'Content-Type': 'application/octet-stream' }).end('SLOTHY_ARTIFACT_OK')
     } else {
       let body = { ok: true }
-      if (request.url?.startsWith('/api/v1/workspaces')) body = { items: [{ id: 'personal', name: 'Personal workspace' }] }
+      if (request.url?.startsWith('/api/v1/workspaces')) body = { items: [{ id: 'personal', name: 'Personal workspace' }], next_offset: null }
       if (request.url?.startsWith('/api/v1/threads')) body = { items: [], next_offset: null }
       if (request.url === '/api/v1/models') body = { items: [], default: null }
       if (request.url === '/api/v1/settings/providers') body = { items: [], templates: [], setup_required: firstRun }
@@ -47,7 +67,18 @@ export async function createSmokeBackend({ firstRun = false } = {}) {
   return { backend, origin }
 }
 
-export async function runSmoke({ devServer, backend: testBackend, firstRun = false } = {}) {
+/**
+ * Launches Electron, drives the renderer through CDP and asserts the desktop contract.
+ *
+ * 启动 Electron，通过 CDP 驱动渲染进程并断言桌面端契约。
+ *
+ * @param options - Harness options. / 测试参数。
+ * @param options.devServer - Vite dev server URL when testing development mode. / 测试开发模式时使用的 Vite 开发服务器 URL。
+ * @param options.backend - Pre-created fake backend; a new one is created when omitted. / 已创建的伪后端；省略时自动创建。
+ * @param options.firstRun - Simulate a fresh installation with the onboarding overlay. / 模拟带引导浮层的全新安装。
+ * @returns Resolves when every assertion passed. / 全部断言通过后完成。
+ */
+export async function runSmoke({ devServer, backend: testBackend, firstRun = false, verify, screenshot } = {}) {
   const { backend, origin } = testBackend || await createSmokeBackend({ firstRun })
   const userData = await mkdtemp(path.join(tmpdir(), 'slothy-electron-'))
   const env = {
@@ -107,6 +138,8 @@ export async function runSmoke({ devServer, backend: testBackend, firstRun = fal
       if (result.error) handler.reject(new Error(result.error.message))
       else handler.resolve(result.result)
     })
+    // Send one expression to the page and await its serialized result.
+    // 向页面发送一个表达式并等待其序列化结果。
     const evaluate = async expression => {
       const id = ++sequence
       const deadline = setTimeout(() => {
@@ -151,6 +184,7 @@ export async function runSmoke({ devServer, backend: testBackend, firstRun = fal
     assert.ok(result.hasVue)
     assert.ok(result.directoryPicker)
     assert.ok(result.json)
+    assert.ok(result.artifactDownload)
     assert.equal(result.upload, 6)
     assert.ok(result.streaming)
     assert.ok(result.isolatedFrame)
@@ -164,6 +198,15 @@ export async function runSmoke({ devServer, backend: testBackend, firstRun = fal
       assert.notEqual(result.hash, '#settings/api')
     }
     if (!devServer) assert.equal(result.avatarWidth, 512)
+    if (verify) console.log('Additional renderer checks:', JSON.stringify(await evaluate('(' + verify.toString() + ')()')))
+    if (screenshot) {
+      const id = ++sequence
+      const capture = await new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject })
+        socket.send(JSON.stringify({ id, method: 'Page.captureScreenshot', params: { format: 'png' } }))
+      })
+      await writeFile(screenshot, Buffer.from(capture.data, 'base64'))
+    }
     console.log('Desktop smoke passed:', devServer ? 'Vite development' : 'dist/index.html')
     console.log('Verified Vue, preload whitelist, renderer/frame isolation, JSON API, binary upload, SSE, avatar loading and ' + (firstRun ? 'first-run overlay below native window controls.' : 'configured startup without onboarding.'))
   } finally {
@@ -180,6 +223,15 @@ export async function runSmoke({ devServer, backend: testBackend, firstRun = fal
   }
 }
 
+/**
+ * Runs inside the page: probes the preload bridge, isolation, HTTP, upload, SSE and avatar behavior.
+ *
+ * 在页面内运行：探测预加载桥、隔离性、HTTP、上传、SSE 与头像加载行为。
+ *
+ * @param base - API origin prefix; empty string means same-origin. / API 源前缀；空串表示同源。
+ * @param firstRun - Whether the onboarding overlay is expected. / 是否预期出现首次运行引导浮层。
+ * @returns Renderer facts asserted by `runSmoke`. / 供 `runSmoke` 断言的渲染进程观测值。
+ */
 async function verifyRenderer(base, firstRun) {
   for (let attempt = 0; attempt < 100 && (
     !window.desktop || document.readyState !== 'complete' ||
@@ -194,6 +246,11 @@ async function verifyRenderer(base, firstRun) {
   }
   const response = await fetch(base + '/api/v1/desktop-smoke')
   const json = (await response.json()).ok
+  const artifactResponse = await fetch(base + '/api/v1/threads/smoke/artifacts/' + 'a'.repeat(64))
+  const artifact = await artifactResponse.blob()
+  const artifactUrl = URL.createObjectURL(artifact)
+  const artifactDownload = artifactResponse.ok && await artifact.text() === 'SLOTHY_ARTIFACT_OK' && artifactUrl.startsWith('blob:')
+  URL.revokeObjectURL(artifactUrl)
   const uploaded = await fetch(base + '/api/v1/desktop-smoke/upload', {
     method: 'POST', body: new Blob(['upload']), headers: { 'Content-Type': 'application/octet-stream' },
   })
@@ -242,7 +299,7 @@ async function verifyRenderer(base, firstRun) {
     directoryPicker: typeof window.desktop.selectDirectory === 'function',
     platform: window.desktop.platform, info,
     hasVue: document.querySelector('#app')?.children.length > 0,
-    json, upload: (await uploaded.json()).size,
+    json, artifactDownload, upload: (await uploaded.json()).size,
     streaming: first.includes('first') && !first.includes('last') && rest.includes('last'),
     avatarWidth, isolatedFrame,
   }

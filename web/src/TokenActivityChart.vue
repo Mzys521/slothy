@@ -14,6 +14,7 @@ const focusBar = ref(52)
 const tooltipId = 'activity-tooltip-' + useId().replaceAll(':', '')
 const tooltip = ref<{ key: string; title: string; tokens: number | null; partial: boolean; x: number; y: number; below: boolean }>()
 const locale = computed(() => settings.language === 'zh-CN' ? 'zh-CN' : 'en-US')
+/** Month captions aligned to the heatmap weeks, repeating only when the month changes. / 与热力图周对齐的月份标题，仅当月份变化时重复显示。 */
 const months = computed(() => {
   let previous = ''
   return weeks.value.map(week => {
@@ -24,13 +25,50 @@ const months = computed(() => {
   })
 })
 
+/**
+ * Formats a token count with an optional lower-bound marker.
+ *
+ * 格式化 Token 数量，可按需添加下界标记。
+ *
+ * @param tokens - Token count; null means usage was not reported. / Token 数量；null 表示未上报用量。
+ * @param partial - True when the total is a lower bound. / 汇总为下界时为 true。
+ * @returns Display text such as "≥ 1.2K tokens". / 例如 "≥ 1.2K tokens" 的展示文本。
+ */
 function tokenLabel(tokens: number | null, partial = false) {
   return (partial && tokens != null ? '≥ ' : '') + formatTokenCount(tokens) + ' tokens'
 }
+/**
+ * Builds the accessible label for a heatmap day.
+ *
+ * 生成热力图某一天的无障碍标签。
+ *
+ * @param day - Activity cell for one UTC day. / 某个 UTC 日的活动单元。
+ * @returns Date and token label. / 日期与 Token 文本。
+ */
 function dayLabel(day: ActivityCell) { return day.date + ' · ' + tokenLabel(day.tokens, (day.unreported ?? 0) > 0) }
+/**
+ * Builds the title/tooltip text for a weekly (or cumulative) bar.
+ *
+ * 生成每周（或累计）柱状的标题/提示文本。
+ *
+ * @param week - Activity week represented by the bar. / 柱状对应的活动周。
+ * @returns Localized week range or cumulative label. / 本地化的周区间或累计标签。
+ */
 function weekTitle(week: ActivityWeek) {
   return view.value === 'cumulative' ? t('Through ', '截至 ') + week.end : week.date + ' – ' + week.end
 }
+/**
+ * Positions the shared tooltip relative to the hovered/focused element.
+ *
+ * 将共用提示框定位到悬停/聚焦元素附近。
+ *
+ * @param event - Pointer or focus event on a chart target. / 图表目标上的指针或聚焦事件。
+ * @param key - Stable key identifying the target. / 标识目标的稳定键。
+ * @param title - Tooltip title text. / 提示框标题文本。
+ * @param tokens - Token count for the target. / 目标的 Token 数量。
+ * @param partial - True when the token total is a lower bound. / Token 汇总为下界时为 true。
+ * @returns Nothing. / 无返回值。
+ */
 function show(event: Event, key: string, title: string, tokens: number | null, partial = false) {
   const rect = (event.currentTarget as Element).getBoundingClientRect()
   const below = rect.top < 100
@@ -38,9 +76,37 @@ function show(event: Event, key: string, title: string, tokens: number | null, p
     x: Math.max(120, Math.min(window.innerWidth - 120, rect.left + rect.width / 2)),
     y: below ? rect.bottom + 10 : rect.top - 10 }
 }
+/**
+ * Shows the tooltip for a heatmap day, skipping future days.
+ *
+ * 显示热力图某天的提示框，跳过未来日期。
+ *
+ * @param event - Pointer or focus event on the day cell. / 日单元上的指针或聚焦事件。
+ * @param day - Activity cell for the day. / 当天的活动单元。
+ * @returns Nothing. / 无返回值。
+ */
 function showDay(event: Event, day: ActivityCell) { if (!day.future) show(event, day.date, day.date, day.tokens, (day.unreported ?? 0) > 0) }
+/**
+ * Shows the tooltip for a weekly/cumulative bar.
+ *
+ * 显示每周/累计柱状的提示框。
+ *
+ * @param event - Pointer or focus event on the bar target. / 柱状目标上的指针或聚焦事件。
+ * @param bar - Activity week represented by the bar. / 柱状对应的活动周。
+ * @returns Nothing. / 无返回值。
+ */
 function showBar(event: Event, bar: ActivityWeek) { show(event, bar.date, weekTitle(bar), bar.tokens, bar.partial) }
+/** Hides the shared tooltip. / 隐藏共用的提示框。 */
 function hideTooltip() { tooltip.value = undefined }
+/**
+ * Moves focus between heatmap day cells using arrow/Home/End keys.
+ *
+ * 使用方向键/Home/End 在热力图日单元之间移动焦点。
+ *
+ * @param event - Keyboard event on the day cell. / 日单元上的键盘事件。
+ * @param index - Flat day index of the current cell. / 当前单元的平铺日索引。
+ * @returns Nothing. / 无返回值。
+ */
 function moveDay(event: KeyboardEvent, index: number) {
   const last = series.value?.lastDay ?? 0
   const next = { ArrowLeft: index - 7, ArrowRight: index + 7, ArrowUp: index - 1, ArrowDown: index + 1,
@@ -50,6 +116,15 @@ function moveDay(event: KeyboardEvent, index: number) {
   const target = Math.max(0, Math.min(last, next))
   ;(event.currentTarget as Element).closest('.account-heatmap')?.querySelector<HTMLButtonElement>(`[data-day-index="${target}"]`)?.focus()
 }
+/**
+ * Moves focus between weekly/cumulative bars using arrow/Home/End keys.
+ *
+ * 使用方向键/Home/End 在每周/累计柱状之间移动焦点。
+ *
+ * @param event - Keyboard event on the bar target. / 柱状目标上的键盘事件。
+ * @param index - Index of the current bar. / 当前柱状的索引。
+ * @returns Nothing. / 无返回值。
+ */
 function moveBar(event: KeyboardEvent, index: number) {
   const next = { ArrowLeft: index - 1, ArrowRight: index + 1, Home: 0, End: bars.value.length - 1 }[event.key]
   if (next === undefined) return
@@ -57,8 +132,10 @@ function moveBar(event: KeyboardEvent, index: number) {
   const target = Math.max(0, Math.min(bars.value.length - 1, next))
   ;(event.currentTarget as Element).closest('.account-bar-chart')?.querySelector<HTMLButtonElement>(`[data-bar-index="${target}"]`)?.focus()
 }
+// Keep the roving-tabindex focus on the latest day when usage data changes, and hide stale tooltips on view switches. / 用量数据变化时把焦点停在最新日期，并在切换视图时隐藏过期提示。
 watch(() => props.usage, () => { focusDay.value = series.value?.lastDay ?? 0; hideTooltip() }, { immediate: true })
 watch(view, hideTooltip)
+// Expose tooltip dismissal so parent panels can close it when they scroll or close. / 暴露提示框关闭方法，供父面板滚动或关闭时调用。
 defineExpose({ hideTooltip })
 </script>
 

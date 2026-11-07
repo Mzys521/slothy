@@ -1,3 +1,5 @@
+-- Historical conceptual schema, not the desktop V3 initialization schema.
+-- Runtime V3 DDL lives in core/app/memory/schema.py and infrastructure/workspace.py.
 PRAGMA foreign_keys = ON;
 
 -- Initialize once for SQLite. WAL is a database setting and may be enabled by

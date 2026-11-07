@@ -22,6 +22,20 @@ const distance = motion => {
 }
 const advance = (motion, count = 180, held) => { for (let i = 0; i < count; i++) motion.step(1000 / 60, held) }
 
+test('semantic provenance and concept strength survive simulation without exposing mutable internals', () => {
+  const motion = new GraphMotion()
+  motion.update({ nodes: [{ ...node('python'), type: 'skill', node_kind: 'concept', fact_ids: ['level-fact'], effective_frequency: 3, strength: 3 / 7 }], edges: [] })
+  advance(motion, 3)
+  const point = motion.snapshot()[0]
+  assert.equal(point.node_kind, 'concept')
+  assert.equal(point.effective_frequency, 3)
+  assert.equal(point.strength, 3 / 7)
+  assert.deepEqual(point.fact_ids, ['level-fact'])
+  assert.equal('vx' in point, false)
+  point.fact_ids.push('untrusted')
+  assert.deepEqual(motion.snapshot()[0].fact_ids, ['level-fact'])
+})
+
 test('real links attract substantially more than the global field', () => {
   const linked = pair([link()]), unrelated = pair()
   advance(linked)

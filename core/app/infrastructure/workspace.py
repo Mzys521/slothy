@@ -1,4 +1,5 @@
-"""SQLite-backed user profile and explicitly managed long-term memories."""
+"""SQLite-backed user profile, memory claims and retrieval state.
+/ SQLite 支持的用户画像、记忆断言与检索状态。"""
 
 import json
 import re
@@ -25,7 +26,17 @@ EPISODE_QUERY_NOISE = re.compile(
 
 
 def memory_terms(query: str, limit: int) -> list[str]:
-    # Match words and adjacent Han characters without requiring spaces in Chinese queries.
+    """Split a query into searchable words and Han character bigrams.
+
+    Args:
+        query: Raw user query. / 原始用户查询。
+        limit: Maximum distinct terms returned. / 返回的去重词项上限。
+
+    Returns:
+        Deduplicated terms in first-seen order. / 按首次出现顺序去重的词项。
+    """
+    # English: Match words and adjacent Han characters without requiring spaces.
+    # 中文：匹配词与相邻汉字二元组，兼容无空格的中文查询。
     words = re.findall(r"[\u3400-\u9fff]+|[^\W_\u3400-\u9fff]+", query.lower())
     terms = []
     for word in words:
@@ -37,10 +48,30 @@ def memory_terms(query: str, limit: int) -> list[str]:
 
 
 class WorkspaceStore:
+    """Own the workspace schema and user-scoped memory/profile access.
+
+    The connection is created and migrated by open; every method must filter by user.
+    / 连接由 open 创建并迁移；每个方法都必须按用户过滤。
+    """
+
     def __init__(self, connection: aiosqlite.Connection):
+        """Bind an already-open workspace connection.
+
+        Args:
+            connection: Connection whose row factory yields mappings.
+                / 行工厂返回映射的连接。
+        """
         self.connection = connection
 
     async def learning_usage(self, user: str):
+        """Yield recorded daily learning usage rows for one user.
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+
+        Yields:
+            (created_at, total_tokens) pairs in chronological order. / 按时间顺序的用量二元组。
+        """
         async with self.connection.execute(
             "SELECT created_at,total_tokens FROM memory_learning_usage "
             "WHERE user_id=? ORDER BY created_at,id",
@@ -52,6 +83,20 @@ class WorkspaceStore:
     @classmethod
     @asynccontextmanager
     async def open(cls, path: Path, timeout: float) -> AsyncIterator["WorkspaceStore"]:
+        """Open the database, create tables, triggers and run migrations.
+
+        The schema enables WAL and foreign keys; additive migrations keep older databases
+        readable without rewriting existing rows.
+        / 结构启用 WAL 与外键；增量迁移让旧库可读且不重写既有行。
+
+        Args:
+            path: Database file path. / 数据库文件路径。
+            timeout: SQLite lock wait in seconds. / SQLite 锁等待秒数。
+
+        Returns:
+            Async context manager yielding the connected store.
+            / 产出已连接存储的异步上下文管理器。
+        """
         async with aiosqlite.connect(path, timeout=timeout, isolation_level=None) as connection:
             connection.row_factory = aiosqlite.Row
             async with connection.executescript(f"""
@@ -224,7 +269,8 @@ class WorkspaceStore:
                     await connection.execute(
                         f"ALTER TABLE memory_claims ADD COLUMN {name} {declaration}"
                     )
-            # Retrieval also reads claim keys and evidence dates. All writers share these triggers.
+            # English: Retrieval also reads claim keys and evidence dates. Triggers cover writers.
+            # 中文：检索还会读取断言键与证据日期；这些触发器覆盖所有写入方。
             for table in ("memory_claims", "memory_evidence"):
                 for event in ("INSERT", "UPDATE", "DELETE"):
                     ref = "OLD" if event == "DELETE" else "NEW"
@@ -256,6 +302,19 @@ class WorkspaceStore:
         limit: int = 50,
         cursor: str | None = None,
     ) -> list[Snapshot]:
+        """List a user's memories filtered by status, type and scope.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            status: Memory status filter, active by default. / 记忆状态过滤，默认 active。
+            memory_type: Optional memory type filter. / 可选记忆类型过滤。
+            scope: Optional scope filter. / 可选作用域过滤。
+            limit: Maximum rows returned. / 返回行数上限。
+            cursor: Last id from the previous page, or None. / 上一页最后一个 ID 或 None。
+
+        Returns:
+            Memory snapshots ordered by id. / 按 ID 排序的记忆快照。
+        """
         async with self.connection.execute(
             """SELECT * FROM workspace_memories
                WHERE user_id=? AND status=? AND (? IS NULL OR type=?)
@@ -266,6 +325,16 @@ class WorkspaceStore:
             return [dict(row) async for row in rows]
 
     async def get_memory(self, user_id: str, memory_id: str) -> Snapshot | None:
+        """Load one memory owned by the user.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            memory_id: Memory identifier. / 记忆标识。
+
+        Returns:
+            The memory snapshot, or None when absent or not owned.
+            / 记忆快照；不存在或不属于该用户时为 None。
+        """
         async with self.connection.execute(
             "SELECT * FROM workspace_memories WHERE user_id=? AND id=?",
             (user_id, memory_id),
@@ -274,6 +343,16 @@ class WorkspaceStore:
             return dict(row) if row else None
 
     async def create_memory(self, user_id: str, values: dict) -> Snapshot:
+        """Insert a memory with a generated id.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            values: Title, content, type, scope, scope_ref, source and importance.
+                / 标题、内容、类型、作用域、作用域引用、来源与重要性。
+
+        Returns:
+            The inserted memory snapshot. / 插入后的记忆快照。
+        """
         async with self.connection.execute(
             """INSERT INTO workspace_memories
                (id,user_id,title,content,type,scope,scope_ref,source,importance)
@@ -284,9 +363,23 @@ class WorkspaceStore:
             return dict(await rows.fetchone())
 
     async def update_memory(self, user_id: str, memory_id: str, values: dict) -> Snapshot | None:
+        """Update mutable memory fields for one owned memory.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            memory_id: Memory identifier. / 记忆标识。
+            values: Subset of title, content, source, importance and status.
+                / title、content、source、importance 与 status 的子集。
+
+        Returns:
+            The updated snapshot, or None when the memory does not exist.
+            / 更新后的快照；记忆不存在时为 None。
+        Raises:
+            ValueError: When values contain unsupported fields. / 含不支持的字段时抛出。
+        """
         if not values:
             return await self.get_memory(user_id, memory_id)
-        columns = {"title", "content", "source", "importance", "status"}
+        columns = {"title", "content", "source", "importance", "status", "protected"}
         if not values.keys() <= columns:
             raise ValueError("Unsupported memory fields")
         assignments = ", ".join(f"{column}=?" for column in values)
@@ -299,12 +392,32 @@ class WorkspaceStore:
             return dict(row) if row else None
 
     async def delete_memory(self, user_id: str, memory_id: str) -> bool:
+        """Delete one owned memory.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            memory_id: Memory identifier. / 记忆标识。
+
+        Returns:
+            True when exactly one row was deleted. / 恰好删除一行时为 True。
+        """
         async with self.connection.execute(
             "DELETE FROM workspace_memories WHERE user_id=? AND id=?", (user_id, memory_id)
         ) as cursor:
             return cursor.rowcount == 1
 
     async def add_feedback(self, user_id: str, memory_id: str, values: dict) -> Snapshot | None:
+        """Attach user feedback to an existing owned memory.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            memory_id: Memory receiving the feedback. / 接收反馈的记忆。
+            values: feedback_type and feedback_content. / feedback_type 与 feedback_content。
+
+        Returns:
+            The feedback row, or None when the memory is not owned.
+            / 反馈行；记忆不属于该用户时为 None。
+        """
         async with self.connection.execute(
             """INSERT INTO workspace_memory_feedback
                (id,memory_id,feedback_type,feedback_content)
@@ -324,6 +437,23 @@ class WorkspaceStore:
         relevance: float,
         directed: bool = False,
     ) -> Snapshot | None:
+        """Create or refresh an edge between two active owned memories.
+
+        Undirected edges normalize endpoint order so each pair has a single row.
+        / 无向边会归一化端点顺序，使每对记忆只有一行。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            source: Source memory id. / 源记忆 ID。
+            target: Target memory id. / 目标记忆 ID。
+            relation: Relation label, e.g. shared_conversation. / 关系标签，如 shared_conversation。
+            relevance: Relevance score from 0 to 1. / 0 到 1 的相关度。
+            directed: Whether to keep the source/target direction. / 是否保留方向。
+
+        Returns:
+            The link row, or None when either endpoint is not active and owned.
+            / 边行；任一端点非活跃或不属于该用户时为 None。
+        """
         if not directed:
             source, target = sorted((source, target))
         async with self.connection.execute(
@@ -344,6 +474,17 @@ class WorkspaceStore:
     async def delete_link(
         self, user_id: str, source: str, target: str, directed: bool = False
     ) -> bool:
+        """Suppress an edge instead of deleting its history.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            source: Source memory id. / 源记忆 ID。
+            target: Target memory id. / 目标记忆 ID。
+            directed: Whether the edge is directed. / 边是否有向。
+
+        Returns:
+            True when exactly one visible edge was suppressed. / 恰好抑制一条可见边时为 True。
+        """
         if not directed:
             source, target = sorted((source, target))
         async with self.connection.execute(
@@ -356,6 +497,22 @@ class WorkspaceStore:
             return cursor.rowcount == 1
 
     async def graph(self, user_id: str, limit: int, focus: str | None = None) -> dict:
+        """Return a bounded memory graph for visualization.
+
+        A focus memory and its direct neighbors are ordered first, then active memories by
+        importance; truncated/total tell the caller whether more nodes exist.
+        / 焦点记忆及其直接邻居排在最前，其余活跃记忆按重要性排序；truncated/total 告知是否还有
+        更多节点。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            limit: Maximum nodes returned. / 返回节点上限。
+            focus: Optional memory id to prioritize. / 可选优先记忆 ID。
+
+        Returns:
+            Mapping with nodes, visible edges, total active count, truncation flag and limit.
+            / 含节点、可见边、活跃总数、截断标记与上限的映射。
+        """
         order = ""
         arguments = [user_id]
         if focus:
@@ -399,6 +556,25 @@ class WorkspaceStore:
     async def retrieve(
         self, *, user_id: str, query: str, thread_id: str, project_id: str | None, limit: int
     ) -> list[Snapshot]:
+        """Retrieve scoped user memories matching query terms.
+
+        Global memories, the current thread's memories and the current project's memories
+        are eligible; confirmed claim keys are joined and episodic results carry evidence
+        dates.
+        / 全局记忆、当前线程记忆与当前项目记忆可被检索；会连接已确认断言键，情景记忆结果带有
+        证据日期。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            query: Raw user query driving term extraction. / 驱动词项提取的原始用户查询。
+            thread_id: Current thread scope. / 当前线程作用域。
+            project_id: Current project scope, or None. / 当前项目作用域或 None。
+            limit: Maximum rows returned. / 返回行数上限。
+
+        Returns:
+            Matching memory snapshots ranked by importance and recency.
+            / 按重要性与时间排序的匹配记忆快照。
+        """
         terms = memory_terms(query, 16)
         if not terms:
             return []
@@ -425,6 +601,16 @@ class WorkspaceStore:
             return [dict(row) async for row in rows]
 
     async def get_profile(self, user_id: str, version: int | None = None) -> Snapshot | None:
+        """Read a profile version with its projected attributes.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            version: Requested version, or None for the newest. / 指定版本；None 表示最新版本。
+
+        Returns:
+            Profile snapshot, or None when the user has no profile.
+            / 画像快照；用户没有画像时为 None。
+        """
         async with self.connection.execute(
             """SELECT version, profile_json, change_summary, created_at,
                       attributes_json, removed_attributes, redacted_attributes
@@ -450,6 +636,16 @@ class WorkspaceStore:
             return result
 
     async def profile_versions(self, user_id: str, limit: int, before: int) -> list[Snapshot]:
+        """List profile version summaries before a version cursor.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            limit: Maximum versions returned. / 返回版本数上限。
+            before: Exclusive upper version bound. / 版本上界（不包含）。
+
+        Returns:
+            Version summaries newest first. / 按版本从新到旧的摘要。
+        """
         async with self.connection.execute(
             """SELECT version, change_summary, created_at, removed_attributes, redacted_attributes
                FROM workspace_profiles
@@ -461,6 +657,23 @@ class WorkspaceStore:
     async def save_profile(
         self, user_id: str, expected_version: int, preferences: dict, summary: str
     ) -> bool:
+        """Append a profile version with optimistic version checking.
+
+        The insert only succeeds while the stored maximum version still equals the expected
+        version; removal counts are derived from the previous version. The caller then prunes
+        old history.
+        / 仅当已存最大版本仍等于期望版本时插入成功；移除数量由上一版本推导。调用方随后会裁剪
+        旧历史。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            expected_version: Version the caller last read. / 调用方最后读到的版本。
+            preferences: Manual preference mapping for the new version. / 新版本的手动偏好映射。
+            summary: Human-readable change summary. / 可读的变更摘要。
+
+        Returns:
+            True when the new version was written. / 新版本写入成功时为 True。
+        """
         previous = await self.get_profile(user_id, expected_version) if expected_version else None
         removed = len(set((previous or {}).get("preferences", {})) - set(preferences))
         async with self.connection.execute(
@@ -492,6 +705,11 @@ class WorkspaceStore:
         return saved
 
     async def prune_profile_history(self, user_id: str):
+        """Keep only the newest profile versions per user.
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+        """
         await self.connection.execute(
             """DELETE FROM workspace_profiles WHERE user_id=? AND version NOT IN (
                 SELECT version FROM workspace_profiles WHERE user_id=? ORDER BY version DESC LIMIT ?
@@ -501,28 +719,88 @@ class WorkspaceStore:
 
 
 class BoundedWorkspaceContext:
+    """Build the bounded personalization reference text for one run.
+    / 为单轮构建有界的个性化参考文本。"""
+
     async def build(
         self, *, user_input, user_profile, relevant_memories, project_id, token_budget
     ) -> ContextBuildResult:
-        # UTF-8 bytes provide a conservative budget without depending on a model tokenizer.
+        """Build reference text within the shared token budget.
+
+        The budget is measured in UTF-8 bytes as a conservative tokenizer-free estimate.
+        Attributes outside the current thread/project scope are excluded, manual
+        preferences win over derived memories, and text that does not fit is skipped.
+        / 预算按 UTF-8 字节计，作为不依赖分词器的保守估算。当前线程/项目作用域之外的属性会被
+        排除，手动偏好优先于派生记忆，放不下的文本会被跳过。
+
+        Args:
+            user_input: Current user request, kept for relevance decisions.
+                / 当前用户请求，用于相关性判断。
+            user_profile: Latest profile snapshot, or None. / 最新画像快照或 None。
+            relevant_memories: Bounded retrieval candidates for this run.
+                / 本轮有界的检索候选。
+            project_id: Current project scope, or None. / 当前项目作用域或 None。
+            token_budget: Shared profile-and-memory budget. / 画像与记忆共享的预算。
+
+        Returns:
+            Built reference text, used memory ids and the estimated token cost.
+            / 构建出的参考文本、使用的记忆 ID 与估算 token 开销。
+        """
+        # English: UTF-8 bytes provide a conservative tokenizer-free budget.
+        # 中文：UTF-8 字节提供保守预算，不依赖模型分词器。
         parts = []
         used_ids = []
         remaining = token_budget
         candidates = []
+        by_id = {item["id"]: item for item in relevant_memories}
+
+        def semantic_metadata(item):
+            concepts = item.get("concepts", [])[:8]
+            if not concepts:
+                return ""
+            labels = {c["id"]: c["label"] for c in concepts}
+            metadata = {
+                "concepts": [{"label": c["label"], "kind": c["kind"]} for c in concepts],
+                "subject": item.get("subject", "user"),
+                "predicate": item.get("predicate"),
+                "source": labels.get(item.get("source_concept_id")),
+                "target": labels.get(item.get("target_concept_id")),
+            }
+            return " | Semantic: " + json.dumps(
+                metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+
         if user_profile:
             preferences = json.dumps(
-                user_profile["preferences"],
+                user_profile.get("preferences", {}),
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             )
-            if user_profile["preferences"]:
+            if user_profile.get("preferences", {}):
                 candidates.append((None, "Preferences: " + preferences))
-        manual = user_profile["preferences"] if user_profile else {}
+        manual = user_profile.get("preferences", {}) if user_profile else {}
         included = set()
+        scope_rank = {"global": 0, "project": 1, "thread": 2}
+        attribute_slots = {}
+        for attribute in (user_profile or {}).get("attributes", []):
+            scope, reference = attribute.get("scope"), attribute.get("scope_ref")
+            if not (
+                (scope == "global" and not reference)
+                or (scope == "project" and project_id and reference == project_id)
+                or (scope == "thread" and reference == (user_profile or {}).get("active_thread_id"))
+            ):
+                continue
+            slot = attribute.get("key") or attribute.get("memory_id")
+            previous = attribute_slots.get(slot)
+            if previous is None or scope_rank.get(attribute.get("scope"), -1) > scope_rank.get(
+                previous.get("scope"), -1
+            ):
+                attribute_slots[slot] = attribute
         for attribute in sorted(
-            (user_profile or {}).get("attributes", []),
+            attribute_slots.values(),
             key=lambda item: (
+                item.get("dimension") != "identity",
                 item.get("scope", ""),
                 item.get("key", ""),
                 item.get("memory_id", ""),
@@ -542,15 +820,25 @@ class BoundedWorkspaceContext:
             if attribute.get("key") in manual:
                 continue
             identifier, value = attribute.get("memory_id"), attribute.get("value")
-            if not isinstance(identifier, str) or not isinstance(value, str):
+            if not isinstance(identifier, str):
+                continue
+            if not isinstance(value, str):
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if attribute.get("dimension") == "skill" and identifier not in {
+                m["id"] for m in relevant_memories
+            }:
                 continue
             candidates.append(
-                (identifier, f"User {attribute['dimension']} ({attribute['key']}): {value}")
+                (
+                    identifier,
+                    f"User {attribute['dimension']} ({attribute['key']}): {value}"
+                    + semantic_metadata(by_id.get(identifier, {})),
+                )
             )
             included.add(identifier)
         for item in sorted(
             relevant_memories,
-            key=lambda item: (item.get("type", ""), -item.get("importance", 0), item["id"]),
+            key=lambda item: (-item.get("retrieval_score", item.get("importance", 0)), item["id"]),
         ):
             if item.get("profile_key") in manual or item["id"] in included:
                 continue
@@ -562,7 +850,7 @@ class BoundedWorkspaceContext:
                 text = f"{label}: {item['content']}"
             else:
                 text = f"{item['title']}: {item['content']}"
-            candidates.append((item["id"], text))
+            candidates.append((item["id"], text + semantic_metadata(item)))
         for identifier, text in candidates:
             cost = len(text.encode("utf-8")) + 1
             if cost > remaining:

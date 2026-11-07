@@ -1,4 +1,4 @@
-"""持久化 Agent 的新请求、流式执行和恢复。 / Durable agent requests, streaming and recovery."""
+"""Durable agent requests, streaming and recovery. / 持久化 Agent 请求与恢复。"""
 
 import asyncio
 from collections.abc import AsyncIterator
@@ -16,15 +16,15 @@ from app.conversations import ConversationTurn, ConversationWriter
 
 
 class AgentRunner:
-    """应用启动时创建一个 Runner。 / Create one runner per application process.
+    """Create one runner per application process. / 每个应用进程创建一个 Runner。
+
+    Serialize each user/thread within this runner; external code owns SQLite resources. /
+    同一 Runner 内按用户/线程串行；SQLite 资源由外部管理。
 
     Args:
-        graph: 已注入 Checkpointer 的在线图。 / Online graph with an injected checkpointer.
-        settings: 调用默认值，不包含具体存储实现。 / Invocation defaults, independent of storage.
-        conversation_writer: 可选的会话归档。 / Optional conversation archive.
-
-    中文：同一 Runner 内按用户/线程串行，SQLite 连接由外部生命周期管理。
-    English: Serialize each user/thread within this runner; external code owns SQLite resources.
+        graph: Online graph with an injected checkpointer. / 已注入 Checkpointer 的图。
+        settings: Invocation defaults, independent of storage. / 调用默认值。
+        conversation_writer: Optional conversation archive. / 可选归档。
     """
 
     def __init__(
@@ -34,6 +34,16 @@ class AgentRunner:
         *,
         conversation_writer: ConversationWriter | None = None,
     ) -> None:
+        """Bind one graph, its settings and an optional archive. / 绑定图与可选归档。
+
+        Args:
+            graph: Compiled graph with a checkpointer. / 已编译的图。
+            settings: Invocation defaults; None loads them from env. / 调用默认值。
+            conversation_writer: Optional archive for completed turns. / 可选归档。
+
+        Raises:
+            ValueError: If the graph has no checkpointer. / 缺 Checkpointer 时抛出。
+        """
         if graph.checkpointer is None:
             raise ValueError("AgentRunner requires a graph with a checkpointer")
         self.graph = graph
@@ -42,7 +52,11 @@ class AgentRunner:
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def _archive_completed(self, snapshot: StateSnapshot) -> None:
-        """snapshot：已保存状态，仅归档完成轮次。 / Saved state; archive completed turns only."""
+        """Archive a completed turn from saved state. / 归档已完成的轮次。
+
+        Args:
+            snapshot: Saved checkpoint snapshot. / 已保存的快照。
+        """
         if self.conversation_writer is None or snapshot.next or not snapshot.values.get("response"):
             return
         values = snapshot.values
@@ -53,13 +67,16 @@ class AgentRunner:
                 values["run_id"],
                 values["user_input"],
                 values["response"],
-                learn_memory=values.get("personalization_enabled", False),
+                learn_memory=values.get("personalization_enabled", False)
+                and values.get("response_source") != "identity_fact",
                 project_id=values.get("project_id"),
                 attachment_ids=tuple(values.get("attachment_ids", ())),
                 activity=tuple(run_activity(values)),
                 metrics=run_metrics(values),
                 used_memory_ids=tuple(values.get("used_memory_ids", ())),
                 profile_version=values.get("profile_version"),
+                references=tuple(values.get("resolved_references", ())),
+                memory_trace=values.get("memory_trace", {}),
             )
         )
 
@@ -73,15 +90,21 @@ class AgentRunner:
         project_id: str | None = None,
         personalization_enabled: bool | None = None,
     ) -> AgentState:
-        """消费状态流并返回最终状态。 / Consume state streaming and return the final state.
+        """Consume state streaming and return the final state. / 消费状态流并返回最终状态。
 
         Args:
-            user_id: 已认证的用户 ID。 / Authenticated user ID.
-            thread_id: 业务线程 ID。 / Business conversation ID.
-            message: 新请求；None 表示恢复未完成执行。 / New request, or None to resume.
-            run_id: 新执行 ID，None 时生成；恢复时不传。 / New run ID; omitted when resuming.
-            project_id: 新请求项目作用域。 / Project scope for a new request.
-            personalization_enabled: 新请求的个性化开关。 / New request personalization gate.
+            user_id: Authenticated user ID. / 用户 ID。
+            thread_id: Business conversation ID. / 会话 ID。
+            message: New request; None resumes a pending run. / 新请求，None 表示恢复。
+            run_id: New execution ID; omitted when resuming. / 新执行 ID。
+            project_id: Project scope for a new request. / 项目作用域。
+            personalization_enabled: Per-request personalization gate. / 个性化开关。
+
+        Returns:
+            Final graph state containing the response. / 含回复的最终状态。
+
+        Raises:
+            RuntimeError: If the run produced no response. / 无回复时抛出。
         """
         result = None
         async for event in self.astream(
@@ -109,21 +132,33 @@ class AgentRunner:
         personalization_enabled: bool | None = None,
         approval_policy: ApprovalPolicy | None = None,
         attachment_ids: list[str] | None = None,
+        references: list[dict] | None = None,
         model_selection: dict | None = None,
         decision: tuple[str, bool] | None = None,
         stream_mode: Literal["values", "updates", "messages", "custom"]
         | list[Literal["values", "updates", "messages", "custom"]] = "values",
     ) -> AsyncIterator[Any]:
-        """新请求或恢复，同步提交快照。 / Stream a new/resumed run with synchronous durability.
+        """Stream a new or resumed run with synchronous durability. / 同步落盘地流式执行。
 
         Args:
-            user_id: 已认证的用户 ID。 / Authenticated user ID.
-            thread_id: 业务线程 ID。 / Business thread ID.
-            message: 新请求；None 只恢复已保存输入。 / New request; None uses pending saved input.
-            run_id: 新请求执行 ID，不复用保留历史中的 ID。 / Fresh ID, absent from retained history.
-            project_id: 新请求项目，恢复时沿用保存值。 / New project, or stored project on recovery.
-            personalization_enabled: 新请求开关，恢复时不传。 / New request gate; omit on resume.
-            stream_mode: 状态、更新或消息流。 / State values, node updates or model messages.
+            user_id: Authenticated user ID. / 用户 ID。
+            thread_id: Business conversation ID. / 会话 ID。
+            message: New request; None resumes saved input. / 新请求，None 恢复。
+            run_id: Fresh execution ID; absent from retained history. / 新执行 ID。
+            project_id: New project, or stored project on resume. / 项目作用域。
+            personalization_enabled: New-request gate; omit on resume. / 个性化开关。
+            approval_policy: Tool review policy for new tool calls. / 审核策略。
+            attachment_ids: Uploaded file IDs attached to the turn. / 附件 ID。
+            model_selection: Chosen model, effort and context window. / 模型选择。
+            decision: Pending approval ID and approved flag on resume. / 审批决定。
+            stream_mode: LangGraph stream modes to yield. / 流模式。
+
+        Returns:
+            Async iterator of LangGraph stream events. / 流事件迭代器。
+
+        Raises:
+            ValueError: If resume overrides or identity mismatch occur. / 恢复参数冲突时抛出。
+            RuntimeError: If a new request arrives during a pending run. / 有未完成运行时抛出。
         """
         config = build_graph_config({"user_id": user_id, "thread_id": thread_id}, self.settings)
         user_id, thread_id = user_id.strip(), thread_id.strip()
@@ -148,6 +183,7 @@ class AgentRunner:
                     or personalization_enabled is not None
                     or approval_policy is not None
                     or attachment_ids is not None
+                    or references is not None
                     or model_selection is not None
                 ):
                     raise ValueError(
@@ -196,6 +232,7 @@ class AgentRunner:
                     project_id=project_id,
                     personalization_enabled=personalization_enabled,
                     attachment_ids=attachment_ids,
+                    references=references,
                     settings=self.settings,
                 )
                 state["approval_policy"] = approval_policy or "ask"

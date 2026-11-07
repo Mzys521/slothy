@@ -30,7 +30,7 @@
 | POST | `/settings/providers/discover` | 用给定凭据请求 `{base_url}/models` |
 | GET | `/settings` | 全局个性化开关 |
 | PATCH | `/settings` | 设置全局个性化开关 |
-| GET | `/settings/memory` | 记忆规划器配置（13 项，带 revision） |
+| GET | `/settings/memory` | 记忆规划器配置（14 项，带 revision） |
 | PATCH | `/settings/memory` | 按 revision 校验更新配置 |
 
 ## 3. 账户
@@ -71,10 +71,39 @@
 | GET | `/graph` | 记忆图谱（`limit`、`focus_id`），返回节点、边与总数 |
 | PUT | `/graph/links` | 新建/更新连线（有向或无向、关系、相关度） |
 | DELETE | `/graph/links` | 删除连线 |
-| GET | `/profile` | 当前画像版本（preferences + attributes） |
+| GET | `/profile` | 当前画像版本与统一 attributes |
 | GET | `/profile/versions` | 版本历史（游标分页） |
 | GET | `/profile/versions/{version}` | 指定历史版本 |
-| PATCH | `/profile` | 按 `expected_version` 修改偏好（冲突返回 409） |
+| PATCH | `/profile` | 按 `expected_version` 替换 attributes（冲突返回 409） |
+
+### V3 契约（0.1.4.1-beta）
+
+`PATCH /profile` 接收 `{expected_version, attributes: [{key, dimension, value,
+scope?, scope_ref?}], change_summary?}`，保留 value 的 JSON 类型。维度为
+`identity/skill/preference/habit/goal`。手动和自动都写事实，画像只作投影；不再接受
+`preferences`。姓名同义键统一为 `identity.name`，称呼为独立的 `identity.preferred_name`，
+身份固定 global。技能使用 `skills.<target>.level`（beginner/intermediate/advanced/expert）
+或 `.learning`（布尔值），必须保留目标对象；个人技能默认全局，明确项目声明保留局部作用域。
+
+记忆新增 `memory_key, dimension, value, subject, predicate, concepts, concept_ids,
+source_concept_id, target_concept_id, effective_frequency, strength, protected,
+superseded_by, scoring_version`。状态为 `active/archived/superseded/invalidated`，更正返回
+新事实 ID。强度为 `f/(f+strength_c)`，默认 c=4。只有合格证据参与强化，概念按作用域和会话去重，
+关系按会话去重；容量治理归档未保护事实，不按分数永久删除，也不执行 TTL 或时间衰减。
+
+`GET /graph?project_id=...&thread_id=...` 只返回可见范围的概念节点及独立频次；有向语义边包含
+`fact_id, relation, effective_frequency, strength, evidence_ids`，同节点不同谓词不会覆盖。
+`GET /concepts/{id}` 使用相同可见性检查。手动连线保留原接口，共现不再自动创建语义边。
+`/memory-learning.statistics` 返回有效/归档数量、强化去重、冲突和容量阻塞计数。
+
+聊天、历史与审批响应新增 `memory_trace`、`response_source`。`used_memory_ids` 表示实际提供给
+模型或身份直答器的证据，不表示模型确定采纳。诊断只保存有界 ID、分数、关系路径和原因码，
+不复制正文。直接身份问答跳过生成，从有效全局身份事实直答；缺失、待学习、待确认、冲突、关闭、
+读取失败分别提示。
+
+`/runtime` 新增 `storage_version=3` 和 `data_epoch`。首次启动 V3 仅一次重置三份业务数据库，
+不回放旧消息；模型/连接器配置文件、界面偏好和工作区实际文件保留。前端数据纪元变化时清除
+旧会话缓存，不再向新业务库导入旧浏览器消息。
 
 ## 5. 工作区、会话与附件
 
@@ -203,3 +232,79 @@ Connector 字段为 `id, kind, name, description, enabled, builtin, tools, trans
 新增项默认关闭。MCP 开启时真实连接获取工具，失败保持原状态；关闭再开启可刷新定义。每个导入工具在聊天和工作模式均受审批约束；禁用撤销旧调用，定义改变会改变工具标识。凭证由 Windows DPAPI 保护。
 
 错误沿用 `{code,message,request_id}`：404 `CONNECTOR_NOT_FOUND`；409 `CONNECTOR_EXISTS`；413 `CONNECTOR_TOO_LARGE`；422 `CONNECTOR_INVALID` / `CONNECTOR_LIMIT` / `VALIDATION_ERROR`；502 `CONNECTOR_CONNECTION_FAILED`。最大上传 10 MiB、解压 20 MiB / 512 项、64 个导入项、64 个同时启用的导入工具；Skill 最多启用 8 个、指导合计 64,000 字符。
+
+## 统一工具契约
+
+`GET /runtime` 增加按 read/write/execute/network 分组的 `tool_groups` 和
+`deprecated_tools`。默认桌面端 Work 9 个、Chat 7 个内置工具；Skill 引用读取按启用状态提供，
+`web_fetch` 为可选项，隐藏旧名不进入可见清单。连接器增加 `risk/platforms/available` 与逐工具
+`capabilities`；配置、凭据、环境变量和包路径不公开。
+
+模型工具消息统一为 `ToolResult`：`ok/summary/data/artifacts/next_offset/error`。
+失败的 `error` 含 `code/message/retryable/hint`。错误码包括 `INVALID_ARGS/UNKNOWN_TOOL/
+UNAVAILABLE/OUT_OF_WORKSPACE/OUTPUT_TOO_LARGE/TIMEOUT/DENIED/CONNECTOR_DISABLED/
+EXEC_FAILED/NETWORK_BLOCKED/BUDGET_EXCEEDED/RECOVERY_REQUIRED`。
+分页用 `next_offset`；产物包含 `id/name/bytes/rel_path/sha256/url`。
+`GET /threads/{thread_id}/artifacts/{artifact_id}` 校验归属、路径、大小和摘要后下载真实产物，
+不可用时返回 404。
+
+审批项可增加 `risk` 与 `review_hint`；中断 ID、严格布尔决定和整批审批语义不变。
+不可用或参数无效的调用直接返回工具错误；`every` 审查全部有效可用调用。
+导入执行工具仅在 Work 可见且需要审批，Skill 引用在两模式免审。
+
+SSE done、归档与账户活动包含 `metrics.tools`，字段为 `name/calls/ok/errors/rejected/
+approval_wait_ms/duration_ms/output_bytes/output_chars/artifacts/timed_out/reused`。
+调用数包含已结算尝试与拒绝，`ok + errors + rejected = calls`。批次审批的墙钟等待分别记录到
+各调用，不计执行预算；复用仍记一次逻辑调用，沿用清单保存的执行耗时。
+只有工具指标而没有模型用量时以 `usage_reported=false` 标记，不把占位零值当作真实账单。
+`GET /account/activity` 增加新埋点运行的 `tools/tool_daily`；旧活动保留原有合计计数。
+
+配置见 `.env.example`：工具开关、网络显式启用及 JSON 域名允许列表、运行预算、
+文件/搜索上限和受管产物保留数。`web_fetch` 需启用且允许列表非空，仅 HTTPS/443，
+每次 DNS 与重定向都校验。
+
+`python -m examples.evaluate_tool_golden` 离线校验 25 个固定用例，不调用模型；
+`--live` 才请求已配置模型生成工具提议并对比历史工具集，不真正执行工具。
+报告区分离线/schema 校验、全量任务路由覆盖和共同能力上的选择准确率，不冒充任务执行成功率。
+
+## 输入区命令与显式引用
+
+输入 `/`、`@` 与加号使用同一展开栏。20 个封闭命令复用已有会话/工作区状态、模型选择、
+设置、附件上传及 SSE；未知命令和非法参数不发送给模型，并保留草稿供修正。
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/references/folders`、`/references/files` | 有界工作区路径及当前会话附件搜索 |
+| GET | `/references/sessions`、`/references/plugins` | 所属会话及插件公开元数据 |
+| POST | `/threads/{id}/compact` | 明确确认后压缩 L2，保留最近两轮及完整归档 |
+| POST | `/threads/{id}/export` | 明确确认后通过既有模板导出 md/docx |
+| POST | `/commands/events` | 记录封闭命令身份，不接受执行参数 |
+| GET | `/commands/usage` | 本地命令计数与引用预检结果 |
+
+搜索参数为 `q`（最多 120 字）、`limit`（1–8）、可选 `thread_id`、`workspace_id=personal`、
+文件夹浏览用的 `path=.`，返回 `{items:[]}`。沿用 token、Origin 与归属校验；搜索不可用返回
+`REFERENCE_UNAVAILABLE`，不存在的会话仍返回既有 404。
+
+`POST /chat` 新增可选 `references[]`，最多 8 个不同对象：
+
+```json
+{"message":"总结所选资料","thread_id":"...","references":[
+  {"kind":"folder","path":"reports"},
+  {"kind":"file","id":"reports/notes.md","source":"workspace"},
+  {"kind":"file","id":"attachment-id","source":"attachment"},
+  {"kind":"session","id":"owned-session-id"},
+  {"kind":"plugin","id":"connector-id"}
+]}
+```
+
+服务端按真实身份解析，非法引用在进入模型前返回 422 `REFERENCE_INVALID`。每次模型调用重新校验，
+引用仅为低信任 L3 数据，不启用插件、不改变审批。总预算 `REFERENCES_CONTEXT_CHARS` 默认 12k 字符，
+与记忆独立；文件夹/文件/会话/插件单块最多 4k/8k/4k/2k，二进制只提供元数据。会话优先已有摘要
+及最近两轮摘录，无摘要时最多六轮。完成结果、审批和归档含 `references` 与 `used_reference_ids`；
+历史 chip 标注失效、停用或截断，不将引用全文写入 L1/L2 或归档。
+完成结果还包含服务器保存的原始 `message`，恢复时用于校正消息关联，避免将回答归到修改后的草稿。
+
+压缩请求为 `{"confirmed":true}`；导出还接受 `format:"md"|"docx"` 和可选 UUID `request_id`，
+用于既有清单复用。未确认返回 409 `CONFIRMATION_REQUIRED`；未完成运行不能压缩。文件名由服务端生成，
+下载沿用产物端点。命令不计工具调用或模型用量；`command_events/reference_events` 只保存本地元数据，
+没有预检时成功率为未知。`/stop` 取消当前请求，`/retry` 可通过既有 resume 接口恢复。

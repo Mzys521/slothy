@@ -1,9 +1,22 @@
-"""Bounded counters without retaining prompt bodies or user profile text."""
+"""Bounded counters that never retain prompt bodies or profile text.
+/ 有界计数器，不保留提示正文或画像文本。
+"""
 
 from collections import OrderedDict
 
 
 def cache_write_tokens(usage: dict | None) -> int | None:
+    """Extract cache-write tokens from provider usage metadata.
+    / 从提供商用量元数据中提取缓存写入 Token 数。
+
+    Args:
+        usage: Provider usage mapping, or None when unavailable.
+            / 提供商用量字典；不可用时为 None。
+
+    Returns:
+        Cache-write tokens, or None when unreported.
+        / 缓存写入 Token 数；未上报时为 None。
+    """
     details = (usage or {}).get("input_token_details") or {}
     specific = [
         details[key]
@@ -14,7 +27,14 @@ def cache_write_tokens(usage: dict | None) -> int | None:
 
 
 class PromptTelemetry:
+    """Process-lifetime counters without storing prompt content.
+    / 不存储提示内容的进程级提示计数器。
+    """
+
     def __init__(self):
+        """Initialize empty thread, segment and token counters.
+        / 初始化空的线程、分段与 Token 计数器。
+        """
         self.threads = OrderedDict()
         self.segments = OrderedDict()
         self.calls = self.reported_input = self.read_tokens = self.write_tokens = 0
@@ -24,6 +44,18 @@ class PromptTelemetry:
     def observe(
         self, user: str, thread: str, run: str, namespace: str, plan: dict, usage: dict | None
     ):
+        """Record one planned model call and its cache usage.
+        / 记录一次已规划的模型调用及其缓存用量。
+
+        Args:
+            user: User identifier. / 用户标识。
+            thread: Thread identifier. / 会话标识。
+            run: Run identifier. / 运行标识。
+            namespace: Prompt namespace such as chat or memory.
+                / 提示命名空间，例如 chat 或 memory。
+            plan: Prompt plan metadata from compose(). / compose() 生成的提示计划元数据。
+            usage: Provider usage mapping, or None. / 提供商用量字典，可为 None。
+        """
         key = (user, thread, namespace)
         previous = self.threads.pop(key, {})
         stable = previous.get("stable_turns", 0)
@@ -49,10 +81,21 @@ class PromptTelemetry:
         self._usage(usage)
 
     def observe_summary(self, usage: dict | None):
+        """Record one summary model call and its cache usage. / 记录一次摘要模型调用及其缓存用量。
+
+        Args:
+            usage: Provider usage mapping, or None. / 提供商用量字典，可为 None。
+        """
         self.summary_calls += 1
         self._usage(usage)
 
     def _usage(self, usage: dict | None):
+        """Accumulate cache read/write and reported-input counters.
+        / 累加缓存读写与已上报输入计数器。
+
+        Args:
+            usage: Provider usage mapping, or None. / 提供商用量字典，可为 None。
+        """
         self.calls += 1
         details = (usage or {}).get("input_token_details") or {}
         if details.get("cache_read") is not None:
@@ -61,6 +104,12 @@ class PromptTelemetry:
         self.write_tokens += cache_write_tokens(usage) or 0
 
     def stats(self) -> dict:
+        """Return a snapshot of process-lifetime prompt counters. / 返回进程级提示计数器的快照。
+
+        Returns:
+            Mapping of counters including cache hit ratio and compression events.
+            / 含缓存命中率与压缩事件等计数器的字典。
+        """
         return {
             "scope": "process_lifetime",
             "tracked_threads": len(self.threads),

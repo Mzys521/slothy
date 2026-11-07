@@ -31,6 +31,7 @@ from app.agent.graph import (
 )
 from app.config import AgentSettings, LLMSettings
 from app.infrastructure.llm import OpenAICompatibleProvider
+from app.tools.contracts import ToolResult
 
 
 class RecordingModel(FakeMessagesListChatModel):
@@ -350,7 +351,9 @@ async def test_registered_tools_complete_a_round_trip() -> None:
     assert result["response"] == "结果是 3"
     tool_result = model.calls[1][-1]
     assert isinstance(tool_result, ToolMessage)
-    assert tool_result.tool_call_id == "sum-call" and tool_result.content == "3"
+    assert tool_result.tool_call_id == "sum-call"
+    envelope = ToolResult.model_validate_json(tool_result.content)
+    assert envelope.ok and envelope.data == {"output": 3}
 
 
 async def test_tool_failures_are_sanitized_before_returning_to_model() -> None:

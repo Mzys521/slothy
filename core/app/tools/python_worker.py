@@ -1,4 +1,5 @@
-"""独立文档执行进程，不导入应用或密钥配置。 / Standalone worker without application secrets."""
+"""Standalone document worker that imports no application code or secrets. /
+独立文档执行进程，不导入应用代码或密钥配置。"""
 
 import ast
 import builtins
@@ -9,8 +10,8 @@ import sys
 import sysconfig
 from pathlib import Path
 
-# 中文：允许文档生成常用标准库与可选文档库，不开放命令、网络和动态加载库。
 # English: Document libraries only; no shells, networking or dynamic loading in generated code.
+# 中文：允许文档生成常用标准库与可选文档库，不开放命令、网络和动态加载库。
 ALLOWED_IMPORTS = {
     "pathlib",
     "math",
@@ -87,8 +88,8 @@ if __name__ == "__main__":
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("_") or node.attr in FORBIDDEN_NAMES:
                 raise ValueError("不允许的 Python 属性 / Python attribute is not allowed")
-    # 中文：预先初始化受信任的文档库，兼容 Windows 数值依赖的 DLL 加载。
     # English: Initialize trusted document libraries before enforcing generated-code policies.
+    # 中文：预先初始化受信任的文档库，兼容 Windows 数值依赖的 DLL 加载。
     document_packages = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -103,11 +104,23 @@ if __name__ == "__main__":
     read_files = set()
     if getattr(sys, "frozen", False):
         read_roots.add(Path(sys._MEIPASS).resolve())
-        # PyInstaller loads delayed modules from its executable's embedded PYZ archive.
+        # English: PyInstaller loads delayed modules from its executable's embedded PYZ archive.
+        # 中文：PyInstaller 从可执行文件内嵌的 PYZ 归档加载延迟模块。
         read_files.add(Path(sys.executable).resolve())
 
     def audit(event: str, args: tuple) -> None:
-        """审计回调，不是安全沙箱。 / Audit callback, not a security sandbox."""
+        """
+        Enforce generated-code file, import and process policies. /
+        执行生成代码的文件、导入与进程策略。
+
+        Args:
+            event: Python audit event name. / Python 审计事件名称。
+            args: Event arguments interpreted per event kind. / 按事件类型解释的事件参数。
+
+        Raises:
+            PermissionError: If code attempts network, command, deletion or out-of-root I/O. /
+                代码尝试网络、命令、删除或越界 I/O 时抛出。
+        """
         if event.startswith(
             ("subprocess.", "socket.", "ctypes.", "os.exec", "os.spawn")
         ) or event in {
@@ -156,8 +169,8 @@ if __name__ == "__main__":
                     "目录操作必须在本次目录内 / directory operation is outside this run"
                 )
 
-    # 中文：审计函数必须在执行生成代码前注册；它是策略检查，不是 OS 隔离边界。
     # English: Register before generated code; these are policy checks, not OS-level isolation.
+    # 中文：审计函数必须在执行生成代码前注册；它是策略检查，不是 OS 隔离边界。
     sys.addaudithook(audit)
     allowed_builtins = {
         name: getattr(builtins, name)

@@ -7,7 +7,7 @@
 <p align="center"><em>Small Steps Toward A Better Future · 小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.3.2--beta-60DD06" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.1--beta-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.3.2-beta"><strong>Download Slothy 0.1.3.2 Beta for Windows x64</strong></a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.1-beta"><strong>Download Slothy 0.1.4.1 Beta for Windows x64</strong></a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -41,6 +41,23 @@ reviewable. Fully manual review is also available. Each request retrieves releva
 memory. Tool calls that change your machine are reviewed by you, not trusted
 blindly.
 
+## Memory V3 — 0.1.4.1-beta
+
+The background model extracts typed concepts and evidence-backed relations. Python
+and beginner are separate concepts; proficiency belongs to Python, not to the user
+as a generic label. Concepts and facts have independent, session-deduplicated
+frequencies and strength `f/(f+4)`. SQLite FTS5, aliases and one-hop relation recall
+need no embedding service. Manual profile edits and automatic learning share the
+same facts; corrections retire old versions, and identity questions use reliable
+facts directly. The context panel shows what was actually provided and why.
+
+This development release resets all three business databases **once on first V3
+startup**, without migrating/relearning old conversations. Provider keys, connector
+configuration files, UI preferences and workspace files remain. Old browser session
+caches are cleared when the data epoch changes. No TTL or time decay is applied.
+The published GitHub release now carries this `0.1.4.1-beta` build; building this
+checkout reproduces the same version locally.
+
 ## Why Slothy
 
 | | |
@@ -49,7 +66,7 @@ blindly.
 | **An agent you can audit** | Every run is checkpointed step by step. You can pause on a tool call, inspect the exact arguments, approve or reject it, and resume the same run. |
 | **Memory with provenance** | A memory is a claim plus evidence plus a scope. Reliable information is saved automatically; you can review, edit, archive or delete it. Deletion redacts references and blocks resurrection during historical reanalysis. |
 | **A real desktop product** | Frameless window, native file dialogs, workspace folders on disk, NSIS installer, offline data directory, DPAPI-encrypted provider keys. |
-| **Built to be maintained** | Strict layering, deterministic prompt assembly, 271 backend + 32 frontend tests, production asset audit, and bilingual architecture/API documentation. |
+| **Built to be maintained** | Strict layering, deterministic prompt assembly, full backend/frontend regression suites, production asset audit, and bilingual architecture/API documentation. |
 
 ## Features
 
@@ -59,6 +76,10 @@ blindly.
   recursion.
 - **Human-in-the-loop tools** — risky tool calls pause the graph through an
   `interrupt()`; approve or reject, then resume with `Command(resume=…)`.
+- **Composer commands and references** — `/` and the plus button share a menu for
+  20 commands and file upload; `@` selects workspace files/folders, conversations
+  and plugins. Compression/export require confirmation, references remain bounded
+  L3 data, and plugin execution keeps its existing approval policy.
 - **First-run onboarding** — a centered, theme-aware glass overlay guides the
   first launch: pick a provider template (DeepSeek, MiMo, OpenAI, Anthropic, Kimi
   or Qwen) or connect a custom endpoint, then drop into the workspace. It only
@@ -74,20 +95,26 @@ blindly.
 - **Appearance** — Slothy green by default, a persistent custom accent with HEX
   validation and readable light/dark contrast, plus a language switch on the
   welcome screen.
-- **Adaptive memory** — durable completed-turn queue → independent LLM judgment →
-  evidence/scope validation → automatic merge/update/save → profile and graph projection.
-  Supports auto/review/shadow/off, a dedicated model, confidence thresholds and a daily
-  token budget. Retrieval stays scoped; background usage is included in token activity.
-- **Versioned user profile** — preferences, habits and goals are projected into
-  an immutable profile history; the next turn injects the current version with
-  source memory IDs.
+- **Long-term memory V3** — the background model extracts typed concepts and
+  evidence-backed directed facts; per-session frequency dedupes and strengthens them
+  (`f/(f+4)`). SQLite FTS5, aliases and one-hop relation recall need no embedding
+  service, identity questions answer from reliable facts, and manual edits share the
+  same fact service as autonomous learning.
+- **Versioned profile & facts** — concepts, facts, preferences, habits and goals
+  project into an immutable profile history; explicit corrections supersede old
+  versions, deletion removes evidence and historical profile bodies, and the next
+  turn injects only the scoped current version with source IDs.
 - **Layered prompt & cache** — L1 stable system rules + session-frozen profile
   snapshot, L2 append-only history with periodic summaries, L3 the volatile
   per-turn references at the tail. Stable prefixes stay byte-identical across
   turns for provider prefix caching.
-- **Built-in tools** — calculator, financial calculator, constrained shell
-  commands, document generation in an isolated Python worker, and reading of
-  uploaded files.
+- **Built-in tools** — calculation, paged workspace reads and literal search,
+  reviewed file writes, template export (md/txt/csv/json/docx), timezone lookup,
+  reviewed Python execution and uploaded-file reads. Work has 9 tools; Chat has
+  7. Results, artifacts, risks and per-tool measurements use one contract;
+  journaled writes can be recovered without repeating completed effects.
+- **Optional HTTPS retrieval** — disabled by default; requires an explicit domain
+  allowlist and rejects non-public addresses and unsafe redirects.
 - **Workspaces on disk** — each workspace maps to a real folder; tool instances
   and artifact roots are isolated per directory, without changing the process
   working directory.
@@ -157,7 +184,7 @@ core/                  Python backend (FastAPI + LangGraph)
   app/agent/           graph, tools, providers, prompt planning
   app/personalization/ memory extraction, profile projection
   app/infrastructure/  SQLite stores, LLM adapters, subprocess runner
-  tests/               271 backend automated tests
+  tests/               424 backend automated tests
 web/                   Electron + Vue desktop client
   electron/            main process, preload bridge, backend supervision
   src/                 Vue pages and TypeScript API layer
@@ -168,12 +195,12 @@ docs/                  public documentation (EN + 中文) and diagrams
 
 ```powershell
 cd core
-.\.venv\Scripts\python.exe -m pytest      # 271 tests
+.\.venv\Scripts\python.exe -m pytest      # 424 tests
 .\.venv\Scripts\python.exe -m ruff check app tests
 
 cd ..\web
 npm run typecheck                         # vue-tsc
-node --test tests/*.test.mjs              # 32 frontend/serverless tests
+node --test tests/*.test.mjs              # 43 frontend/serverless tests (+ 3 desktop directory tests)
 npm run production:audit                  # packaged-asset allowlist audit
 ```
 

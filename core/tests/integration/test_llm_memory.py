@@ -14,9 +14,9 @@ from app.api import create_app
 from app.config import CheckpointSettings
 from app.conversations import ConversationTurn
 from app.infrastructure.conversations import SQLiteConversationStore
-from app.infrastructure.workspace import WorkspaceStore
 from app.memory.learning import MemoryLearner
-from app.personalization.evolution import MemoryEvolution
+from app.memory.service import MemoryService as MemoryEvolution
+from app.memory.store import MemoryStore as WorkspaceStore
 from app.personalization.settings import MemoryConfiguration
 
 BASE = "/api/v1"
@@ -165,7 +165,9 @@ async def test_all_memory_kinds_are_classified_and_only_profile_dimensions_proje
         assert {
             item["dimension"] for item in (await system.store.get_profile("u"))["attributes"]
         } == {"preference", "habit", "goal"}
-        assert (await system.store.graph("u", limit=250))["edges"]
+        assert (await system.store.graph("u", limit=250))[
+            "edges"
+        ] == []  # co-occurrence is not a semantic relation
 
 
 async def test_clear_new_preference_supersedes_same_topic_and_merge_reuses_memory(tmp_path):
@@ -197,7 +199,7 @@ async def test_clear_new_preference_supersedes_same_topic_and_merge_reuses_memor
         await system.evolution.process(await enqueue(system, "现在改为先解释再总结。", run="r2"))
         updated = (await memories(system))[0]
         assert updated["id"] != original["id"]
-        assert (await system.store.get_memory("u", original["id"]))["status"] == "archived"
+        assert (await system.store.get_memory("u", original["id"]))["status"] == "superseded"
         version = (await system.store.get_profile("u"))["version"]
         await system.evolution.process(
             await enqueue(system, "merge: 仍然采用前述回答方式。", run="r3")

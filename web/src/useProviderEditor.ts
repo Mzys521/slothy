@@ -1,9 +1,23 @@
+/**
+ * Composable that owns the provider editor form state and save/discover operations.
+ *
+ * 提供商编辑器组合式函数：持有表单状态以及保存/发现目录等操作。
+ */
+
 import { computed, onUnmounted, reactive, ref } from 'vue'
 import { t } from './preferences'
 import { ApiError, workRequest } from './workApi'
 import { loadProviderSettings, providerConfigs, providerTemplates, type ProviderConfig, type ProviderModel } from './providerSettings'
 import { providerIssue, providerModelIssue, providerPayload, type ProviderDraft, type ProviderIssue } from './providerForm'
 
+/**
+ * Maps a validation issue code onto a localized message.
+ *
+ * 将校验错误码映射为本地化文案。
+ *
+ * @param issue - Validation issue code. / 校验错误码。
+ * @returns Localized message for the issue. / 该错误对应的本地化文案。
+ */
 function issueMessage(issue: ProviderIssue) {
   return {
     id: t('Use a provider ID starting with a lowercase letter (up to 48 characters).', '提供商 ID 需以小写字母开头，最多 48 个字符。'),
@@ -18,6 +32,13 @@ function issueMessage(issue: ProviderIssue) {
   }[issue]
 }
 
+/**
+ * Creates the provider-editor state, computed flags and actions.
+ *
+ * 创建提供商编辑器的状态、计算属性与操作方法。
+ *
+ * @returns Reactive editor state and commands consumed by the settings page. / 设置页使用的响应式编辑器状态与命令。
+ */
 export function useProviderEditor() {
   const providers = providerConfigs
   const templates = providerTemplates
@@ -42,6 +63,13 @@ export function useProviderEditor() {
   const canSave = computed(() => !providerIssue(form, savedKey.value))
   const canDiscover = computed(() => !providerIssue(form, savedKey.value, false))
 
+  /**
+   * Stores a failure message, masking the API key and mapping common statuses.
+   *
+   * 记录失败信息：遮蔽 API 密钥，并为常见状态码补充前缀说明。
+   *
+   * @param reason - Thrown error or unknown rejection value. / 抛出的错误或未知的拒绝值。
+   */
   function report(reason: unknown) {
     let message = reason instanceof Error ? reason.message : String(reason)
     if (form.api_key.trim()) message = message.split(form.api_key.trim()).join('••••••••')
@@ -53,6 +81,11 @@ export function useProviderEditor() {
     error.value = [prefix, message].filter(Boolean).join(' ')
   }
 
+  /**
+   * Fills the form from the selected built-in template.
+   *
+   * 用选中的内置模板填充表单。
+   */
   function selectTemplate() {
     const template = templates.value.find(item => item.id === form.template)
     if (!template) return
@@ -63,12 +96,26 @@ export function useProviderEditor() {
     form.models = template.model_ids.map(id => ({ id, name: id }))
     catalog.value = form.models.map(item => ({ ...item }))
   }
+  /**
+   * Switches between built-in and custom provider input.
+   *
+   * 在内置提供商与自定义提供商输入之间切换。
+   *
+   * @param value - Target input kind. / 目标输入类型。
+   */
   function changeKind(value: 'builtin' | 'custom') {
     if (kind.value === value || editId.value) return
     kind.value = value; form.api_key = ''; showKey.value = false
     if (value === 'builtin') selectTemplate()
     else { Object.assign(form, { id: '', name: '', protocol: 'openai', base_url: '', models: [] }); catalog.value = [] }
   }
+  /**
+   * Opens the editor for an existing provider or a new one.
+   *
+   * 打开编辑器：编辑已有提供商或新建提供商。
+   *
+   * @param provider - Provider to edit; omit to create a new one. / 要编辑的提供商；省略表示新建。
+   */
   function openEditor(provider?: ProviderConfig) {
     error.value = ''; notice.value = ''; showKey.value = false; committedKey.value = ''; discoverManual.value = false
     editId.value = provider?.id ?? ''
@@ -82,9 +129,21 @@ export function useProviderEditor() {
     }
     editing.value = true
   }
+  /**
+   * Closes the editor unless a request is still running.
+   *
+   * 在请求未结束时不会关闭编辑器。
+   */
   function closeEditor() {
     if (!busy.value) { editing.value = false; form.api_key = ''; showKey.value = false; error.value = '' }
   }
+  /**
+   * Creates or updates the provider, then reloads the configuration.
+   *
+   * 创建或更新提供商，然后重新加载配置。
+   *
+   * @returns Refreshed provider list, or `undefined` when validation or the request failed. / 刷新后的提供商列表；校验或请求失败时返回 `undefined`。
+   */
   async function save() {
     if (busy.value) return
     lastOperation.value = 'save'
@@ -94,6 +153,7 @@ export function useProviderEditor() {
     try {
       await workRequest('/settings/providers' + (editId.value ? '/' + encodeURIComponent(editId.value) : ''), editId.value ? 'PUT' : 'POST', providerPayload(form, kind.value))
       // Erase the plaintext as soon as the local backend has accepted it, even if reload fails.
+      // 后端接受后立刻清除明文密钥，即使随后刷新配置失败。
       form.api_key = ''; showKey.value = false
       editId.value = form.id.trim(); committedKey.value = editId.value
       const result = await loadProviderSettings({ refresh: true })
@@ -101,6 +161,13 @@ export function useProviderEditor() {
     } catch (reason) { report(reason) }
     finally { saving.value = false }
   }
+  /**
+   * Asks the provider for its model catalog and merges new entries.
+   *
+   * 向提供商请求模型目录并合并新条目。
+   *
+   * @returns Discovered models response, or `undefined` when the request failed. / 发现到的模型响应；请求失败时返回 `undefined`。
+   */
   async function discover() {
     if (busy.value) return
     lastOperation.value = 'discover'
@@ -119,6 +186,13 @@ export function useProviderEditor() {
     } catch (reason) { discoverManual.value = reason instanceof ApiError && [501, 502].includes(reason.status); report(reason) }
     finally { discovering.value = false }
   }
+  /**
+   * Validates and appends the model currently typed into the add-model form.
+   *
+   * 校验并把「添加模型」表单中的模型追加到列表。
+   *
+   * @returns `true` when the model was added. / 模型添加成功时返回 `true`。
+   */
   function addModel() {
     const model: ProviderModel = { id: newModel.id.trim(), name: newModel.name.trim() || newModel.id.trim(), context_window: newModel.context ? Number(newModel.context) : null }
     const issue = providerModelIssue([...form.models, model])
@@ -130,6 +204,11 @@ export function useProviderEditor() {
     addModelOpen.value = false; error.value = ''
     return true
   }
+  /**
+   * Resets the add-model form and reveals it.
+   *
+   * 重置「添加模型」表单并显示它。
+   */
   function showModelForm() { Object.assign(newModel, { id: '', name: '', context: '' }); addModelOpen.value = true; error.value = '' }
   onUnmounted(() => { form.api_key = ''; showKey.value = false })
   return { providers, templates, editing, editId, kind, saving, discovering, busy, error, notice, showKey, addModelOpen, catalog, lastOperation, discoverManual, newModel, form, savedKey, canSave, canDiscover,

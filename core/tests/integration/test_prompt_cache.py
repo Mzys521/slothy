@@ -24,6 +24,7 @@ from app.config import AgentSettings, CheckpointSettings, PromptSettings
 from app.infrastructure.prompt_cache import CachedMemoryReader, ProfileSnapshots
 from app.infrastructure.workspace import WorkspaceStore
 from tests.support.legacy_app import create_app
+from tests.support.profiles import attributes
 
 
 def settings(**values):
@@ -67,7 +68,7 @@ def prompt_plan(**overrides):
 def test_tail_preserves_the_entire_current_tool_round_and_history():
     plan = prompt_plan()
     assert [item.content for item in plan.messages[:4]] == [
-        "trusted\nprompt_version=2026-11-05.1",
+        "trusted\nprompt_version=2026-11-07.memory-v3",
         "old user",
         "old answer",
         "fresh",
@@ -285,7 +286,7 @@ async def test_profile_snapshot_is_frozen_scoped_persisted_forked_and_revocable(
         assert await snapshots.read("u", "t", changed) == saved
         await store.delete_memory("u", item["id"])
         removed = await snapshots.read("u", "t", {**changed, "preferences": {}})
-        assert removed["profile"]["preferences"] == {}
+        assert "preferences" not in removed["profile"]
         assert removed["profile"]["attributes"] == []
         assert removed["revision"] > saved["revision"]
         await snapshots.reset("u", "t")
@@ -304,31 +305,35 @@ def test_api_learning_changes_only_the_tail_and_disable_clear_fork_remain_compat
         assert (
             client.patch(
                 base + "/profile",
-                json={"expected_version": 0, "preferences": {"language": "Python"}},
+                json={"expected_version": 0, "attributes": attributes({"language": "Python"})},
             ).status_code
             == 200
         )
         thread = client.post(base + "/threads", json={}).json()["thread_id"]
         first = client.post(base + "/chat", json={"thread_id": thread, "message": "First question"})
         assert first.status_code == 200, first.text
-        prefix = next(item for item in record[-1] if item.name == "profile_snapshot")
+        assert any(
+            item.name == "profile_snapshot" and "Python" in item.content for item in record[-1]
+        )
         client.patch(
             base + "/profile",
-            json={"expected_version": 1, "preferences": {"language": "Go", "detail": "short"}},
+            json={
+                "expected_version": 1,
+                "attributes": attributes({"language": "Go", "detail": "short"}),
+            },
         )
         second = client.post(base + "/chat", json={"thread_id": thread, "message": "Next question"})
         assert second.status_code == 200, second.text
-        assert (
-            next(item for item in record[-1] if item.name == "profile_snapshot").content
-            == prefix.content
+        assert not any(
+            item.name == "profile_snapshot" and "Python" in item.content for item in record[-1]
         )
         names = [item.name for item in record[-1]]
-        assert names.index("personalization_reference") > 3
+        assert names.index("personalization_reference") >= 3
         assert "Go" in next(
             item.content for item in record[-1] if item.name == "personalization_reference"
         )
         assert record[-1][-1].content == "Next question"
-        assert second.json()["metrics"]["l1_hash"] == first.json()["metrics"]["l1_hash"]
+        assert second.json()["metrics"]["l1_hash"] != first.json()["metrics"]["l1_hash"]
         fork_result = client.post(base + f"/threads/{thread}/fork", json={"title": "Branch"})
         assert fork_result.status_code == 201, fork_result.text
         fork = fork_result.json()["thread_id"]
@@ -338,9 +343,8 @@ def test_api_learning_changes_only_the_tail_and_disable_clear_fork_remain_compat
             ).status_code
             == 200
         )
-        assert (
-            next(item for item in record[-1] if item.name == "profile_snapshot").content
-            == prefix.content
+        assert not any(
+            item.name == "profile_snapshot" and "Python" in item.content for item in record[-1]
         )
         client.patch(base + "/settings", json={"personalization_enabled": False})
         assert (

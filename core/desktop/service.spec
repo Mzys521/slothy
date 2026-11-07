@@ -9,13 +9,14 @@ for package in ('langchain_core', 'langchain_openai', 'langchain_anthropic', 'la
                 'anthropic', 'pydantic', 'uvicorn', 'fastapi', 'python-docx', 'tiktoken', 'mcp',
                 'jsonschema', 'referencing', 'jsonschema-specifications'):
     datas += copy_metadata(package)
-for package in ('certifi', 'docx', 'openpyxl', 'reportlab', 'pptx', 'tiktoken_ext'):
+for package in ('certifi', 'docx', 'openpyxl', 'reportlab', 'pptx', 'tiktoken_ext', 'tzdata'):
     datas += collect_data_files(package, include_py_files=False)
 
 hiddenimports = ['app.tools.python_worker', 'uvicorn.logging', 'uvicorn.loops.asyncio',
                  'uvicorn.protocols.http.h11_impl', 'uvicorn.lifespan.on', 'sqlite3',
                  'docx', 'openpyxl', 'reportlab.pdfgen.canvas', 'pptx', 'tiktoken_ext.openai_public']
 hiddenimports += collect_submodules('langgraph', filter=lambda name: '.test' not in name)
+hiddenimports += collect_submodules('tzdata')
 datas += collect_data_files('jsonschema_specifications', include_py_files=False)
 
 analysis = Analysis(

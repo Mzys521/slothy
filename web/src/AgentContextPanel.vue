@@ -19,6 +19,12 @@ interface MemorySnippet {
   title: string
   content: string
   type?: MemoryReceipt['type']
+  concepts?: { id: string; label: string; kind: string }[]
+  source_concept_id?: string | null
+  target_concept_id?: string | null
+  predicate?: string
+  effective_frequency?: number
+  strength?: number
   evidence?: { thread_id: string; run_id: string; quote: string; recorded_at?: string | null }[]
 }
 interface Runtime {
@@ -43,6 +49,24 @@ const pending = computed(() => props.session?.pendingReview)
 const memoryIds = computed(() => props.memoryId
   ? [props.memoryId]
   : pending.value?.used_memory_ids ?? turn.value?.usedMemoryIds)
+const trace = computed(() => pending.value?.memory_trace ?? turn.value?.memoryTrace)
+const traceLabels: Record<string, [string, string]> = {
+  provided: ['Evidence provided to the model', '已向模型提供参考事实'],
+  identity_fact: ['Answered directly from identity facts', '根据身份事实直接回答'],
+  identity_conflict: ['Identity changes await confirmation', '身份变更存在冲突，尚待确认'],
+  no_match: ['No relevant facts matched', '没有匹配到相关事实'],
+  no_record: ['No confirmed identity record', '没有已确认的身份记录'],
+  disabled: ['Personalized memory is off', '定制记忆已关闭'],
+  pending_learning: ['Memory learning is pending', '记忆仍在整理中'],
+  pending_confirmation: ['Identity facts await confirmation', '身份事实尚待确认'],
+  read_failed: ['Memory read failed', '记忆读取失败'],
+  budget_excluded: ['Excluded by the context budget', '受上下文预算限制未提供'],
+  concept_relation: ['Semantic concept → related fact', '语义概念 → 关联事实'],
+  identity_intent: ['Direct identity recall', '本人身份意图直召'],
+  lexical: ['Local text match', '本地文本匹配'],
+  profile_attribute: ['Current profile attribute', '当前画像属性'],
+}
+function traceLabel(code: string) { const pair = traceLabels[code]; return pair ? t(...pair) : code }
 const snippets = remoteMemories
 const expanded = computed(() => snippets.value.find(item => item.id === openMemory.value))
 const isRunning = computed(() => !!props.session && runningSessions.has(props.session.id))
@@ -56,12 +80,16 @@ const status = computed(() => {
 const memoryEnabled = computed(() => settings.personalizedMemory && (turn.value?.memory ?? true))
 const toolNames = computed(() => (workMode.value ? runtime.value?.work_tools : runtime.value?.chat_tools) ?? [])
 
+// Follow a newly requested memory id: switch to the memory tab and expand that entry.
+// 响应新传入的记忆 id：切换到记忆标签并展开该条。
 watch(() => props.memoryId, id => {
   if (!id) return
   selectedTab.value = 'memory'
   openMemory.value = id
 }, { immediate: true })
 
+// Reload the runtime description whenever the active session changes; ignore stale responses.
+// 切换会话时重新读取运行环境描述，并忽略过期的响应。
 watch(() => props.session?.id, async (_, __, onCleanup) => {
   runtime.value = undefined
   let current = true
@@ -78,6 +106,8 @@ watch(() => props.session?.id, async (_, __, onCleanup) => {
   }
 }, { immediate: true })
 
+// Fetch every memory referenced by the latest turn or by the requested memory id.
+// 拉取最近一轮或指定记忆 id 所引用的全部记忆。
 watch([memoryIds, () => props.session?.id], async ([ids], _, onCleanup) => {
   remoteMemories.value = []
   if (!props.memoryId) openMemory.value = undefined
@@ -96,6 +126,12 @@ watch([memoryIds, () => props.session?.id], async ([ids], _, onCleanup) => {
   memoryLoading.value = false
 }, { immediate: true })
 
+/**
+ * Move tab selection with the arrow, Home and End keys.
+ * 使用方向键、Home 和 End 键切换标签。
+ *
+ * @param event - Keydown event from the tab list. / 标签列表上的键盘事件。
+ */
 function moveTab(event: KeyboardEvent) {
   const index = tabs.findIndex(tab => tab.id === selectedTab.value)
   const next = { ArrowLeft: (index + tabs.length - 1) % tabs.length, ArrowRight: (index + 1) % tabs.length, Home: 0, End: tabs.length - 1 }[event.key]
@@ -119,9 +155,16 @@ function moveTab(event: KeyboardEvent) {
     </div>
 
     <div v-show="selectedTab === 'memory'" :id="prefix + '-panel-memory'" class="monitor-content" role="tabpanel" tabindex="0" :aria-labelledby="prefix + '-memory'">
+      <section v-if="trace" class="memory-trace" data-testid="memory-trace">
+        <p class="monitor-muted">{{ traceLabel(trace.status) }}</p>
+        <p v-if="trace.response_source === 'model' && trace.facts.some(fact => fact.included)" class="monitor-muted">{{ t('These facts were included in context; model adoption is not asserted.', '以下事实已放入上下文，不代表模型必然采纳。') }}</p>
+        <details v-if="trace.facts.length"><summary>{{ t('Recall details', '召回详情') }} · {{ trace.context_token_estimate }} {{ t('estimated tokens', '预算估算') }}</summary>
+          <ul><li v-for="fact in trace.facts" :key="fact.id"><button class="text-link" @click="openMemory = fact.id">{{ fact.id.slice(0, 8) }}</button> · {{ traceLabel(fact.reason) }}<span v-if="fact.strength != null"> · {{ t('Frequency strength', '频次强度') }} {{ fact.strength.toFixed(2) }}</span><small v-if="fact.concept_ids.length">{{ t('Concept path', '概念路径') }} {{ fact.concept_ids.map(id => id.slice(0, 8)).join(' → ') }}</small></li></ul>
+        </details>
+      </section>
       <p v-if="memoryLoading" class="monitor-muted" role="status">{{ t('Loading memories…', '正在加载记忆…') }}</p>
       <p v-else-if="!snippets.length && !memoryError" class="monitor-muted">
-        {{ memoryIds ? t('No memories used in this reply.', '本次回复未使用记忆。') : t('No memory references recorded yet.', '暂无记忆引用记录。') }}
+        {{ memoryIds ? t('No facts were provided for this reply.', '本次回复未提供记忆事实。') : t('No memory references recorded yet.', '暂无记忆引用记录。') }}
       </p>
       <ul v-if="snippets.length" class="memory-chips">
         <li v-for="item in snippets" :key="item.id">
@@ -132,6 +175,8 @@ function moveTab(event: KeyboardEvent) {
         </li>
       </ul>
       <p v-if="expanded?.type" class="monitor-muted">{{ memoryTypeName(expanded.type, t) }}</p>
+      <p v-if="expanded?.source_concept_id && expanded?.target_concept_id" class="monitor-muted">{{ expanded.concepts?.find(c => c.id === expanded?.source_concept_id)?.label }} → {{ expanded.concepts?.find(c => c.id === expanded?.target_concept_id)?.label }} · {{ expanded.predicate === 'proficiency' ? t('Skill proficiency', '技能熟练度') : expanded.predicate }}</p>
+      <p v-if="expanded?.effective_frequency != null" class="monitor-muted">{{ t('Confirmed sessions', '有效确认会话') }} {{ expanded.effective_frequency }} · {{ t('Frequency strength', '频次强度') }} {{ (expanded.strength ?? 0).toFixed(2) }}</p>
       <p v-if="expanded" class="monitor-snippet">{{ expanded.content }}</p>
       <details v-if="expanded?.evidence?.length" class="monitor-evidence">
         <summary>{{ t('Evidence', '原始证据') }}</summary>

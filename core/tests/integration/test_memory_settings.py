@@ -38,12 +38,13 @@ def test_configuration_roundtrip_conflict_restart_and_legacy_gate(tmp_path):
         "fact_ttl_days": 200,
         "retention_days": 120,
         "daily_token_budget": 0,
+        "strength_c": 4.0,
     }
     with TestClient(app) as client:
         initial = client.get(PATH).json()
         assert initial["revision"] == 0
         assert initial["configuration"] == initial["defaults"]
-        assert len(initial["configuration"]) == 13
+        assert len(initial["configuration"]) == 14
         assert {
             key: initial["runtime"][key]
             for key in ("engine", "planner_available", "personalization_enabled")

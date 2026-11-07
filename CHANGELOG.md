@@ -9,6 +9,90 @@ the four-part Windows version followed by a prerelease suffix.
 > 0.1.0 – 0.3.0). This line continues with the current desktop application and
 > keeps that history for reference.
 
+## [Unreleased]
+
+## [0.1.4.1-beta] — 2026-11-07
+
+### Added
+- Memory V3: model-extracted typed concepts, evidence-backed directed facts,
+  independent per-session reinforcement and local FTS5/alias/one-hop recall.
+- Deterministic identity answers and bounded memory diagnostics in chat, history,
+  approval and the context panel; concept and relation frequencies shown separately.
+
+### Changed
+- Manual profile editing and autonomous learning now write the same fact service;
+  attributes project identity, target-specific skills, preferences, habits and goals.
+- Explicit corrections create new versions; capacity archives unprotected facts.
+  Deleted evidence and historical profile bodies are erased and cannot replay.
+- Strength is independently f/(f+c), default c=4. No TTL/time decay or embedding
+  dependency. Prompt version is `2026-11-07.memory-v3`.
+- First V3 startup resets all three business databases once without migrating or
+  relearning old messages. Provider keys, connector configuration files, appearance
+  preferences and real workspace files remain; old browser business caches clear.
+- Display version `0.1.4.1-beta`, npm `0.1.4-beta.1`, Windows `0.1.4.1`.
+- Verification: 424 backend tests (41 V3 cases), 43 frontend plus 3 desktop
+  directory tests, Ruff, TypeScript, dark/light component and Electron checks,
+  actual packaged backend acceptance, production bundle audit and SHA-256 verification.
+
+### Release
+- Windows x64 installer: `slothy-0.1.4.1-beta-x64-Setup.exe` (164,306,334 bytes).
+  SHA-256: `b2d32a98f5066b78ce5860f56cc11763edd4b1355c7891bf7f8e4ac6e0d3f141`
+  (also in `SHA256SUMS-0.1.4.1-beta.txt`; blockmap included).
+- Display version `0.1.4.1-beta`, package SemVer `0.1.4-beta.1`, Windows numeric
+  file version `0.1.4.1`; packaged manifest and lockfile agree.
+- Production audit: 24 app entries, 956 backend files, 7,145 embedded Python
+  modules, 0 prohibited entries.
+- Verification: 424 collected backend tests (423 passed, 1 skipped), 43 frontend
+  plus 3 desktop directory tests, Ruff, TypeScript, packaged-backend acceptance,
+  both desktop startup smoke scenarios, dark/light checks and SHA-256 verification.
+
+## [0.1.3.3-beta] — 2026-11-06
+
+### Added — 2026-11-07 rebuild
+- **Composer commands**: 20 fixed `/` actions and the plus button share a grouped,
+  searchable menu. File upload moves into that menu and reuses the current picker;
+  model, workspace, settings, navigation and streaming use their existing interfaces.
+- **Explicit references**: `@` selects folders, files, owned conversations and
+  plugins. Server revalidation, bounded low-trust L3 context, reference chips,
+  archive/fork/review provenance and local preflight counts are included.
+- **Context and artifacts**: confirmed `/compact` preserves the archive and two
+  recent turns; `/export` reuses template export, journaling and authenticated downloads.
+- **Run control**: stop handles survive page navigation. Resumption uses the
+  server's original message and run identity, including after an edited retry fails.
+- Verification: 383 backend and 42 frontend tests, Ruff, TypeScript, dark/light
+  interactive desktop checks, IME/paste/keyboard, confirmation and stop/resume checks.
+
+### Changed
+- **Tool layer P0–P7**: built-ins, attachments and connectors share descriptor
+  metadata, registry selection and a gateway for typed results/errors,
+  risk-based approval, sequential execution, budgets and persisted measurements.
+- Work exposes 9 default tools and Chat 7. Workspace reads/search/writes,
+  md/txt/csv/json/docx template export, timezone lookup and reviewed `run_python`
+  replace the old command/document interfaces. Hidden aliases resume old
+  checkpoints; executable connectors are Work-only and Skill reads are read-only.
+- Journaled file effects verify existing artifacts before reuse, block uncertain
+  recovery, retain bounded managed runs and support authenticated downloads.
+  Optional HTTPS retrieval is off by default and enforces a domain allowlist,
+  public DNS addresses, pinned connections and redirect checks.
+- Approval, activity and connector views expose risks, targets, artifacts and
+  tool measurements while retaining historical text. Prompt/schema changes use
+  one default prompt-version bump to `2026-11-06.tools-v2`.
+- Verification: 368 backend and 36 frontend tests, Ruff, TypeScript, production
+  frontend and frozen-backend builds, plus frozen-runtime acceptance pass. A
+  25-case live proposal comparison selects the correct tool in 100% of new-tool
+  cases versus 60% for the old set; shared-capability selection is 100% for both.
+  This measures tool proposals, not end-to-end task completion.
+
+### Release — 2026-11-07 rebuild
+- Windows x64 installer: `slothy-0.1.3.3-beta-x64-Setup.exe` (164,157,898 bytes).
+  SHA-256: `DE2276772DD3797ECA3F069615BEAD99A8CDCE886209118D41D07B399314C2EB`.
+- Display version `0.1.3.3-beta`, package SemVer `0.1.3-beta.3`, Windows numeric
+  file version `0.1.3.3`; the lockfile and packaged manifest agree.
+- Production audit passes with 24 app entries, 956 backend files and 7,139
+  embedded Python modules, including zero prohibited modules. Acceptance of
+  the actual bundled backend, including commands/references, and both desktop
+  startup smoke scenarios passes. The original pre-composer installer is archived.
+
 ## [0.1.3.2-beta] — 2026-11-06
 
 ### Added

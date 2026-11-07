@@ -7,7 +7,7 @@
 <p align="center"><em>小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.3.2--beta-60DD06" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.1--beta-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.3.2-beta"><strong>下载 Slothy 0.1.3.2 Beta（Windows x64）</strong></a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.1-beta"><strong>下载 Slothy 0.1.4.1 Beta（Windows x64）</strong></a> ·
   <a href="CHANGELOG.md">更新日志</a>
 </p>
 
@@ -38,6 +38,18 @@
 与当前请求相关的记忆。会改动你机器的工具调用会先暂停、
 由你审批后再恢复同一次运行。
 
+## 长期记忆 V3 — 0.1.4.1-beta
+
+后台模型提炼语义概念与有证据的关系。Python 与新手是两个概念，“新手”绑定 Python，
+不会成为用户整体标签。概念和事实各自按会话去重强化，强度为 `f/(f+4)`；本地 SQLite
+FTS5、别名与一跳关联检索无需 embedding 服务。手动编辑和自动学习写同一事实结构，更正
+撤销旧版本；直接身份问答使用可靠事实直答。上下文面板显示实际提供的证据与未召回原因。
+
+本开发版首次启动 V3 **仅一次重置三份业务数据库**，不迁移或重新学习旧消息。模型密钥、
+连接器配置文件、界面偏好及工作区实际文件保留；数据纪元变化会清理旧浏览器会话缓存。
+不采用 TTL 或时间衰减。上方 GitHub 发布即本 `0.1.4.1-beta` 构建；本源码构建会生成
+相同版本的安装包。
+
 ## 为什么是 Slothy
 
 | | |
@@ -46,7 +58,7 @@
 | **可审计的智能体** | 每次运行逐步落检查点；工具调用可暂停、查看参数、批准或拒绝，然后从同一断点恢复。 |
 | **有出处的记忆** | 一条记忆 = claim + 证据 + 作用域。可靠信息自动沉淀，用户可审查、编辑、归档或删除；删除会擦除旧快照引用并阻止历史重分析复活。 |
 | **真正的桌面产品** | 无边框窗口、原生目录选择、工作区映射到真实文件夹、NSIS 安装包、离线数据目录、DPAPI 加密的模型密钥。 |
-| **可维护的工程** | 严格分层、确定性的提示词组装、271 个后端 + 32 个前端测试、生产资源审查，以及中英双语的架构与 API 文档。 |
+| **可维护的工程** | 严格分层、确定性的提示词组装、424 个后端 + 43 个前端测试及 3 个桌面目录测试、生产资源审查，以及中英双语的架构与 API 文档。 |
 
 ## 能力
 
@@ -55,6 +67,8 @@
   agent →（tools）→ finalize_response`，同步检查点、有界递归步数。
 - **人在回路工具审批**：高风险工具调用通过 `interrupt()` 暂停运行，批准/拒绝后以
   `Command(resume=…)` 恢复。
+- **输入区命令与引用**：`/` 和加号共用 20 个命令与文件添加入口；`@` 选择文件夹、文件、
+  会话或插件。压缩/导出明确确认，引用仅注入有界 L3 数据，插件执行保留既有审批。
 - **首次启动引导**：居中的主题自适应液态玻璃引导层，提供内置服务商模板（DeepSeek、MiMo、
   OpenAI、Anthropic、Kimi、Qwen）与自定义连接两条路径；仅在未配置服务商时出现，读取失败显示
   重试而不是误判为未配置。
@@ -63,13 +77,17 @@
 - **消息预览与复制**：SVG/HTML 预览按会话宽度与内容高度渲染并跟随实时主题；每条消息的复制走
   原生剪贴板桥，浏览器环境自动回退。
 - **外观**：默认思洛绿，支持带 HEX 校验的持久自定义强调色与亮/暗可读对比度，欢迎页可切换语言。
-- **自适应记忆**：完成轮次持久入队 → 独立 LLM 判断 → 原文与作用域校验 → 自动合并、更新与保存
-  → 画像投影和关系更新。支持 auto / review / shadow / off、独立模型、置信度与每日预算。
-  记忆按 global / project / thread 检索；后台用量计入 Token 活动，未上报数据明确标记不完整。
-- **版本化用户画像**：偏好、习惯、目标投影为不可变的历史版本；下一轮注入当前版本及来源记忆 ID。
+- **长期记忆 V3**：后台模型提炼语义概念与有证据的有向事实，按会话去重强化
+  （`f/(f+4)`）。SQLite FTS5、别名与一跳关联检索无需 embedding 服务；身份问答直接使用
+  可靠事实；手动编辑与自动学习共用同一事实服务。
+- **版本化画像与事实**：概念、事实、偏好、习惯与目标投影为不可变历史；显式更正会取代
+  旧版本，删除会清除证据与历史画像正文；下一轮只注入当前作用域内的版本及来源 ID。
 - **分层提示词与缓存**：L1 稳定系统规则 + 会话冻结画像快照，L2 只追加历史（周期性摘要），
   L3 易变的当轮参考放在尾部；稳定前缀在连续请求间保持字节一致，服务端前缀缓存可持续命中。
-- **内置工具**：计算器、金融计算、受限命令、隔离 Python 进程生成文档、读取上传文件。
+- **内置工具**：计算、工作区分页读取与固定字符串搜索、审批后写入、模板导出
+  （md/txt/csv/json/docx）、时区查询、审批后执行 Python、读取上传文件。Work 9 个、Chat 7 个；
+  统一结果、产物、风险和逐工具度量，清单记录可恢复已完成写入，避免重复副作用。
+- **可选 HTTPS 获取**：默认关闭，需显式配置域名允许列表，拒绝非公网地址及不安全重定向。
 - **工作区即目录**：每个工作区映射真实文件夹，工具实例与产物目录按目录隔离，不改变进程工作目录。
 - **模型接入**：DeepSeek、MiMo、Anthropic 以及任意 OpenAI 兼容服务；密钥用 Windows DPAPI 加密，
   API 只返回掩码状态。
@@ -132,7 +150,7 @@ core/                  Python 后端（FastAPI + LangGraph）
   app/agent/           图、工具、Provider、提示词规划
   app/personalization/ 记忆抽取与画像投影
   app/infrastructure/  SQLite 存储、LLM 适配、子进程执行
-  tests/               271 个后端自动化测试
+  tests/               424 个后端自动化测试
 web/                   Electron + Vue 桌面客户端
   electron/            主进程、preload 桥、后端守护
   src/                 Vue 页面与 TypeScript API 层
@@ -143,12 +161,12 @@ docs/                  公共文档（中英）与图表
 
 ```powershell
 cd core
-.\.venv\Scripts\python.exe -m pytest      # 271 个测试
+.\.venv\Scripts\python.exe -m pytest      # 424 个测试
 .\.venv\Scripts\python.exe -m ruff check app tests
 
 cd ..\web
 npm run typecheck                         # vue-tsc
-node --test tests/*.test.mjs              # 32 个前端/无服务器测试
+node --test tests/*.test.mjs              # 43 个前端/无服务器测试（另含 3 个桌面目录测试）
 npm run production:audit                  # 打包资源白名单审查
 ```
 

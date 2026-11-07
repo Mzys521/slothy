@@ -1,4 +1,7 @@
-"""Extract bounded document text from files explicitly supplied to a conversation."""
+"""
+Extract bounded text from files explicitly supplied to a conversation. /
+从会话显式提供的文件中提取有界文本。
+"""
 
 from io import BytesIO
 from pathlib import PurePath
@@ -33,6 +36,23 @@ WORD = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 def read_attachment(filename: str, contents: bytes) -> str:
+    """
+    Decode one uploaded text or DOCX file into plain text. / 将上传的文本或 DOCX
+    文件解码为纯文本。
+
+    Args:
+        filename: Uploaded filename whose extension chooses the reader. /
+        上传文件名，由其扩展名选择读取方式。
+        contents: Raw uploaded bytes, already bounded by the caller. /
+        已由调用方限制大小的原始上传字节。
+
+    Returns:
+        Decoded non-empty text without NUL bytes. / 不含 NUL 字节的非空解码文本。
+
+    Raises:
+        ValueError: If the type is unsupported, unsafe or not readable UTF-8/DOCX text. /
+            类型不支持、不安全或不是可读 UTF-8/DOCX 文本时抛出。
+    """
     extension = PurePath(filename).suffix.lower()
     if extension not in TEXT_EXTENSIONS and extension != ".docx":
         raise ValueError("Unsupported file type. Upload UTF-8 text or a DOCX document.")
@@ -66,7 +86,17 @@ def read_attachment(filename: str, contents: bytes) -> str:
 
 
 def attachment_references(documents: list[dict]) -> list[dict]:
-    """Share the prompt budget among files, reusing space left by short documents."""
+    """
+    Share the prompt budget across uploaded files. / 在上传文件之间分配提示词预算。
+
+    Args:
+        documents: Uploaded document mappings with id, filename and content. /
+            含 id、filename 与 content 的上传文档映射。
+
+    Returns:
+        Reference dicts with bounded text and next_offset when truncated. /
+        含截断游标的参考字典列表。
+    """
     remaining = MAX_CONTEXT_CHARS
     references = {}
     for index, item in enumerate(sorted(documents, key=lambda doc: len(doc["content"]))):

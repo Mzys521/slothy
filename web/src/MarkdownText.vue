@@ -3,6 +3,7 @@ import MarkdownIt from 'markdown-it'
 import { replyPreview, previewTheme } from './replyPreview'
 const markdown = new MarkdownIt({ html: false, breaks: true })
 // Chat output must not fetch remote images. Keep their alt text visible.
+// 聊天输出不得加载远程图片，改为保留其替代文本。
 markdown.renderer.rules.image = (tokens, index) => markdown.utils.escapeHtml(tokens[index]?.content ?? '')
 
 interface PreviewLabels {
@@ -13,6 +14,14 @@ interface PreviewLabels {
 const previewLimit = 200_000
 const svgStart = /^<svg(?=[\s/>])/
 
+/**
+ * Sanitize an inline SVG fence and turn it into a sandboxed preview.
+ * 清洗内联 SVG 代码块，并转换为沙箱预览。
+ *
+ * @param source - Raw SVG markup from a fenced code block. / 围栏代码块中的原始 SVG 标记。
+ * @param label - Fallback accessible title for the preview. / 预览的后备无障碍标题。
+ * @returns Serialized preview HTML, or an empty string when the SVG is unsafe or invalid. / 序列化后的预览 HTML；SVG 不安全或无效时返回空字符串。
+ */
 function svgImage(source: string, label: string) {
   let svg = source.trim().replace(/^<\?xml[^?]*\?>\s*/, '')
   if (svg.length > previewLimit || !svgStart.test(svg) || /<!DOCTYPE|<!ENTITY/i.test(svg)) return ''
@@ -38,12 +47,22 @@ function svgImage(source: string, label: string) {
   return replyPreview(new XMLSerializer().serializeToString(root), title, 'svg')
 }
 
+/**
+ * Wrap raw HTML demo markup as a sandboxed preview when it is small enough.
+ * 在体积允许时，将原始 HTML 演示包装为沙箱预览。
+ *
+ * @param source - Raw HTML from a fenced code block. / 围栏代码块中的原始 HTML。
+ * @param label - Accessible title for the preview. / 预览的无障碍标题。
+ * @returns Preview HTML, or an empty string when empty or oversized. / 预览 HTML；为空或过大时返回空字符串。
+ */
 function htmlDemo(source: string, label: string) {
   if (!source.trim() || source.length > previewLimit) return ''
   return replyPreview(source, label, 'html')
 }
 
 const renderFence = markdown.renderer.rules.fence!
+// Route fenced SVG/HTML blocks to sandboxed previews when the reply enables previews.
+// 当回复启用预览时，将围栏 SVG/HTML 代码块交给沙箱预览渲染。
 markdown.renderer.rules.fence = (tokens, index, options, env, renderer) => {
   const token = tokens[index]!
   const previews = env?.previews as PreviewLabels | undefined
@@ -62,6 +81,7 @@ markdown.renderer.rules.fence = (tokens, index, options, env, renderer) => {
 }
 
 // Also recognize a standalone SVG outside a fenced code block, without enabling raw HTML.
+// 同时识别围栏代码块之外的独立 SVG，且不放开原始 HTML。
 markdown.block.ruler.before('html_block', 'reply_svg', (state, start, end, silent) => {
   const previews = state.env?.previews as PreviewLabels | undefined
   if (!previews || state.sCount[start]! - state.blkIndent >= 4) return false
@@ -97,6 +117,7 @@ const rendered = computed(() => markdown.render(props.text, {
 }))
 const container = ref<HTMLElement>()
 const media = matchMedia('(prefers-color-scheme: dark)')
+/** Push the current theme into every rendered preview iframe. / 将当前主题同步到所有已渲染的预览 iframe。 */
 function syncTheme() {
   for (const frame of container.value?.querySelectorAll<HTMLIFrameElement>('iframe[data-preview-id]') ?? []) {
     const send = () => frame.contentWindow?.postMessage({ kind: 'preview-theme', id: frame.dataset.previewId, theme: previewTheme() }, '*')
@@ -104,6 +125,12 @@ function syncTheme() {
     send()
   }
 }
+/**
+ * Resize a preview iframe to the height reported by its sandboxed document.
+ * 根据沙箱文档上报的高度调整预览 iframe。
+ *
+ * @param event - Message event sent by a preview iframe. / 预览 iframe 发送的消息事件。
+ */
 function resize(event: MessageEvent) {
   if (event.data?.kind !== 'reply-preview-size' || !Number.isFinite(event.data.height)) return
   for (const frame of container.value?.querySelectorAll<HTMLIFrameElement>('iframe[data-preview-id]') ?? []) {
@@ -112,7 +139,11 @@ function resize(event: MessageEvent) {
     }
   }
 }
+// Re-sync preview themes after a re-render or a theme, font or mode change.
+// 重新渲染，或主题、字体、模式变化后，重新同步预览主题。
 watch([rendered, () => settings.mode, () => settings.palette, () => settings.font], () => { void nextTick(syncTheme) })
+// Preview iframes report their height and need theme updates while this component is mounted.
+// 预览 iframe 会回报高度，且在本组件挂载期间需要主题更新。
 onMounted(() => { window.addEventListener('message', resize); media.addEventListener('change', syncTheme); syncTheme() })
 onUnmounted(() => { window.removeEventListener('message', resize); media.removeEventListener('change', syncTheme) })
 </script>

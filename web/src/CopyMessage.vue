@@ -7,6 +7,7 @@ const props = defineProps<{ text: string }>()
 const status = ref<'idle' | 'done' | 'error'>('idle')
 let timer: ReturnType<typeof setTimeout>
 onUnmounted(() => clearTimeout(timer))
+/** Copy the message text and briefly show success or failure feedback. / 复制消息文本，并短暂显示成功或失败反馈。 */
 async function copy() {
   clearTimeout(timer)
   try { await copyText(props.text); status.value = 'done' }

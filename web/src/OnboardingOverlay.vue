@@ -21,7 +21,9 @@ let cycleStarted = false
 let disposed = false
 let successTimer: ReturnType<typeof setTimeout> | undefined
 let fadeTimer: ReturnType<typeof setTimeout> | undefined
+/** Stays visible while connecting or animating the success state, even if the parent closes the prop. / 连接中或成功动画期间保持可见，即使父组件的 open 属性已关闭。 */
 const visible = computed(() => !cycleClosed.value && (props.open || connecting.value || step.value === 'success'))
+/** Busy whenever a provider save/discovery is running or the onboarding is connecting. / 保存/发现提供商或引导连接进行中时为忙碌状态。 */
 const working = computed(() => busy.value || connecting.value)
 const names = computed(() => templates.value.map(item => item.name).join(' · '))
 const title = computed(() => step.value === 'welcome' ? 'Slothy · 思洛'
@@ -32,6 +34,7 @@ const subtitle = computed(() => step.value === 'welcome' ? t('Connect a model, a
   : step.value === 'builtin' ? t('Choose a service, add your key, and make yourself at home.', '选择服务商，填入密钥，即可开始。')
   : t('Use any compatible OpenAI or Anthropic API.', '连接兼容 OpenAI 或 Anthropic 协议的 API。'))
 
+/** Moves keyboard focus to the current step's primary control. / 将键盘焦点移到当前步骤的主要控件。 */
 function focusStep() {
   void nextTick(() => {
     if (!visible.value) return
@@ -39,19 +42,30 @@ function focusStep() {
     ;(target ?? card.value)?.focus()
   })
 }
+// Report visibility changes to the shell and focus the new step when it becomes visible. / 向壳层报告可见性变化，并在可见时聚焦新步骤。
 watch(visible, value => { emit('visibility', value); if (value) focusStep() }, { immediate: true })
 watch(step, focusStep)
+/** Resets every onboarding step to the welcome state. / 将所有引导步骤重置为欢迎状态。 */
 function startCycle() {
   clearTimeout(successTimer); clearTimeout(fadeTimer)
   cycleStarted = true; cycleClosed.value = false; leaving.value = false
   activePath.value = null; step.value = 'welcome'; openEditor()
 }
+// Start or resume the flow whenever the parent opens the overlay. / 父组件打开引导层时开始或继续流程。
 watch(() => props.open, open => {
   if (!open) return
   if (!cycleStarted || cycleClosed.value) startCycle()
   focusStep()
 }, { immediate: true })
 
+/**
+ * Selects a built-in provider template, reusing an existing connection when present.
+ *
+ * 选择内置提供商模板；已有连接时复用该连接。
+ *
+ * @param id - Provider template id. / 提供商模板 ID。
+ * @returns Nothing. / 无返回值。
+ */
 function chooseTemplate(id: string) {
   if (working.value) return
   const existing = providers.value.find(item => item.template === id)
@@ -69,6 +83,14 @@ function chooseTemplate(id: string) {
   }
   addModelOpen.value = false
 }
+/**
+ * Switches between the built-in template path and the custom-connection path.
+ *
+ * 在内置模板路径与自定义连接路径之间切换。
+ *
+ * @param path - Which onboarding path to enter. / 要进入的引导路径。
+ * @returns Nothing. / 无返回值。
+ */
 function choosePath(path: 'builtin' | 'custom') {
   if (working.value) return
   if (path !== activePath.value) {
@@ -82,16 +104,33 @@ function choosePath(path: 'builtin' | 'custom') {
   }
   step.value = path
 }
+/**
+ * Adds or removes a model from the current provider form.
+ *
+ * 将模型加入当前提供商表单，或从中移除。
+ *
+ * @param model - Model catalog entry to toggle. / 要切换的模型目录项。
+ * @returns Nothing. / 无返回值。
+ */
 function toggleModel(model: ProviderModel) {
   const index = form.models.findIndex(item => item.id === model.id)
   if (index >= 0) form.models.splice(index, 1)
   else form.models.push({ ...model })
 }
+/** Returns to the previous onboarding step or welcome screen. / 返回上一个引导步骤或欢迎页。 */
 function back() {
   if (working.value || step.value === 'success') return
   if (addModelOpen.value) addModelOpen.value = false
   else step.value = 'welcome'
 }
+/**
+ * Handles Escape to go back and keeps Tab focus cycling inside the dialog.
+ *
+ * 处理 Escape 返回上一步，并让 Tab 焦点在对话框内部循环。
+ *
+ * @param event - Keyboard event from the overlay. / 来自引导层的键盘事件。
+ * @returns Nothing. / 无返回值。
+ */
 function keydown(event: KeyboardEvent) {
   if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); back(); return }
   if (event.key !== 'Tab') return
@@ -102,6 +141,7 @@ function keydown(event: KeyboardEvent) {
   if (event.shiftKey && (document.activeElement === first || document.activeElement === card.value)) { event.preventDefault(); last.focus() }
   else if (!event.shiftKey && (document.activeElement === last || !card.value?.contains(document.activeElement))) { event.preventDefault(); first.focus() }
 }
+/** Clears the entered key and animates into the success state. / 清空已输入的密钥并动画进入成功状态。 */
 function finish() {
   if (step.value === 'success') return
   form.api_key = ''; showKey.value = false; step.value = 'success'
@@ -116,6 +156,7 @@ function finish() {
     }, 200)
   }, 450)
 }
+/** Saves the provider form and finishes onboarding when the setup is usable. / 保存提供商表单，并在配置可用时完成引导。 */
 async function connect() {
   if (working.value) return
   connecting.value = true
@@ -130,6 +171,7 @@ async function connect() {
     finish()
   } finally { connecting.value = false }
 }
+// Finish automatically once configuration loads and no setup is required; restart if it becomes unusable. / 配置加载完成且无需设置时自动完成；若配置变为不可用则重新开始。
 watch([configurationLoaded, setupRequired], ([loaded, required]) => {
   if (!cycleStarted || connecting.value) return
   if ((!loaded || required) && step.value === 'success') {
@@ -138,6 +180,7 @@ watch([configurationLoaded, setupRequired], ([loaded, required]) => {
   }
   if (!cycleClosed.value && loaded && !required && !props.preview) finish()
 })
+// Clear pending timers and the in-memory API key when the overlay unmounts. / 卸载引导层时清除待执行的定时器与内存中的 API 密钥。
 onUnmounted(() => { disposed = true; clearTimeout(successTimer); clearTimeout(fadeTimer); form.api_key = ''; showKey.value = false })
 </script>
 

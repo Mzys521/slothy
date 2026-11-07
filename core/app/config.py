@@ -1,4 +1,4 @@
-"""模型与运行参数配置。 / Validated model and agent runtime settings."""
+"""Validated model and agent runtime settings. / 模型与运行参数配置。"""
 
 import os
 from collections.abc import Callable
@@ -52,7 +52,7 @@ _PROVIDER_VARIABLES = {
 
 
 class _ProjectSettings(BaseSettings):
-    """共用加载规则；禁止输出输入中的密钥。 / Shared loading with hidden error inputs."""
+    """Shared loading with hidden error inputs. / 共用加载规则，隐藏错误输入。"""
 
     model_config = SettingsConfigDict(
         env_file=_ENV_FILES,
@@ -66,11 +66,11 @@ class _ProjectSettings(BaseSettings):
 
 
 class LLMSettings(_ProjectSettings):
-    """读取 LLM_* 与所选服务的变量。 / Load LLM_* and the selected service's variables.
+    """Load LLM_* and the selected service's variables. / 读取 LLM_* 与服务变量。
 
-    中文：显式参数优先，其次 LLM_*，最后所选服务的命名变量；各变量内环境优先于文件。
-    English: Explicit arguments win over LLM_* overrides and then selected-service variables;
-    process environment wins over dotenv files within each variable name.
+    Explicit arguments win over LLM_* overrides and then selected-service variables;
+    process environment wins over dotenv files within each variable name. /
+    显式参数优先，其次 LLM_*，最后服务变量；同名变量内环境优先于文件。
     """
 
     model_config = SettingsConfigDict(env_prefix="LLM_")
@@ -78,6 +78,7 @@ class LLMSettings(_ProjectSettings):
     # 中文：服务选择器；决定读取哪组密钥、模型和地址。
     # English: Selects the vendor's credential, model, and endpoint namespace.
     provider: ProviderName = "openai_compatible"
+    # Skip LLM_* overrides; read only the selected vendor's variables. / 只读所选服务变量。
     vendor_credentials_only: bool = Field(default=False, exclude=True, repr=False)
     # 中文：实际模型或部署名称，必须显式配置，不自动升级。
     # English: Explicit model/deployment name; never upgraded automatically.
@@ -116,13 +117,34 @@ class LLMSettings(_ProjectSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource | Callable[[], dict[str, Any]], ...]:
-        """添加服务变量作为最后一级回退。 / Add selected-vendor variables as the last fallback."""
+        """Add selected-vendor variables as the last fallback. / 服务变量作为末级回退。
+
+        Args:
+            settings_cls: Settings class holding field defaults. / 设置类。
+            init_settings: Explicit constructor arguments. / 显式参数。
+            env_settings: Process environment source. / 环境变量。
+            dotenv_settings: Dotenv file source. / 点文件。
+            file_secret_settings: File-based secret source. / 密钥文件。
+
+        Returns:
+            Sources in precedence order, vendor resolver last. / 按优先级的来源序列。
+        """
 
         def source_value(source: PydanticBaseSettingsSource, name: str) -> Any:
+            """Read one variable from a settings source. / 从设置来源读取单个变量。
+
+            Args:
+                source: Pydantic settings source. / 设置来源。
+                name: Variable name. / 变量名。
+
+            Returns:
+                The stored value, or None. / 存储值或 None。
+            """
             variables = getattr(source, "env_vars", {})
             return variables.get(name if source.case_sensitive else name.lower())
 
         def selected_vendor_source() -> dict[str, Any]:
+            """Resolve variables for the selected vendor only. / 仅解析所选服务变量。"""
             selected = (
                 init_settings().get("provider")
                 or source_value(env_settings, "LLM_PROVIDER")
@@ -141,6 +163,14 @@ class LLMSettings(_ProjectSettings):
             return resolved
 
         def generic_source(source: PydanticBaseSettingsSource) -> dict[str, Any]:
+            """Load one source, dropping credentials when requested. / 读取来源并按需丢弃凭据。
+
+            Args:
+                source: Pydantic settings source. / 设置来源。
+
+            Returns:
+                Field values from that source. / 该来源的字段值。
+            """
             values = source()
             if init_settings().get("vendor_credentials_only"):
                 for field in ("api_key", "base_url", "model", "extra_body"):
@@ -158,6 +188,17 @@ class LLMSettings(_ProjectSettings):
     @field_validator("model")
     @classmethod
     def validate_model(cls, value: str) -> str:
+        """Strip and reject a blank model name. / 去空白并拒绝空模型名。
+
+        Args:
+            value: Raw model or deployment name. / 原始模型名。
+
+        Returns:
+            Trimmed model name. / 去空白后的名称。
+
+        Raises:
+            ValueError: If the name is blank. / 名称为空时抛出。
+        """
         value = value.strip()
         if not value:
             raise ValueError("LLM_MODEL must not be blank")
@@ -166,6 +207,17 @@ class LLMSettings(_ProjectSettings):
     @field_validator("api_key")
     @classmethod
     def validate_api_key(cls, value: SecretStr) -> SecretStr:
+        """Strip and reject a blank API key. / 去空白并拒绝空密钥。
+
+        Args:
+            value: Selected service's secret. / 所选服务密钥。
+
+        Returns:
+            Trimmed SecretStr. / 去空白后的密钥。
+
+        Raises:
+            ValueError: If the key is blank. / 密钥为空时抛出。
+        """
         key = value.get_secret_value().strip()
         if not key:
             raise ValueError("LLM_API_KEY must not be blank")
@@ -173,6 +225,10 @@ class LLMSettings(_ProjectSettings):
 
     @model_validator(mode="after")
     def validate_endpoint(self) -> Self:
+        """Require an explicit base URL for the generic compatible provider.
+
+        通用兼容服务必须显式提供根地址。
+        """
         if self.base_url is None and self.provider == "openai_compatible":
             raise ValueError("LLM_BASE_URL is required for openai_compatible")
         return self
@@ -180,6 +236,17 @@ class LLMSettings(_ProjectSettings):
     @field_validator("extra_body")
     @classmethod
     def validate_extra_body(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        """Reject extensions that override validated core fields. / 禁止扩展覆盖核心字段。
+
+        Args:
+            value: Vendor request extensions. / 服务扩展字段。
+
+        Returns:
+            The unchanged extensions. / 原样返回扩展。
+
+        Raises:
+            ValueError: If a reserved field is present. / 出现保留字段时抛出。
+        """
         # 中文：扩展字段最终会合并进请求，禁止其覆盖已校验的核心字段。
         # English: Extensions merge into the wire payload; protect validated core fields.
         reserved = {
@@ -195,21 +262,22 @@ class LLMSettings(_ProjectSettings):
 
     @property
     def resolved_base_url(self) -> str:
-        """解析服务地址，不跨服务借用密钥。 / Resolve the URL without cross-vendor credentials."""
+        """Resolve the URL without cross-vendor credentials. / 解析服务地址。"""
         if self.base_url is not None:
             return str(self.base_url).rstrip("/")
         return _DEFAULT_BASE_URLS[self.provider]
 
 
 class AgentSettings(_ProjectSettings):
-    """Graph 与个性化的部署默认值。 / Deployment defaults for graph and personalization."""
+    """Deployment defaults for graph and personalization. / 图与个性化默认值。"""
 
     model_config = SettingsConfigDict(env_prefix="AGENT_")
 
     # 中文：单次 Graph 的最大 super-step 数；包括读取、构建、模型和工具节点。
     # English: Maximum graph super-steps per run, including reads, context, model, and tools.
     max_steps: int = Field(default=25, ge=1)
-    # Legacy layout/library history cap. The layered HTTP runtime uses HISTORY_* batch limits.
+    # Legacy layout/library history cap. / 旧版历史轮次上限。
+    # The layered HTTP runtime uses HISTORY_* batch limits. / 分层运行时改用 HISTORY_* 批次限制。
     history_max_turns: int = Field(default=20, ge=1)
     # 中文：画像、记忆检索和上下文构建各自的超时秒数，超时后降级为普通回答。
     # English: Timeout for each profile/retrieval/context read, followed by graceful fallback.
@@ -228,7 +296,7 @@ class AgentSettings(_ProjectSettings):
 
 
 class MemorySettings(_ProjectSettings, MemoryConfiguration):
-    """Planner defaults; persisted UI configuration overrides these in the settings API."""
+    """Planner defaults overridden by persisted settings-API config. / 规划器默认值。"""
 
     model_config = SettingsConfigDict(env_prefix="MEMORY_", extra="ignore")
 
@@ -247,17 +315,26 @@ class MemorySettings(_ProjectSettings, MemoryConfiguration):
     )
     @classmethod
     def parse_environment_integer(cls, value: Any) -> Any:
-        # Environment values are strings; the public JSON contract remains strict.
+        """Convert decimal environment strings to integers. / 环境字符串转整数。
+
+        Args:
+            value: Raw field value from any source. / 原始字段值。
+
+        Returns:
+            An int for decimal strings, else the value. / 十进制串返回整数，其余原样。
+        """
+        # Environment values are strings; the public JSON contract stays strict.
+        # 中文：环境值是字符串，公开 JSON 契约保持严格。
         if isinstance(value, str) and value.strip().isdecimal():
             return int(value)
         return value
 
 
 class PromptSettings(_ProjectSettings):
-    """Prompt layout and transparent local cache limits; independent of model settings."""
+    """Prompt layout and local cache limits, independent of models. / 提示词布局与缓存限制。"""
 
     model_config = SettingsConfigDict(env_prefix="PROMPT_", extra="ignore", populate_by_name=True)
-    version: str = Field(default="2026-11-05.1", min_length=1, max_length=80)
+    version: str = Field(default="2026-11-07.memory-v3", min_length=1, max_length=80)
     layout: Literal["layered", "legacy"] = "layered"
     layered_l3: bool = True
     cache_breakpoints: Literal["anthropic:auto", "auto", "off"] = "anthropic:auto"
@@ -299,6 +376,11 @@ class PromptSettings(_ProjectSettings):
 
     @model_validator(mode="after")
     def validate_history(self) -> Self:
+        """Reject inconsistent history limits. / 拒绝不一致的历史限制。
+
+        Raises:
+            ValueError: If limits or batch size are inconsistent. / 限制不一致时抛出。
+        """
         if self.history_soft_limit >= self.history_hard_limit:
             raise ValueError("HISTORY_SOFT_LIMIT must be below HISTORY_HARD_LIMIT")
         if self.history_compression_batch > self.history_hard_limit - 1:
@@ -306,8 +388,15 @@ class PromptSettings(_ProjectSettings):
         return self
 
 
+class ReferenceSettings(_ProjectSettings):
+    """Budget for explicit composer reference context. / 输入区显式引用预算。"""
+
+    model_config = SettingsConfigDict(env_prefix="REFERENCES_")
+    context_chars: int = Field(default=12000, ge=2000, le=64000)
+
+
 class CheckpointSettings(_ProjectSettings):
-    """SQLite 快照配置，不依赖 Graph。 / SQLite checkpoint configuration independent of Graph."""
+    """SQLite checkpoint configuration independent of Graph. / SQLite 快照配置。"""
 
     model_config = SettingsConfigDict(env_prefix="CHECKPOINT_")
 
@@ -321,7 +410,17 @@ class CheckpointSettings(_ProjectSettings):
     @field_validator("sqlite_path", mode="before")
     @classmethod
     def validate_sqlite_path(cls, value: Any) -> Path:
-        """校验持久化文件路径。 / Validate and resolve a durable filesystem path."""
+        """Validate and resolve a durable filesystem path. / 校验并解析持久化路径。
+
+        Args:
+            value: Raw configured path. / 原始路径配置。
+
+        Returns:
+            Absolute filesystem path. / 绝对路径。
+
+        Raises:
+            ValueError: If the path is a memory URI or directory. / 内存 URI 或目录时抛出。
+        """
         if isinstance(value, str) and (
             not value.strip() or value == ":memory:" or value.startswith(("sqlite:", "file:"))
         ):
@@ -334,13 +433,14 @@ class CheckpointSettings(_ProjectSettings):
 
 
 class ToolSettings(_ProjectSettings):
-    """内置工具的工作区与资源限制。 / Built-in tool workspace and resource limits."""
+    """Built-in tool workspace and resource limits. / 内置工具限制。"""
 
     model_config = SettingsConfigDict(env_prefix="TOOLS_")
 
     # 中文：工具输入与产物的根目录，相对路径固定相对 core/。
     # English: Root for tool inputs/artifacts; relative paths resolve against core/.
     workspace_path: Path = Path("data/artifacts")
+    # Optional artifact directory; None keeps workspace_path. / 可选产物目录，None 沿用工作区。
     artifacts_path: Path | None = None
     # 中文：外部只读命令的最长执行秒数。
     # English: Maximum execution time for external read-only commands.
@@ -360,11 +460,38 @@ class ToolSettings(_ProjectSettings):
     # 中文：单次 Python 返回的产物文件数量上限。
     # English: Maximum number of returned files from one Python run.
     max_artifact_files: int = Field(default=20, ge=1, le=100)
+    # Feature gates for the layered tool suite. / 分层工具集的功能开关。
+    workspace_files_enabled: bool = True
+    export_document_enabled: bool = True
+    get_datetime_enabled: bool = True
+    run_python_enabled: bool = True
+    # Web fetch defaults off and is domain-limited. / 网页抓取默认关闭且限域名。
+    web_fetch_enabled: bool = False
+    web_fetch_allowed_domains: list[str] = Field(default_factory=list)
+    web_fetch_max_bytes: int = Field(default=1_000_000, ge=1024, le=10_000_000)
+    # Per-run resource budget shared by all tool calls. / 所有工具调用共享的单次运行预算。
+    max_calls_per_run: int = Field(default=12, ge=1, le=100)
+    max_total_output_chars: int = Field(default=64000, ge=256, le=1_000_000)
+    max_total_duration_seconds: float = Field(default=120, gt=0, le=600, allow_inf_nan=False)
+    failure_streak_limit: int = Field(default=3, ge=1, le=20)
+    max_workspace_read_bytes: int = Field(default=1_048_576, ge=1024, le=100_000_000)
+    max_workspace_search_bytes: int = Field(default=10_485_760, ge=1024, le=100_000_000)
+    max_artifact_runs: int = Field(default=100, ge=1, le=10000)
 
     @field_validator("workspace_path", mode="before")
     @classmethod
     def resolve_workspace(cls, value: Any) -> Path:
-        """解析工作区，拒绝现有普通文件。 / Resolve the workspace and reject existing files."""
+        """Resolve the workspace directory and reject existing files. / 解析工作区目录。
+
+        Args:
+            value: Raw configured workspace path. / 原始工作区路径。
+
+        Returns:
+            Absolute workspace directory. / 绝对目录路径。
+
+        Raises:
+            ValueError: If blank or pointing at a file. / 为空或指向文件时抛出。
+        """
         if isinstance(value, str) and not value.strip():
             raise ValueError("TOOLS_WORKSPACE_PATH must not be blank")
         path = Path(value).expanduser()

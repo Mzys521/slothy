@@ -36,14 +36,39 @@ const displayName = ref('')
 const handle = ref('')
 const activityChart = ref<InstanceType<typeof TokenActivityChart>>()
 const locale = computed(() => settings.language === 'zh-CN' ? 'zh-CN' : 'en-US')
+/**
+ * Format a number using the active locale, with an em dash for missing values.
+ * 按当前语言格式化数字，缺省值显示破折号。
+ *
+ * @param value - Number to format, or null/undefined. / 待格式化的数字，可为 null 或 undefined。
+ * @returns Localized number string or an em dash. / 本地化数字字符串或破折号。
+ */
 const number = (value: number | null | undefined) => value == null ? '—' : value.toLocaleString(locale.value)
+// Shared token-count formatter used by the totals and the activity chart.
+// 与活跃度图表共用的 token 数量格式化函数。
 const compact = formatTokenCount
+/**
+ * Format a 0–1 ratio as a localized percentage.
+ * 将 0–1 的比率格式化为本地化百分比。
+ *
+ * @param value - Ratio to format, or null/undefined. / 待格式化的比率，可为 null 或 undefined。
+ * @returns Localized percentage string or an em dash. / 本地化百分比字符串或破折号。
+ */
 const percent = (value: number | null | undefined) => value == null ? '—'
   : new Intl.NumberFormat(locale.value, { style: 'percent', maximumFractionDigits: 1 }).format(value)
+// Map the stored reasoning-effort id to its short display label.
+// 将存储的思考强度标识映射为简短显示名。
 const effortName = computed(() => ({
   none: 'Off', low: 'Low', high: 'High', max: 'Max',
 })[usage.value?.reasoning_effort ?? ''] ?? '—')
 
+/**
+ * Render a duration in seconds as a short localized string.
+ * 将秒数时长渲染为简短的本地化文本。
+ *
+ * @param seconds - Duration in seconds, or null/undefined. / 时长（秒），可为 null 或 undefined。
+ * @returns Short duration text such as "3.2 s", "12 min" or "2 h 5 min". / 简短时长文本，如 "3.2 秒"、"12 分" 或 "2 小时 5 分"。
+ */
 function duration(seconds: number | null | undefined) {
   if (seconds == null) return '—'
   if (seconds < 60) return t(seconds.toFixed(1) + ' s', seconds.toFixed(1) + ' 秒')
@@ -54,6 +79,7 @@ function duration(seconds: number | null | undefined) {
     : t(minutes + ' min ' + Math.floor(seconds % 60) + ' s', minutes + ' 分 ' + Math.floor(seconds % 60) + ' 秒')
 }
 
+/** Load the local account profile and usage activity together. / 同时加载本地账户资料与用量活动数据。 */
 async function load() {
   loading.value = true
   error.value = ''
@@ -68,12 +94,19 @@ async function load() {
 }
 onMounted(load)
 
+/** Prefill the edit dialog from the current account profile. / 使用当前账户资料预填编辑弹窗。 */
 function edit() {
   displayName.value = accountProfile.value?.display_name ?? ''
   handle.value = accountProfile.value?.handle ?? ''
   editDialog.value?.showModal()
 }
 
+/**
+ * Run a save action while tracking busy state and surfacing failures.
+ * 在跟踪忙碌状态并展示失败信息的同时执行保存操作。
+ *
+ * @param action - Save callback to execute. / 要执行的保存回调。
+ */
 async function change(action: () => Promise<void>) {
   if (busy.value) return
   busy.value = true
@@ -88,6 +121,7 @@ async function change(action: () => Promise<void>) {
   }
 }
 
+/** Validate the handle and save the edited profile fields. / 校验用户名并保存编辑后的资料字段。 */
 function submitProfile() {
   const username = handle.value.trim().replace(/^@/, '')
   if (username && !/^[a-zA-Z0-9_.-]{1,32}$/.test(username)) {
@@ -97,6 +131,12 @@ function submitProfile() {
   void change(() => saveAccount(displayName.value.trim() || null, username || null))
 }
 
+/**
+ * Validate, center-crop and upload the selected avatar image.
+ * 校验、居中裁剪并上传选中的头像图片。
+ *
+ * @param event - Change event from the hidden avatar file input. / 隐藏头像文件输入框的 change 事件。
+ */
 async function uploadAvatar(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]

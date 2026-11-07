@@ -6,6 +6,7 @@ import { brandAsset } from './brand'
 const maximized = ref(false)
 const desktop = window.desktop
 let unsubscribe: (() => void) | undefined
+// Only the Electron shell exposes the desktop bridge; mirror and subscribe to its maximize state. / 仅 Electron 壳层提供桌面桥接；同步并订阅其最大化状态。
 onMounted(async () => {
   if (!desktop) return
   maximized.value = await desktop.isMaximized()

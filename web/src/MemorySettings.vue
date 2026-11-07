@@ -5,6 +5,7 @@ import { ApiError, workRequest, type ModelItem } from './workApi'
 import { loadMemorySettings, saveMemorySettings, type MemoryConfiguration, type MemoryConfigurationPublic } from './memorySettings'
 
 type NumberKey = Exclude<keyof MemoryConfiguration, 'mode' | 'model'>
+/** Numeric planner setting rendered as a labelled input with min/max bounds. / 以带最小/最大边界的标签输入框呈现的数值型规划器设置。 */
 type NumberField = {
   key: NumberKey
   en: string
@@ -15,22 +16,18 @@ type NumberField = {
   max: number
   step?: number
 }
+/** Numeric setting groups rendered as collapsible sections. / 以可折叠分区呈现的数值设置组。 */
 const groups: { id: string; title: [string, string]; fields: NumberField[] }[] = [
   { id: 'schedule', title: ['Scheduling', '调度与批量'], fields: [
     { key: 'batch_size', en: 'Batch size', zh: '单批轮数', description: ['Maximum conversation turns in one batch.', '每次规划处理的对话轮数上限。'], unit: ['turns', '轮'], min: 1, max: 64 },
-    { key: 'idle_seconds', en: 'Idle time', zh: '空闲等待', description: ['Idle time before background consolidation.', '对话空闲多久后进行后台整合。'], unit: ['seconds', '秒'], min: 1, max: 86400 },
-    { key: 'consolidate_every', en: 'Consolidate every', zh: '整合间隔', description: ['New turns required to trigger consolidation.', '积累指定数量的新轮次后触发整合。'], unit: ['turns', '轮'], min: 1, max: 1000 },
   ] },
-  { id: 'retention', title: ['Retention & forgetting', '保留与遗忘'], fields: [
-    { key: 'forget_interval_hours', en: 'Forgetting interval', zh: '遗忘检查间隔', description: ['Time between background decay checks.', '后台执行衰减检查的时间间隔。'], unit: ['hours', '小时'], min: 1, max: 720 },
+  { id: 'retention', title: ['Capacity & protection', '容量与保护'], fields: [
     { key: 'active_limit', en: 'Active memory limit', zh: '有效记忆上限', description: ['Target maximum number of active memories.', '单个用户可保留的有效记忆数量上限。'], unit: ['memories', '条'], min: 1, max: 100000 },
-    { key: 'episodic_ttl_days', en: 'Episodic memory lifetime', zh: '情景记忆保留期', description: ['Time before summarizing and archiving episodes.', '情景记忆在压缩为摘要并归档前的保留天数。'], unit: ['days', '天'], min: 1, max: 3650 },
-    { key: 'fact_ttl_days', en: 'Fact memory lifetime', zh: '事实记忆保留期', description: ['Unused facts are eligible for archival after this period.', '事实记忆超过此天数未使用后可归档。'], unit: ['days', '天'], min: 1, max: 3650 },
-    { key: 'retention_days', en: 'Archived memory retention', zh: '归档后保留期', description: ['Retention before a planner may permanently remove archived memories.', '归档记忆在规划器可永久清除前的保留天数。'], unit: ['days', '天'], min: 1, max: 3650 },
   ] },
   { id: 'decisions', title: ['Decisions & budget', '决策与预算'], fields: [
     { key: 'auto_confirm_score', en: 'Auto-apply confidence', zh: '自动应用置信度', description: ['Minimum confidence for automatically accepting explicit statements (0–1).', '自动接受明确个人陈述的最低置信度（0–1）。'], unit: ['', ''], min: 0, max: 1, step: 0.01 },
     { key: 'observed_min_threads', en: 'Minimum source conversations', zh: '观察记忆最少来源', description: ['Distinct conversations required for an observed preference.', '观察所得偏好至少需要多少个不同会话作为证据。'], unit: ['conversations', '个会话'], min: 1, max: 100 },
+    { key: 'strength_c', en: 'Half-saturation confirmations', zh: '半饱和确认会话数', description: ['Independent strength f/(f+c); no time decay.', '独立强度 f/(f+c)，不采用时间衰减。'], unit: ['sessions', '个会话'], min: 0.1, max: 1000000, step: 0.1 },
     { key: 'daily_token_budget', en: 'Daily token budget', zh: '每日 Token 预算', description: ['Daily model budget for the planner. Zero disables planner model calls.', '规划器每日模型用量上限；设为 0 表示不允许规划器调用模型。'], unit: ['tokens', 'tokens'], min: 0, max: 10000000 },
   ] },
 ]
@@ -46,11 +43,15 @@ const conflict = ref(false)
 const models = ref<ModelItem[]>([])
 const modelsLoading = ref(false)
 const modelsError = ref('')
+/** Draft payload sent to the server, with blank model IDs normalized to null. / 提交给服务端的草稿负载，空白模型 ID 会规整为 null。 */
 const payload = computed(() => draft.value ? { ...draft.value, model: draft.value.model?.trim() || null } : undefined)
+/** True when the draft differs from the last saved configuration. / 草稿与最近保存的配置不同时为 true。 */
 const dirty = computed(() => !!state.value && JSON.stringify(payload.value) !== JSON.stringify(state.value.configuration))
 const enabled = computed(() => state.value?.runtime.personalization_enabled ?? false)
 const llmLearning = computed(() => state.value?.runtime.engine === 'llm_learning')
+/** Settings keys the active engine currently applies; others are saved as reserved values. / 当前引擎实际生效的设置键；其余键仅作为预留值保存。 */
 const appliedFields = computed(() => new Set(state.value?.runtime.applied_fields ?? []))
+/** Human-readable summary of the active memory engine and processing mode. / 当前记忆引擎与处理模式的可读摘要。 */
 const engineDescription = computed(() => {
   if (!enabled.value) return t('Personalized memory is off', '定制记忆已关闭')
   if (!llmLearning.value) return t('Rule extraction · user review', '规则提取 · 人工审核')
@@ -67,12 +68,29 @@ const modes = computed(() => [
   { id: 'off', label: t('Off', '关闭规划器'), description: t('Pause planner processing.', '暂停规划器处理。') },
 ])
 const selectedMode = computed(() => modes.value.find(item => item.id === draft.value?.mode))
+/**
+ * Converts an unknown thrown value into a user-facing message.
+ *
+ * 将未知异常值转换为可展示给用户的文本。
+ *
+ * @param reason - Unknown caught error value. / 捕获到的未知错误值。
+ * @returns Error message or the stringified value. / 错误信息或字符串化后的值。
+ */
 function message(reason: unknown) { return reason instanceof Error ? reason.message : String(reason) }
+/**
+ * Adopts a server configuration as both the saved state and the editable draft.
+ *
+ * 将服务端配置同时作为已保存状态与可编辑草稿。
+ *
+ * @param value - Latest public configuration returned by the server. / 服务端返回的最新公开配置。
+ * @returns Nothing. / 无返回值。
+ */
 function accept(value: MemoryConfigurationPublic) {
   state.value = value
   draft.value = { ...value.configuration }
   settings.personalizedMemory = value.runtime.personalization_enabled
 }
+/** Loads the current memory configuration and resets the draft. / 加载当前记忆配置并重置草稿。 */
 async function load() {
   if (saving.value || toggling.value) return
   loading.value = true; error.value = ''; notice.value = ''
@@ -80,12 +98,14 @@ async function load() {
   catch (reason) { error.value = message(reason) }
   finally { loading.value = false }
 }
+/** Loads configured models for the planner-model datalist. / 为规划模型候选列表加载已配置的模型。 */
 async function loadModels() {
   modelsLoading.value = true; modelsError.value = ''
   try { models.value = (await workRequest<{ items: ModelItem[] }>('/models')).items }
   catch (reason) { modelsError.value = message(reason) }
   finally { modelsLoading.value = false }
 }
+/** Toggles personalized memory on the server and mirrors it into local settings. / 在服务端切换定制记忆开关，并同步到本地设置。 */
 async function toggle() {
   if (!state.value || toggling.value || saving.value) return
   toggling.value = true; toggleError.value = ''
@@ -96,6 +116,7 @@ async function toggle() {
   } catch (reason) { toggleError.value = message(reason) }
   finally { toggling.value = false }
 }
+/** Saves the draft using the last known revision, flagging 409 conflicts. / 使用最近已知版本保存草稿，并标记 409 冲突。 */
 async function save() {
   if (!state.value || !payload.value || saving.value || !dirty.value || conflict.value) return
   saving.value = true; error.value = ''; notice.value = ''
@@ -111,13 +132,23 @@ async function save() {
       : message(reason)
   } finally { saving.value = false }
 }
+/**
+ * Resets the draft to the saved configuration or to deployment defaults.
+ *
+ * 将草稿重置为已保存配置或部署默认值。
+ *
+ * @param toDefaults - When true, load deployment defaults instead of saved values. / 为 true 时载入部署默认值而非已保存值。
+ * @returns Nothing. / 无返回值。
+ */
 function reset(toDefaults = false) {
   if (!state.value || saving.value) return
   draft.value = { ...(toDefaults ? state.value.defaults : state.value.configuration) }
   notice.value = toDefaults ? t('Defaults restored in this draft. Save to keep them.', '已在草稿中恢复默认值，保存后才会写入。') : ''
   if (!conflict.value) error.value = ''
 }
+// Clear the saved notice as soon as the user edits the draft. / 用户一修改草稿就清除“已保存”提示。
 watch(draft, () => { notice.value = '' }, { deep: true, flush: 'sync' })
+// Load configuration and model list on mount. / 挂载时加载配置与模型列表。
 onMounted(() => { void load(); void loadModels() })
 </script>
 

@@ -34,6 +34,7 @@ const account = [
 type Page = 'chat' | 'settings' | 'settings/language' | 'settings/memory' | 'settings/archives' | 'settings/api' | 'settings/about' | 'memory-detail' | typeof account[number]['id']
 const validPages = new Set<string>(['chat', 'settings', 'settings/language', 'settings/memory', 'settings/archives', 'settings/api', 'settings/about', 'memory-detail', ...account.map(item => item.id)])
 const isDesktop = !!window.desktop
+/** Resolve the active page from the URL hash, falling back to the workspace view. / 根据 URL hash 解析当前页面，无法识别时回退到会话页。 */
 function currentPage(): Page {
   const route = location.hash.slice(1)
   return validPages.has(route) ? route as Page : 'workspace'
@@ -85,6 +86,8 @@ const duplicateWorkspace = computed(() => {
   const name = workspaceDraft.value.trim().toLowerCase()
   return Boolean(name) && workspaces.value.some(workspace => workspace.id !== editingId && workspaceName(workspace.id).toLowerCase() === name)
 })
+// Group sessions under their workspace, hiding archived rows and putting pinned rows first.
+// 按工作区归组会话，隐藏归档行并优先显示置顶行。
 const workspaceTree = computed(() => workspaces.value.map(workspace => {
   const entries = sessions.value.filter(item => sessionWorkspace(item) === workspace.id)
   return {
@@ -93,39 +96,66 @@ const workspaceTree = computed(() => workspaces.value.map(workspace => {
     items: entries.filter(item => !item.archived).sort((a, b) => (b.pinnedAt ?? 0) - (a.pinnedAt ?? 0)),
   }
 }))
+// Expand the newly active workspace and create a draft session when it is empty.
+// 展开新激活的工作区，为空时创建草稿会话。
 watch(activeWorkspace, id => { openWorkspace(id) })
 watch(activeSession, id => {
   if (id) expandedWorkspaces.value.add(activeWorkspace.value)
 })
+// Recreate a draft session when the active workspace loses all of its rows.
+// 活动工作区没有任何会话行时重建草稿会话。
 watch(() => sessions.value.some(item => sessionWorkspace(item) === activeWorkspace.value), hasSessions => {
   if (!hasSessions && !workspaceBusy.value && expandedWorkspaces.value.has(activeWorkspace.value)) openWorkspace(activeWorkspace.value)
 })
+/**
+ * Short status label shown on a session row.
+ * 会话行上显示的简短状态标签。
+ *
+ * @param item - Session to describe. / 待描述的会话。
+ * @returns Localized running, approval, finished or ready label. / 本地化的运行、审批、已结束或就绪文案。
+ */
 function sessionStatus(item: Session) {
   if (runningSessions.has(item.id)) return t('Running', '运行中')
   if (item.pendingReview) return t('Awaiting approval', '等待确认')
   return item.turns.length ? t('Finished', '已结束') : t('Ready', '就绪')
 }
+/**
+ * Display title for a session row, including draft and untitled fallbacks.
+ * 会话行的显示标题，包含草稿与未命名回退。
+ *
+ * @param item - Session to title. / 待生成标题的会话。
+ * @returns Session title or a localized fallback. / 会话标题或本地化回退文案。
+ */
 function sessionTitle(item: Session) {
   return item.title || (item.draft === false || item.archived
     ? t('Untitled session', '未命名会话') : t('New session', '新建会话'))
 }
 watch(page, () => { profileMenu.value = false })
 
+/**
+ * Switch the active page and keep the URL hash in sync.
+ * 切换当前页面并同步 URL hash。
+ *
+ * @param target - Page to open. / 要打开的页面。
+ */
 function navigate(target: Page) {
   page.value = target
   if (location.hash !== '#' + target) location.hash = target
   profileMenu.value = false
   sidebarOpen.value = false
 }
+/** Sync the page state from the current URL hash. / 根据当前 URL hash 同步页面状态。 */
 function updateRoute() {
   if (location.hash === '#sessions') location.replace('#workspace')
   page.value = currentPage()
 }
+/** Retry the startup provider configuration after a failed attempt. / 启动配置失败后重试读取服务商配置。 */
 async function initializeConfiguration() {
   try {
     await loadProviderSettings()
   } catch { /* The startup error stays visible with an explicit retry. */ }
 }
+/** Close the onboarding preview, reset the chat view and route to the workspace. / 关闭引导预览、重置聊天视图并跳转到会话页。 */
 function finishOnboarding() {
   onboardingPreview.value = false
   conversationGeneration.value++
@@ -135,16 +165,31 @@ function finishOnboarding() {
   page.value = 'workspace'
   profileMenu.value = false; sidebarOpen.value = false
 }
+// Close other overlays when onboarding becomes visible.
+// 引导层显示时关闭其他浮层。
 watch(onboardingOpen, open => {
   if (!open) return
   profileMenu.value = false; sidebarOpen.value = false; closeRowMenu()
   if (workspaceDialog.value?.open) workspaceDialog.value.close()
 })
+/**
+ * Open a memory detail view, remembering where the user came from.
+ * 打开记忆详情视图，并记录用户来源页面。
+ *
+ * @param id - Memory id to open. / 要打开的记忆 id。
+ */
 function openMemory(id: string) {
   if (page.value !== 'memory-detail') memoryOrigin.value = page.value
   selectedMemory.value = id
   navigate('memory-detail')
 }
+/**
+ * Jump to the transcript that produced a memory evidence quote.
+ * 跳转到产生记忆证据引用的对话记录。
+ *
+ * @param thread - API thread id of the source conversation. / 来源会话的接口 id。
+ * @param run - Run id whose messages should be revealed. / 需要定位的运行 id。
+ */
 function openEvidence(thread: string, run: string) {
   const session = sessions.value.find(item => item.apiThreadId === thread)
   if (!session || session.archived) {
@@ -158,29 +203,67 @@ function openEvidence(thread: string, run: string) {
     article?.scrollIntoView({ block: 'center' })
   }))
 }
+/**
+ * Open the graph page focused on one memory.
+ * 打开图谱页面并聚焦指定记忆。
+ *
+ * @param id - Memory id to focus. / 要聚焦的记忆 id。
+ */
 function openGraph(id: string) {
   graphNode.value = id
   navigate('graph')
 }
+/**
+ * Activate a session and show the chat page.
+ * 激活会话并显示聊天页面。
+ *
+ * @param id - Session id to open. / 要打开的会话 id。
+ */
 function openSession(id: string) {
   if (selectSession(id)) navigate('chat')
 }
+/**
+ * Start a new session in a workspace and route to it.
+ * 在工作区中新建会话并跳转到该会话。
+ *
+ * @param workspaceId - Workspace that owns the new session. / 新会话所属的工作区。
+ */
 function startChat(workspaceId = activeWorkspace.value) {
   if (!workspaces.value.some(item => item.id === workspaceId)) return
   newChat('chat', workspaceId)
   expandedWorkspaces.value.add(activeWorkspace.value)
   navigate('chat')
 }
+/**
+ * Expand a workspace, creating an empty session when it has none.
+ * 展开工作区；若其中没有会话则新建一个空会话。
+ *
+ * @param id - Workspace id to open. / 要打开的工作区 id。
+ * @returns True when a new session had to be created. / 需要新建会话时返回 true。
+ */
 function openWorkspace(id: string) {
   expandedWorkspaces.value.add(id)
   if (sessions.value.some(item => sessionWorkspace(item) === id)) return false
   newChat('chat', id)
   return true
 }
+/**
+ * Expand or collapse a workspace folder in the sidebar.
+ * 在侧边栏中展开或折叠工作区目录。
+ *
+ * @param id - Workspace id to toggle. / 要切换的工作区 id。
+ */
 function toggleWorkspace(id: string) {
   if (expandedWorkspaces.value.delete(id)) return
   if (openWorkspace(id)) navigate('chat')
 }
+/**
+ * Open the workspace/session dialog in create, rename or delete mode.
+ * 以新建、重命名或删除模式打开工作区/会话弹窗。
+ *
+ * @param target - Optional workspace or session being edited. / 可选：正在编辑的工作区或会话。
+ * @param remove - Whether the dialog should confirm deletion. / 弹窗是否进入删除确认模式。
+ */
 function showWorkspaceDialog(target?: RowTarget, remove = false) {
   workspaceError.value = ''
   editTarget.value = target
@@ -189,6 +272,7 @@ function showWorkspaceDialog(target?: RowTarget, remove = false) {
   workspaceDraft.value = target?.kind === 'workspace' ? workspaceName(target.id) : target?.item.title ?? ''
   workspaceDialog.value?.showModal()
 }
+/** Pick a working directory through the desktop bridge. / 通过桌面端桥接选择工作目录。 */
 async function chooseDirectory() {
   if (!window.desktop?.selectDirectory || choosingDirectory.value) return
   choosingDirectory.value = true
@@ -203,6 +287,7 @@ async function chooseDirectory() {
     workspaceError.value = t('Could not open the directory picker.', '无法打开工作目录选择器。')
   } finally { choosingDirectory.value = false }
 }
+/** Validate and apply the dialog's create, rename or delete action. / 校验并执行弹窗中的新建、重命名或删除操作。 */
 async function saveWorkspace() {
   if (workspaceBusy.value) return
   const target = editTarget.value
@@ -236,13 +321,29 @@ async function saveWorkspace() {
   }
 }
 const relativeTime = computed(() => new Intl.RelativeTimeFormat(zh.value ? 'zh-CN' : 'en', { style: 'short' }))
+// Unit sizes in seconds, largest first, used by sessionAge().
+// sessionAge 使用的单位秒数，按从大到小排列。
 const ageUnits = [['year', 31536000], ['month', 2592000], ['week', 604800], ['day', 86400], ['hour', 3600], ['minute', 60]] as const
+/**
+ * Relative age label for a session row.
+ * 会话行的相对年龄标签。
+ *
+ * @param createdAt - Creation timestamp in milliseconds. / 创建时间戳（毫秒）。
+ * @returns Localized relative time, or an em dash when unknown. / 本地化相对时间；未知时返回破折号。
+ */
 function sessionAge(createdAt?: number) {
   if (!createdAt) return '—'
   const seconds = Math.max(0, (now.value - createdAt) / 1000)
   const unit = ageUnits.find(([, size]) => seconds >= size)
   return unit ? relativeTime.value.format(-Math.floor(seconds / unit[1]), unit[0]) : t('Now', '刚刚')
 }
+/**
+ * Open the per-row action menu anchored to its trigger button.
+ * 在触发按钮旁打开行内操作菜单。
+ *
+ * @param event - Click event on the menu trigger. / 菜单触发按钮的点击事件。
+ * @param target - Workspace or session the menu acts on. / 菜单作用的工作区或会话。
+ */
 function showRowMenu(event: MouseEvent, target: RowTarget) {
   const anchor = event.currentTarget as HTMLButtonElement
   if (rowMenu.value?.anchor === anchor) {
@@ -255,15 +356,34 @@ function showRowMenu(event: MouseEvent, target: RowTarget) {
     top: above ? rect.top - 4 : rect.bottom + 4 }
   void nextTick(() => rowMenuPanel.value?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus())
 }
+/**
+ * Close the row action menu.
+ * 关闭行内操作菜单。
+ *
+ * @param restoreFocus - Whether to return focus to the trigger. / 是否将焦点还给触发按钮。
+ */
 function closeRowMenu(restoreFocus = false) {
   const anchor = rowMenu.value?.anchor
   rowMenu.value = undefined
   if (restoreFocus) anchor?.focus()
 }
+/**
+ * Patch title or pin state on the server for a session that has a thread id.
+ * 对已有接口会话 id 的会话，在服务端更新标题或置顶状态。
+ *
+ * @param item - Session to update. / 要更新的会话。
+ * @param patch - Fields to send to the API. / 发送给接口的字段。
+ */
 async function updateSessionMetadata(item: Session, patch: { title?: string; pinned?: boolean }) {
   if (!item.apiThreadId) return
   await workRequest(threadPath(item.apiThreadId), 'PATCH', patch)
 }
+/**
+ * Toggle the pinned state of a session.
+ * 切换会话的置顶状态。
+ *
+ * @param item - Session to pin or unpin. / 要置顶或取消置顶的会话。
+ */
 async function togglePin(item: Session) {
   closeRowMenu(true)
   const pinned = !item.pinnedAt
@@ -274,6 +394,12 @@ async function togglePin(item: Session) {
     actionNotice.value = error instanceof Error ? error.message : t('Could not update session.', '无法更新会话。')
   }
 }
+/**
+ * Toggle the archived state of a session.
+ * 切换会话的归档状态。
+ *
+ * @param item - Session to archive or restore. / 要归档或恢复的会话。
+ */
 async function toggleArchive(item: Session) {
   closeRowMenu(true)
   if (archiving.value.has(item.id)) return
@@ -287,6 +413,12 @@ async function toggleArchive(item: Session) {
     archiving.value.delete(item.id)
   }
 }
+/**
+ * Fork a session into a new branch and open it.
+ * 将会话分叉为新分支并打开。
+ *
+ * @param item - Session to fork. / 要分叉的会话。
+ */
 async function branchSession(item: Session) {
   closeRowMenu()
   if (forking.value.has(item.id)) return
@@ -302,6 +434,12 @@ async function branchSession(item: Session) {
     forking.value.delete(item.id)
   }
 }
+/**
+ * Copy a session id to the clipboard and report the result.
+ * 将会话 id 复制到剪贴板并提示结果。
+ *
+ * @param item - Session whose id should be copied. / 要复制 id 的会话。
+ */
 async function copySessionId(item: Session) {
   closeRowMenu(true)
   try {
@@ -311,6 +449,12 @@ async function copySessionId(item: Session) {
     actionNotice.value = t('Could not copy session ID.', '无法复制会话 ID。')
   }
 }
+/**
+ * Handle global Escape: close menus or reset transient navigation state.
+ * 处理全局 Escape：关闭菜单或重置临时导航状态。
+ *
+ * @param event - Keydown event from the window. / 窗口上的键盘事件。
+ */
 function onGlobalKey(event: KeyboardEvent) {
   if (onboardingBlocking.value) return
   if (event.key === 'Escape') {
@@ -323,6 +467,12 @@ function onGlobalKey(event: KeyboardEvent) {
     sidebarOpen.value = false
   }
 }
+/**
+ * Close menus and popovers when a pointerdown lands outside them.
+ * 当指针按在菜单或弹层之外时关闭它们。
+ *
+ * @param event - Document-level pointerdown event. / 文档级 pointerdown 事件。
+ */
 function closeOutside(event: PointerEvent) {
   const target = event.target as Node
   if (rowMenuPanel.value?.contains(target)) return
@@ -330,6 +480,7 @@ function closeOutside(event: PointerEvent) {
   if (!workspaceDialog.value?.open && !sidebar.value?.contains(target)) sidebarOpen.value = false
   if (!profileArea.value?.contains(target)) profileMenu.value = false
 }
+/** Load workspaces and sessions, surfacing failures beside the sidebar. / 加载工作区与会话，失败时在侧边栏提示。 */
 async function loadWorkspaces() {
   workspaceLoadError.value = ''
   try {
@@ -339,6 +490,8 @@ async function loadWorkspaces() {
     workspaceLoadError.value = error instanceof Error ? error.message : t('Could not load workspaces.', '无法读取工作区。')
   }
 }
+// Bootstrap routing, configuration, workspaces and global listeners once on mount.
+// 挂载时初始化路由、配置、工作区与全局监听。
 onMounted(() => {
   updateRoute()
   void initializeConfiguration()
@@ -349,6 +502,8 @@ onMounted(() => {
   document.addEventListener('pointerdown', closeOutside)
   ageTimer = window.setInterval(() => { now.value = Date.now() }, 15_000)
 })
+// Remove every global listener and interval registered on mount.
+// 卸载时移除挂载阶段注册的全局监听与定时器。
 onUnmounted(() => {
   window.removeEventListener('hashchange', updateRoute)
   window.removeEventListener('keydown', onGlobalKey)

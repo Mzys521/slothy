@@ -93,37 +93,30 @@ START → prepare_run → load_profile → retrieve_memories
 - Runner 按线程串行执行；推进前会补写上一轮缺失的归档。
 - 审批策略（`ask` | `every`）决定哪些调用暂停；`ask` 下安全工具与只读命令不暂停。
 
-## 5. 记忆与用户画像
+## 5. 记忆与用户画像 V3
 
-```
-完成一轮 ──▶ 归档（sessions.sqlite）──▶ 学习队列
-                                        │
-                 独立 memory_learning 图：LLM 判断与原文校验
-                                        ▼
-                        memory_claims + memory_evidence（workspace.sqlite）
-                                        │
-                     auto 自动应用 / review 审核 ──▶ 已确认记忆
-                                        │
-                  画像投影（偏好/习惯/目标）──▶ 画像新版本 +1
-                                        │
-                   下一轮：按作用域检索 + 注入画像快照
-```
+链路为：归档 → 持久学习队列 → LLM concepts/facts → 原话与作用域校验 → 事实事务 →
+独立强化 → 画像/搜索/图谱投影。在线 Agent 保持只读，不引入 embedding 服务。
 
-- claim 带作用域（`global` / `project` / `thread`）、维度、尽可能稳定的主题键与证据原文。
-- `app/memory/learning.py` 是后台编排层，LLM 只输出严格 JSON，不绑定执行工具；
-  `app/personalization/evolution.py` 继续拥有确认、画像投影、删除及关系维护的领域事务。
-- 模型调用不持有写锁，不阻塞聊天；持久队列通过 Event 唤醒并在启动恢复。配置、来源、
-  版本和总开关在落库前重查；跨库完成标记防止崩溃后的重复应用。
-- 默认 auto 自动应用可信、有原话的持久信息。review 全人工确认，shadow 只评估，off 暂停；
-  推断需要跨会话佐证，敏感或不确定候选仍可审查。删除/忽略的来源不因重新分析复活。
-- 每日预算以保守上界预留并用实际 usage 结算，长批次自动拆小；后台已上报用量计入账户
-  Token 活动，不增加对话轮数，未上报显示为不完整统计。遗忘、TTL 和定期整合仍为明确标注的预配置。
-- 画像是不可变版本链；编辑使用乐观并发（`expected_version`），删除会擦除旧快照原文，只有
-  内容变化才产生新版本（保留最近 200 版）。
-- 记忆关系（`shared_conversation`、手工连线）保存在同一工作区库；图谱 API 支持有向/无向
-  连线与删除。
-- 工作区映射到真实目录；工具实例与产物根按目录隔离，不改变进程工作目录。这是路径策略，
-  不是操作系统沙箱。
+- `app/memory/learning.py` 保留后台编排及严格有界 JSON（最多 32 概念、16 事实）；
+  `MemoryService` 复用原事务/审核生命周期并拥有 V3 写入，`MemoryStore` 拥有作用域检索
+  和图谱投影。模型网络调用不持有写锁。
+- 概念按用户和作用域保存类型、规范键及有证据的别名；事实保存主体、谓词、目标、值、
+  证据、状态和版本链。语义边直接使用事实 ID。熟练度必须绑定具体技能，共现不代表关系成立。
+- 概念和事实分别记录唯一会话强化事件；证据合格资格与实际强化分开。强度独立使用
+  `f/(f+c)`，默认 c=4，不做集合归一化、TTL 或时间衰减。默认 500 条有效事实容量先去重，
+  再归档未保护的低效用事实；身份、明确偏好和手动保护项不自动归档。
+- 身份及个人技能全局可用，明确项目声明局部可用。过滤作用域后组合 FTS5、中文二元组、
+  英文词项、别名和身份意图，一跳扩展关联事实，按 `.75 相关性 + .15 关系强度 + .10 重要性`
+  排序。无关高频技能不注入；默认 8 条与概念元数据共享 1200 个性化 token 预算。
+- 事实是唯一真相；手动和自动都投影 `identity/skill/preference/habit/goal` attributes，
+  取消可独立写入的 profile_json/preferences。画像乐观编辑创建新事实版本；永久删除清除
+  证据及所有历史画像正文。
+- 直接身份问答跳过自由生成，读取实时全局事实；缺失、待学习、待确认、冲突、关闭和读取失败
+  分别提示。有界 memory_trace 保存提供的证据 ID、关系路径、分数和原因，不复制正文，
+  不把上下文提供等同于模型采纳。
+- 持久队列 generation、配置修订、来源排除和 SQLite 唯一事件阻止迟到结果与重放污染。
+  网络错误及每日预算预留沿用可观测的后台生命周期。
 
 ## 6. 提示词分层与缓存
 
@@ -155,15 +148,41 @@ START → prepare_run → load_profile → retrieve_memories
 
 ## 8. 工具与执行边界
 
+`ToolDescriptor → ToolRegistry → ToolGateway → ToolNode → 执行器` 是内置、附件和连接器工具
+的统一装配路径。描述符决定参数、模式、平台、审批、静态说明和限制。模型不绑定隐藏别名，
+运行时名单保留注册顺序，提示词说明与 schema 按名称排序。独立计算/执行辅助函数保留原生接口。
+
+模型统一收到 `ToolResult`：`ok/summary/data/artifacts/next_offset/error`，错误带稳定 code、
+retryable 与修正提示。默认审查 write/execute/network；`every` 审查全部可用且参数有效的调用。
+Skill 引用读取在两模式免审，导入执行连接器限定 Work。审批卡片展示风险、影响路径和结构化参数。
+
+批次顺序执行，默认每轮最多 12 次、64,000 输出字符、120 秒工具执行、同工具连续失败 3 次。
+预算从当前 run 的检查点结果恢复，审批等待单独计时；耗尽时仍回填有界错误以保持调用/结果配对。
+`RunMetrics.tools` 进入 SSE、归档和按日/工具账户聚合；`usage_reported=false` 区分模型未报告
+用量与实际零值。
+
 | 工具 | 执行方式 | 边界 |
 |---|---|---|
-| `calculate` / `calculate_financial` | 进程内 | float / Decimal 运算 |
-| `run_command` | 白名单命令进程内，`rg` 子进程 | 命令枚举、argv 列表、工作区路径、无 shell |
-| `write_document_python` | 独立 Python 进程 | 独立 run 目录、审计策略、产物预算 |
+| `calculate` / `calculate_financial` | 进程内 | float / Decimal 字符串计算 |
+| `workspace_read` | 进程内 | 有界 UTF-8 分页、目录与固定字符串搜索；排除私密和链接路径 |
+| `workspace_write` | 进程内 | 审批后创建目录/写文件；默认不覆盖 |
+| `export_document` | 标准库 / python-docx | 审批后模板导出 md/txt/csv/json/docx，不执行模型代码 |
+| `run_python` | 独立 Python 进程 | 审批、调用清单、独立目录、原有审计和产物限制 |
+| `get_datetime` | 进程内 | 当前时间和带偏移量的 IANA 时区换算，随包携带 tzdata |
 | `list_uploaded_files` / `read_uploaded_file` | 进程内 SQLite 读取 | 按线程隔离、分页读取 |
 
-子进程使用 `create_subprocess_exec`（仅 argv）、最小环境白名单、合并 stderr、输出上限与超时
-终止。文档生成有策略检查，但**不是**操作系统沙箱；这是明确的设计边界。
+文件副作用先独占写入调用清单，再执行；完成结果校验路径、大小和 SHA-256 后复用。
+状态不确定或产物改变时返回带清单路径的 `RECOVERY_REQUIRED`，不自动重复副作用。
+默认保留最近 100 个已完成/已失败的受管调用目录，保留不确定状态和工作区业务文件。
+文件与 SQLite 仍不是原子事务。隐藏旧名仅恢复升级前运行，不进入模型绑定和运行时名单。
+`2026-11-07.memory-v3` 合并本轮工具变更，提示词前缀有意失效一次。
+
+子进程保持无 Shell 的 argv、最小环境、输出上限、超时终止和取消清理。
+Python 审计是策略级约束，不是操作系统沙箱。
+
+可选 `web_fetch` 默认关闭，需同时配置域名允许列表才向模型暴露；仅接受无凭据的 HTTPS/443。
+检查全部 DNS 地址与每次重定向，连接固定到已校验公网 IP，同时使用原域名做 TLS 验证。
+响应字节、文本和重定向次数有界，HTML 提取不含脚本/样式；该设置与已导入 MCP 的配置 URL 分开。
 
 ## 9. 连接器
 
@@ -175,7 +194,7 @@ START → prepare_run → load_profile → retrieve_memories
 | MCP 服务 | `mcpServers` JSON（stdio `command,args,env`；HTTP `url,type,headers`） | 通过真实连接发现（`streamable-http` 或兼容 `sse`）；调用需审批 |
 | Skills | 含唯一 `SKILL.md` 与引用文件的 ZIP | 低信任 L3 指令；`read_skill_file` 分页读取 UTF-8 引用 |
 
-导入项默认停用；启用时通过真实连接发现工具，失败保留原状态。导入工具在 Chat 与 Work 模式下都
+导入项默认停用；启用时通过真实连接发现工具，失败保留原状态。导入执行工具仅在 Work 模式可见且
 需要审批，停用立即撤销执行权限，定义变化会改变工具标识。配置、凭据、环境变量与解压路径永远不会
 由 API 返回；Windows 下连接器配置使用 DPAPI 保护。限制：单次导入 10 MiB、解压后 20 MiB / 512
 项、最多 64 个导入项与 64 个启用的导入工具、8 个启用 Skills（指令合计 64,000 字符）。本地工具
@@ -209,3 +228,10 @@ START → prepare_run → load_profile → retrieve_memories
   永久删除仍是预留配置，不会自动执行。
 - 记忆检索目前是词法匹配；embedding 是明确的后续工作。
 - 对话分支已有设计文档，尚未实现。
+
+## V3 数据纪元
+
+开库前 `prepare_storage` 以固定三库白名单、独占锁和原子标记完成一次性重置；保留独立配置
+及真实工作区文件。`.storage.json` 在开新库前写入，重启不会再次删除新业务数据。前端按
+`/runtime.data_epoch` 清理旧会话缓存，不导入旧消息。冻结画像每次调用前复核事实 ID、状态
+和值，更正/归档/删除会剔除旧值，新值进入 L3；审批恢复亦复核。

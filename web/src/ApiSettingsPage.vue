@@ -13,15 +13,18 @@ const { providers, templates, editing, editId, kind, saving, discovering, error,
 const loading = ref(true)
 const customSettings = ref(true)
 const deleteTarget = ref<ProviderConfig>()
+/** Load the provider catalog and surface any failure through the shared error state. / 读取提供商目录，失败时写入共享错误状态。 */
 async function load() {
   loading.value = true; error.value = ''
   try { await loadProviderSettings() }
   catch (reason) { error.value = reason instanceof Error ? reason.message : String(reason) }
   finally { loading.value = false }
 }
+/** Persist the edited provider and close the editor on success. / 保存正在编辑的提供商，成功后关闭编辑器。 */
 async function save() {
   if (await saveProvider()) { editing.value = false; notice.value = t('Provider saved.', '提供商已保存。') }
 }
+/** Delete the provider selected for removal and refresh the catalog. / 删除待移除的提供商并刷新目录。 */
 async function remove() {
   if (!deleteTarget.value) return
   saving.value = true; error.value = ''

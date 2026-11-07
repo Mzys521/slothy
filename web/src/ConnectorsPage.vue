@@ -3,8 +3,9 @@ import { computed, ref, onMounted, nextTick, watch } from 'vue'
 import { FileArchive, Plug, Terminal, Upload, Trash2 } from 'lucide-vue-next'
 import { workRequest, uploadConnector } from './workApi'
 import { t } from './preferences'
+import { riskLabel } from './toolResults'
 type Kind = 'local' | 'mcp' | 'skill'
-interface Connector { id: string; kind: Kind; name: string; description: string; enabled: boolean; builtin: boolean; tools: string[]; transport: string | null; file_count: number }
+interface Connector { id: string; kind: Kind; name: string; description: string; enabled: boolean; builtin: boolean; tools: string[]; transport: string | null; file_count: number; risk?: string; platforms?: string[]; available?: boolean; capabilities?: { name: string; risk: string; modes: string[]; requires_approval: boolean }[] }
 const items = ref<Connector[]>([])
 const kind = ref<Kind>('local')
 const busy = ref('')
@@ -14,7 +15,15 @@ const notice = ref('')
 const deleting = ref<Connector>()
 const input = ref<HTMLInputElement>()
 const dialog = ref<HTMLElement>()
+// Move focus into the confirmation dialog as soon as it opens.
+// 确认弹窗打开后立即将焦点移入其中。
 watch(deleting, item => { if (item) void nextTick(() => dialog.value?.querySelector<HTMLButtonElement>('button')?.focus()) })
+/**
+ * Handle Escape and keep Tab focus trapped inside the removal dialog.
+ * 处理 Escape，并将 Tab 焦点限制在移除确认弹窗内。
+ *
+ * @param event - Keyboard event from the dialog. / 弹窗上的键盘事件。
+ */
 function dialogKey(event: KeyboardEvent) {
   if (event.key === 'Escape' && !busy.value) { deleting.value = undefined; return }
   if (event.key !== 'Tab') return
@@ -36,7 +45,14 @@ const description = computed(() => ({
   skill: t('Import a ZIP containing SKILL.md and its reference files.', '导入包含 SKILL.md 及参考文件的 ZIP 技能包。'),
 })[kind.value])
 const example = computed(() => kind.value === 'mcp' ? JSON.stringify({ mcpServers: { 'my-server': { command: 'npx', args: ['--no-install', 'your-installed-mcp-server'] } } }, null, 2) : JSON.stringify({ name: 'my_tool', description: 'Describe the operation', command: 'python', args: ['${plugin}/tool.py'], input_schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false } }, null, 2))
+/**
+ * Turn an unknown thrown value into a user-facing error message.
+ * 将未知异常转换为面向用户的错误提示。
+ *
+ * @param cause - Value thrown by the failed request. / 请求失败时抛出的值。
+ */
 function fail(cause: unknown) { error.value = cause instanceof Error ? cause.message : t('The connector request failed.', '连接器请求失败。') }
+/** Reload all connectors from the server. / 从服务端重新加载全部连接器。 */
 async function load() {
   loading.value = true; error.value = ''
   try { items.value = (await workRequest<{ items: Connector[] }>('/connectors')).items }
@@ -44,6 +60,12 @@ async function load() {
   finally { loading.value = false }
 }
 onMounted(load)
+/**
+ * Validate and upload the file chosen in the import picker.
+ * 校验并上传导入选择器选中的文件。
+ *
+ * @param event - Change event from the hidden file input. / 隐藏文件输入框的 change 事件。
+ */
 async function importFile(event: Event) {
   const field = event.target as HTMLInputElement
   const file = field.files?.[0]; field.value = ''
@@ -58,6 +80,12 @@ async function importFile(event: Event) {
   } catch (cause) { fail(cause) }
   finally { busy.value = '' }
 }
+/**
+ * Enable or disable one connector and replace it with the server response.
+ * 启用或停用单个连接器，并用服务端返回值替换本地记录。
+ *
+ * @param item - Connector row to toggle. / 待切换的连接器记录。
+ */
 async function toggle(item: Connector) {
   busy.value = item.id; error.value = ''; notice.value = ''
   try {
@@ -66,6 +94,7 @@ async function toggle(item: Connector) {
   } catch (cause) { fail(cause) }
   finally { busy.value = '' }
 }
+/** Remove the connector awaiting confirmation and drop it from the list. / 移除确认中的连接器并从列表中删除。 */
 async function remove() {
   const item = deleting.value
   if (!item) return
@@ -92,7 +121,10 @@ async function remove() {
       <p v-else-if="!visible.length && !error" class="connector-empty">{{ t('Nothing imported yet.', '尚未导入。') }}</p>
       <div v-for="item in visible" :key="item.id" class="connector-row" :class="{ 'connector-off': !item.enabled }">
         <component :is="kind === 'local' ? Terminal : kind === 'mcp' ? Plug : FileArchive" class="connector-row-icon" />
-        <div class="connector-row-info"><h3>{{ item.name }}<span v-if="item.builtin">{{ t('Built-in', '内置') }}</span><span v-else-if="item.transport">{{ item.transport }}</span></h3><p :title="item.description">{{ item.description || (kind === 'skill' ? t('Skill package', '技能包') + ' · ' + item.file_count + ' ' + t('files', '个文件') : item.tools.length ? item.tools.length + ' ' + t('tools', '个工具') : t('Connect when enabled', '启用时连接并获取工具')) }}</p></div>
+        <div class="connector-row-info"><h3>{{ item.name }}<span v-if="item.builtin">{{ t('Built-in', '内置') }}</span><span v-else-if="item.transport">{{ item.transport }}</span></h3><p :title="item.description">{{ item.description || (kind === 'skill' ? t('Skill package', '技能包') + ' · ' + item.file_count + ' ' + t('files', '个文件') : item.tools.length ? item.tools.length + ' ' + t('tools', '个工具') : t('Connect when enabled', '启用时连接并获取工具')) }}</p>
+          <p>{{ riskLabel(item.risk, t) }} · {{ item.available ? t('Available', '当前可用') : t('Disabled', '已停用') }}<span v-if="!item.builtin && item.kind !== 'skill'"> · {{ t('Work mode', 'Work 模式') }}</span></p>
+          <details v-if="item.capabilities?.length"><summary>{{ t('Tool permissions', '工具权限') }}</summary><p v-for="capability in item.capabilities" :key="capability.name">{{ capability.name }} · {{ riskLabel(capability.risk, t) }} · {{ capability.requires_approval ? t('Approval required', '需要审批') : t('Read without approval', '读取免审') }}</p></details>
+        </div>
         <button v-if="!item.builtin" class="icon-button connector-delete" type="button" :disabled="!!busy" :title="t('Remove', '移除')" :aria-label="t('Remove ', '移除 ') + item.name" @click="deleting = item"><Trash2 /></button>
         <button class="settings-switch" type="button" role="switch" :aria-checked="item.enabled" :aria-label="t('Enable ', '启用 ') + item.name" :disabled="!!busy || loading" @click="toggle(item)"><span></span></button>
       </div>

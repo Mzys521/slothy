@@ -1,1 +1,4 @@
-"""基础工具业务实现，不依赖 LangChain。 / Built-in implementations independent of LangChain."""
+"""
+Built-in tool implementations that do not depend on LangChain. / 不依赖 LangChain
+的基础工具实现。
+"""

@@ -1,4 +1,4 @@
-"""结构化基础命令，不提供删除。 / Basic structured commands without deletion."""
+"""Structured basic commands without deletion. / 结构化基础命令，不提供删除。"""
 
 import shutil
 from itertools import islice
@@ -10,14 +10,23 @@ from app.infrastructure.processes import ProcessRunner
 
 
 class CommandExecutor:
-    """提供可移植文件命令与只读 rg。 / Portable filesystem commands and read-only rg.
+    """
+    Portable filesystem commands and read-only rg support. / 可移植文件命令与只读 rg 支持。
 
-    Args:
-        settings: 工作区、超时和输出上限。 / Workspace, timeout and output limits.
-        process_runner: 可替换的外部进程执行器。 / Injectable external-process execution.
+    Commands are name-checked and arguments are passed literally; every path must
+    resolve inside the configured tool workspace. /
+    命令按名称白名单校验并原样传递参数；所有路径必须解析到配置的工具工作区内。
     """
 
     def __init__(self, settings: ToolSettings, process_runner: ProcessRunner | None = None) -> None:
+        """
+        Configure command execution for the tool workspace. / 为工具工作区配置命令执行。
+
+        Args:
+            settings: Workspace, timeout and output limits. / 工作区、超时与输出上限。
+            process_runner: Optional injectable external-process runner. /
+            可选的可替换外部进程执行器。
+        """
         self.settings = settings
         self.root = settings.workspace_path
         self.root.mkdir(parents=True, exist_ok=True)
@@ -37,12 +46,24 @@ class CommandExecutor:
         arguments: list[str] | None = None,
         cwd: str = ".",
     ) -> dict[str, Any]:
-        """白名单命令使用字面参数。 / Execute allowed commands with literal arguments.
+        """
+        Execute one allowlisted command with literal arguments. /
+        使用字面参数执行一个白名单命令。
 
         Args:
-            command: pwd/ls/cat/mkdir/echo/rg。 / Allowed name; no deletion or interpreters.
-            arguments: 字面参数列表；rg 为 [pattern, optional_path]。 / Literal argument list.
-            cwd: 相对工具工作区的目录。 / Directory inside the tool workspace.
+            command: One of pwd, ls, cat, mkdir, echo or rg; no deletion or interpreters. /
+                pwd、ls、cat、mkdir、echo 或 rg；不含删除与解释器。
+            arguments: Literal argument list; rg takes [pattern, optional_path]. /
+                字面参数列表；rg 为 [pattern, 可选 path]。
+            cwd: Directory relative to the tool workspace. / 相对工具工作区的目录。
+
+        Returns:
+            Command mapping with ok, return_code, output and error fields. /
+                含 ok、return_code、output 与 error 字段的命令结果。
+
+        Raises:
+            ValueError: If the command, arguments, path or workspace boundary is invalid. /
+                命令、参数、路径或工作区边界无效时抛出。
         """
         if command not in {"pwd", "ls", "cat", "mkdir", "echo", "rg"}:
             raise ValueError("命令不在白名单中 / command is not allowed")
@@ -103,8 +124,8 @@ class CommandExecutor:
             else:
                 if self.search_executable is None:
                     raise ValueError("未找到可用的 rg 程序 / rg executable is not available")
-                # 中文：固定选项，-- 后的模式与路径不可能成为额外选项或 Shell。
                 # English: Fixed options; pattern/path after -- cannot become flags or shell syntax.
+                # 中文：固定选项，-- 后的模式与路径不可能成为额外选项或 Shell。
                 result = await self.process_runner.run(
                     [
                         self.search_executable,

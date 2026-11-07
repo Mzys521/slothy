@@ -1,4 +1,5 @@
-"""Evidence-backed memory learning, separate from the online agent graph."""
+"""Evidence-backed memory learning and profile projection, separate from the online graph.
+/ 以证据为依据的记忆学习与画像投影，与在线图分离。"""
 
 import asyncio
 import hashlib
@@ -96,6 +97,9 @@ HYPOTHETICAL = re.compile(r"如果|假设|\b(?:if|hypothetically|suppose)\b", re
 
 @dataclass(frozen=True)
 class Claim:
+    """One normalized assertion extracted from user text.
+    / 从用户文本提取的一条规范化断言。"""
+
     key: str
     dimension: str
     value: str
@@ -106,6 +110,19 @@ class Claim:
 
 
 def reports_episode(text: str) -> bool:
+    """Report whether text states a completed real event.
+
+    Hypothetical or conditional statements never count; relative dates are stripped
+    before matching so both Chinese and English reports are recognized.
+    / 假设或条件陈述不计入；匹配前会剥离相对日期，因此中英文事件陈述都能识别。
+
+    Args:
+        text: Candidate sentence. / 候选句子。
+
+    Returns:
+        True when the sentence reports an actually completed event.
+        / 句子报告了真实完成的事件时为 True。
+    """
     if HYPOTHETICAL.search(text):
         return False
     report = EPISODE_SCOPE.sub("", text.strip(), count=1)
@@ -126,6 +143,26 @@ def extract_claim(
     recorded_at: str | None = None,
     run_id: str | None = None,
 ) -> Claim | None:
+    """Extract one claim from a sentence, or reject the sentence.
+
+    Rejects questions, sensitive content, quotations, pasted examples and purely
+    temporary requests; infers global/project/thread scope from explicit wording and
+    assigns a stable topic key.
+    / 拒绝问句、敏感内容、引用、粘贴示例与纯临时请求；根据显式措辞推断全局/项目/线程
+    作用域并生成稳定主题键。
+
+    Args:
+        text: Sentence-level user text. / 句子级用户文本。
+        thread_id: Current thread, used for thread scope. / 当前线程，用于线程作用域。
+        project_id: Current project, or None. / 当前项目或 None。
+        recorded_at: Turn recording timestamp used for relative episode dates.
+            / 用于相对事件日期的轮次记录时间。
+        run_id: Run id used as a date fallback for replayed turns. / 回放轮次的日期兜底。
+
+    Returns:
+        The extracted claim, or None when the sentence is not learnable.
+        / 提取出的断言；句子不可学习时为 None。
+    """
     quote = text.strip()
     if (
         not quote
@@ -146,7 +183,8 @@ def extract_claim(
         episode or remember or durable or PERSONAL.search(quote)
     ):
         return None
-    # Restrict extraction to direct statements rather than pasted or quoted instructions.
+    # English: Restrict extraction to direct statements, not pasted or quoted instructions.
+    # 中文：仅提取直接陈述，而不是粘贴或引用的指令。
     if QUOTED.search(quote):
         return None
     if episode and THREAD.search(quote):
@@ -214,15 +252,44 @@ def extract_claim(
 
 
 def _normalized(text: str) -> str:
+    """Normalize text for identity comparisons.
+
+    Args:
+        text: Raw text. / 原始文本。
+
+    Returns:
+        Case-folded text with non-word characters removed. / 去除非单词字符并转小写的文本。
+    """
     return re.sub(r"[\W_]+", "", text.casefold())
 
 
 def _fingerprint(*values) -> str:
+    """Hash JSON-encoded components into a stable hex digest.
+
+    Args:
+        *values: Components hashed after JSON encoding. / JSON 编码后参与哈希的各组成部分。
+
+    Returns:
+        Full SHA-256 hex digest of the encoded values. / 编码后值的完整 SHA-256 十六进制摘要。
+    """
     return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()
 
 
 def profile_key(dimension: str, value: str, title: str = "") -> str:
-    """Topic identity must not change when a preference's value or polarity changes."""
+    """Derive a topic key that survives value and polarity changes.
+
+    Known preference topics map to canonical keys; everything else hashes the topic
+    text so the same subject keeps the same key.
+    / 已知偏好主题映射到规范键；其余主题对主题文本取哈希，使同一主题保持同一键。
+
+    Args:
+        dimension: Claim dimension such as preference or fact. / 断言维度，如 preference 或 fact。
+        value: Claimed value text. / 断言值文本。
+        title: Optional human title used as a topic hint. / 可选的人类可读标题，用作主题提示。
+
+    Returns:
+        Stable topic key. / 稳定的主题键。
+    """
     topics = (
         (
             "answer_structure",
@@ -255,7 +322,24 @@ def profile_key(dimension: str, value: str, title: str = "") -> str:
 def extract_claims(
     text: str, thread: str, project: str | None, recorded: str | None, run: str
 ) -> list[tuple[str, Claim]]:
-    """Read direct prose, including lists; ignore code, quotations and speculative text."""
+    """Extract claims from prose lines, including list items.
+
+    Fenced code, quote lines, headings and speculative fragments are ignored; a bare
+    remember directive applies to following prose. At most eight claims are returned.
+    / 忽略代码围栏、引用行、标题与推测片段；单独的“记住”指令作用于后续正文。最多返回
+    八条断言。
+
+    Args:
+        text: Whole user message. / 完整用户消息。
+        thread: Current thread id. / 当前线程 ID。
+        project: Current project id, or None. / 当前项目 ID 或 None。
+        recorded: Turn recording timestamp. / 轮次记录时间。
+        run: Run id used as a date fallback. / 用作日期兜底的运行 ID。
+
+    Returns:
+        Pairs of evidence quote and extracted claim, deduplicated by topic and value.
+        / 证据原话与提取断言的二元组，按主题与值去重。
+    """
     prose = []
     fenced = False
     for line in text.splitlines():
@@ -307,7 +391,24 @@ def extract_claims(
 
 
 class MemoryEvolution:
+    """Apply extracted claims to the store and project confirmed facts into profiles.
+
+    Args:
+        store: Workspace store owning memory, claim and profile tables.
+            / 持有记忆、断言与画像表的工作区存储。
+        conversations: Conversation archive holding the learning queue.
+            / 持有学习队列的会话归档。
+    """
+
     def __init__(self, store: WorkspaceStore, conversations: SQLiteConversationStore):
+        """Bind the workspace and conversation stores and create the write lock.
+
+        Args:
+            store: Workspace store used for memory and profile writes.
+                / 用于记忆与画像写入的工作区存储。
+            conversations: Conversation archive used for learning state.
+                / 用于学习状态的会话归档。
+        """
         self.store = store
         self.conversations = conversations
         self.db = store.connection
@@ -315,11 +416,29 @@ class MemoryEvolution:
         self.planner = None
 
     async def rows(self, sql: str, args: tuple = ()) -> list[dict]:
+        """Run a query and return all rows as mappings.
+
+        Args:
+            sql: SQL text with placeholders. / 含占位符的 SQL 文本。
+            args: Positional parameters. / 位置参数。
+
+        Returns:
+            All result rows as dictionaries. / 全部结果行（字典形式）。
+        """
         async with self.db.execute(sql, args) as cursor:
             return [dict(row) async for row in cursor]
 
     @asynccontextmanager
     async def transaction(self):
+        """Serialize memory writes inside an immediate transaction.
+
+        Yields control while BEGIN IMMEDIATE holds the write lock; commits on success and
+        rolls back on any exception.
+        / 在 BEGIN IMMEDIATE 持有写锁期间交出控制权；成功时提交，任意异常时回滚。
+
+        Yields:
+            Control inside the transaction. / 事务内的控制权。
+        """
         async with self.lock:
             await self.db.execute("BEGIN IMMEDIATE")
             try:
@@ -330,6 +449,12 @@ class MemoryEvolution:
                 raise
 
     async def run(self):
+        """Reconcile startup metadata, then serve the learning queue.
+
+        When a planner is configured it delegates to that worker; otherwise it processes
+        rule-extracted claims one job at a time.
+        / 配置了规划器时委托给该工作器；否则逐条处理规则提取的断言。
+        """
         try:
             async with self.transaction():
                 await self.refresh_relationships()
@@ -353,6 +478,12 @@ class MemoryEvolution:
             await asyncio.sleep(1)
 
     async def process(self, job: tuple):
+        """Learn one queued turn or delegate it to the planner.
+
+        Args:
+            job: (row_id, user, thread, run, quote, project, recorded_at) tuple.
+                / 任务元组。
+        """
         if self.planner is not None:
             await self.planner.process_jobs([job])
             return
@@ -378,6 +509,21 @@ class MemoryEvolution:
         claim: Claim,
         recorded_at: str | None,
     ):
+        """Record evidence for a claim and advance its lifecycle.
+
+        Claims are inserted as observed; explicit or corroborated ones become pending, and
+        remember directives confirm immediately when no conflict exists.
+        / 断言先以 observed 写入；显式或有佐证的转为 pending；无明显冲突时“记住”指令会立即
+        确认。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Source thread id. / 来源线程 ID。
+            run: Source run id. / 来源运行 ID。
+            quote: Evidence quote from the source text. / 来源文本中的证据原话。
+            claim: Extracted claim. / 提取出的断言。
+            recorded_at: Recording timestamp of the turn. / 轮次的记录时间。
+        """
         claim_id = _fingerprint(
             user, claim.scope, claim.scope_ref, claim.key, _normalized(claim.value)
         )
@@ -431,6 +577,15 @@ class MemoryEvolution:
             )
 
     async def conflicts(self, claim: dict) -> list[dict]:
+        """Find confirmed claims that conflict with the candidate's topic.
+
+        Args:
+            claim: Claim row being evaluated. / 正在评估的断言行。
+
+        Returns:
+            Confirmed claims sharing the topic key, directly or by derived topic.
+            / 直接或经推导主题共享主题键的已确认断言。
+        """
         candidates = await self.rows(
             """SELECT c.id, c.memory_id, c.profile_key, c.dimension, m.content AS value
                FROM memory_claims c JOIN workspace_memories m
@@ -456,6 +611,21 @@ class MemoryEvolution:
         ]
 
     async def confirm(self, claim: dict, value: str, *, rebuild: bool = True) -> str:
+        """Confirm a claim and project its value into a memory.
+
+        Conflicting confirmed claims are archived and superseded first; the memory is
+        updated in place when it already exists, otherwise created with a mapped type.
+        / 冲突的已确认断言会先归档并标记被取代；记忆已存在时原地更新，否则按映射类型新建。
+
+        Args:
+            claim: Claim row ready for confirmation. / 可确认的断言行。
+            value: Final value to store. / 最终存储值。
+            rebuild: Whether to rebuild the profile and relations afterwards.
+                / 之后是否重建画像与关系。
+
+        Returns:
+            The confirmed memory id. / 已确认的记忆 ID。
+        """
         user = claim["user_id"]
         for previous in await self.conflicts(claim):
             await self.store.update_memory(user, previous["memory_id"], {"status": "archived"})
@@ -498,6 +668,18 @@ class MemoryEvolution:
         return memory["id"]
 
     async def rebuild(self, user: str):
+        """Project confirmed preference-like claims into a new profile version.
+
+        A version is only written when the attribute list actually changes; the version
+        counter guards against overflow and history is pruned afterwards.
+        / 仅当属性列表实际变化时才写入新版本；版本计数器防止溢出，随后裁剪历史。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+        Raises:
+            ValueError: When the profile version counter is exhausted.
+                / 画像版本计数器耗尽时抛出。
+        """
         attributes = await self.rows(
             """SELECT c.profile_key AS key, c.dimension, m.content AS value, c.scope, c.scope_ref,
                       c.memory_id, c.updated_at
@@ -534,6 +716,16 @@ class MemoryEvolution:
         await self.store.prune_profile_history(user)
 
     async def refresh_relationships(self, user: str | None = None):
+        """Recompute conversation-origin edges between memories.
+
+        Edges are rebuilt from shared-thread evidence; obsolete conversation edges are
+        removed while manual edges are preserved.
+        / 依据共享线程证据重建边；过期的会话边被移除，手动边保留。
+
+        Args:
+            user: Optional user filter; None rebuilds all users.
+                / 可选用户过滤；None 表示重建全部用户。
+        """
         await self.db.execute(
             """DELETE FROM workspace_memory_links AS l WHERE origin='conversation' AND suppressed=0
                AND source_id IN (SELECT id FROM workspace_memories WHERE ? IS NULL OR user_id=?)
@@ -577,6 +769,18 @@ class MemoryEvolution:
     async def create_memory(
         self, user: str, values: dict, dimension: str | None = None, key: str | None = None
     ):
+        """Create a memory manually and optionally link it to a claim.
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            values: Memory fields for the new row. / 新记忆行的字段。
+            dimension: Optional claim dimension to create alongside the memory.
+                / 可选，为记忆同时创建的断言维度。
+            key: Optional explicit topic key for the claim. / 断言的可选显式主题键。
+
+        Returns:
+            The created memory snapshot. / 创建后的记忆快照。
+        """
         async with self.transaction():
             values = {**values, "source": values.get("source") or "manual"}
             memory = await self.store.create_memory(user, values)
@@ -605,11 +809,31 @@ class MemoryEvolution:
             return memory
 
     async def update_profile(self, user: str, expected: int, preferences: dict, summary: str):
+        """Replace manual profile preferences under optimistic versioning.
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            expected: Version the caller read. / 调用方读到的版本。
+            preferences: New manual preference mapping. / 新的手动偏好映射。
+            summary: Change summary stored with the version. / 随版本保存的变更摘要。
+
+        Returns:
+            The new profile snapshot, or None when the version was stale.
+            / 新的画像快照；版本过期时为 None。
+        """
         async with self.transaction():
             saved = await self.store.save_profile(user, expected, preferences, summary)
             return await self.store.get_profile(user) if saved else None
 
     async def evidence(self, claim_id: str):
+        """List the evidence rows backing one claim.
+
+        Args:
+            claim_id: Claim identifier. / 断言标识。
+
+        Returns:
+            Evidence rows in insertion order. / 按插入顺序排列的证据行。
+        """
         return await self.rows(
             "SELECT thread_id, run_id, quote, source, recorded_at FROM memory_evidence "
             "WHERE claim_id=? ORDER BY rowid",
@@ -617,6 +841,15 @@ class MemoryEvolution:
         )
 
     async def suggestions(self, user: str):
+        """List pending claims with their evidence for review.
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+
+        Returns:
+            Pending claims, newest first, each carrying its evidence list.
+            / 按从新到旧排列且携带证据列表的待处理断言。
+        """
         async with self.lock:
             claims = await self.rows(
                 """SELECT id, value, title, dimension, profile_key, scope, scope_ref
@@ -631,6 +864,24 @@ class MemoryEvolution:
     async def review(
         self, user: str, claim_id: str, action: str, value: str | None, key: str | None = None
     ):
+        """Accept or ignore one pending claim.
+
+        Ignoring records learning exclusions so the same turns are not re-learned; accepting
+        confirms the claim, optionally rewrites its topic key and requires evidence.
+        / 忽略会记录学习排除项以避免同一轮次被重新学习；接受会确认断言，可重写主题键，且
+        必须存在证据。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            claim_id: Claim identifier. / 断言标识。
+            action: Either ignore or accept. / ignore 或 accept。
+            value: Replacement value when accepting, or None. / 接受时的替换值或 None。
+            key: Optional replacement topic key. / 可选替换主题键。
+
+        Returns:
+            Result status mapping, or None when the claim is missing or unsupported.
+            / 结果状态映射；断言缺失或不可处理时为 None。
+        """
         async with self.transaction():
             claims = await self.rows(
                 "SELECT * FROM memory_claims WHERE user_id=? AND id=?", (user, claim_id)
@@ -663,6 +914,16 @@ class MemoryEvolution:
             }
 
     async def memory_evidence(self, user: str, memory_id: str):
+        """List evidence for the claim attached to one memory.
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            memory_id: Memory identifier. / 记忆标识。
+
+        Returns:
+            Evidence rows, or an empty list when the memory has no claim.
+            / 证据行；记忆没有断言时为空列表。
+        """
         async with self.lock:
             claims = await self.rows(
                 "SELECT id FROM memory_claims WHERE user_id=? AND memory_id=?", (user, memory_id)
@@ -670,6 +931,17 @@ class MemoryEvolution:
             return await self.evidence(claims[0]["id"]) if claims else []
 
     async def receipts(self, user: str, thread: str, run: str):
+        """Return what one run changed in memory for the UI.
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+            run: Run identifier. / 运行标识。
+
+        Returns:
+            Confirmed memories plus ids of claims still pending review.
+            / 已确认记忆与仍待审查断言 ID 的二元组。
+        """
         async with self.lock:
             items = await self.rows(
                 """SELECT DISTINCT m.id, m.title, m.scope, m.type FROM workspace_memories m
@@ -688,6 +960,21 @@ class MemoryEvolution:
             return items, [item["id"] for item in suggestions]
 
     async def edit_memory(self, user: str, memory_id: str, values: dict):
+        """Edit a memory and keep its claim, profile and exclusions consistent.
+
+        Archiving excludes the source turns from future learning; reactivating confirms the
+        attached claim; other edits rebuild the profile and relations.
+        / 归档会把来源轮次排除出后续学习；重新激活会确认关联断言；其他编辑会重建画像与关系。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            memory_id: Memory identifier. / 记忆标识。
+            values: Fields to update. / 要更新的字段。
+
+        Returns:
+            The updated memory snapshot, or None when it does not exist.
+            / 更新后的记忆快照；不存在时为 None。
+        """
         async with self.transaction():
             result = await self.store.update_memory(user, memory_id, values)
             if result and values.get("status") == "archived":
@@ -708,6 +995,19 @@ class MemoryEvolution:
             return result
 
     async def delete_memory(self, user: str, memory_id: str):
+        """Delete a memory, its evidence and its profile traces.
+
+        Source turns are excluded from future learning and redacted from stored snapshots
+        and profile history.
+        / 来源轮次会被排除出后续学习，并从已存快照与画像历史中擦除。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            memory_id: Memory identifier. / 记忆标识。
+
+        Returns:
+            True when a memory row was removed. / 删除了记忆行时为 True。
+        """
         async with self.transaction():
             await self.db.execute(
                 """INSERT OR IGNORE INTO memory_learning_exclusions
@@ -732,6 +1032,12 @@ class MemoryEvolution:
             return removed
 
     async def redact_profile_history(self, user: str, memory_id: str):
+        """Erase one memory id from stored snapshots and profile history.
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            memory_id: Memory id to redact. / 要擦除的记忆 ID。
+        """
         from app.infrastructure.prompt_cache import ProfileSnapshots
 
         await ProfileSnapshots(self.store).redact_memory(user, memory_id)
@@ -750,6 +1056,20 @@ class MemoryEvolution:
         )
 
     async def forget_thread(self, user: str, thread: str, delete_source: Callable[[], Awaitable]):
+        """Forget one thread's learning and repair affected claims.
+
+        Evidence from the thread is deleted; claims left without evidence lose their
+        memories; pending claims below the corroboration threshold revert to observed;
+        profiles are rebuilt and redacted, then the caller's delete callback runs.
+        / 删除该线程的证据；失去全部证据的断言连同记忆一起删除；佐证不足的待处理断言回退为
+        observed；重建并擦除画像，最后执行调用方的删除回调。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread being deleted or cleared. / 被删除或清空的线程。
+            delete_source: Awaitable deleting the thread history after learning state.
+                / 在学习状态修复后删除线程历史的可等待对象。
+        """
         async with self.transaction():
             await self.conversations.discard_thread_learning(user, thread)
             await self.db.execute(

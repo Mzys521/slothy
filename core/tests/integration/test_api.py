@@ -12,6 +12,7 @@ from langchain_core.runnables import RunnableLambda
 from app.agent.graph import build_graph_config
 from app.config import CheckpointSettings
 from tests.support.legacy_app import create_app
+from tests.support.profiles import attributes
 
 
 def test_workspace_contract_and_legacy_thread_updates(tmp_path):
@@ -103,7 +104,7 @@ def test_uploaded_text_reaches_model_only_in_its_thread(tmp_path):
         assert reply_result.status_code == 200, reply_result.text
         reference = next(message for message in received if message.name == "attachment_reference")
         assert "独有的附件内容" in reference.content
-        document, = json.loads(reference.text)
+        (document,) = json.loads(reference.text)
         assert document["id"] == attachment_id
         assert len(document["text"]) == document["next_offset"] == 60_000
         assert document["total_chars"] > document["next_offset"]
@@ -149,11 +150,27 @@ def test_graph_contract_filters_service_internal_fields(tmp_path):
         result = client.get("/api/v1/graph?limit=10")
         assert result.status_code == 200
         assert result.json() == {
-            "nodes": [{"id": "mem-1", "label": "Brief", "type": "preference", "importance": 0.5}],
+            "nodes": [
+                {
+                    "id": "mem-1",
+                    "label": "Brief",
+                    "type": "preference",
+                    "importance": 0.5,
+                    "node_kind": "fact",
+                    "concept_kind": None,
+                    "scope": None,
+                    "scope_ref": None,
+                    "fact_ids": [],
+                    "effective_frequency": 0,
+                    "strength": 0,
+                }
+            ],
             "edges": [],
-            "total": 1, "truncated": False, "limit": 10,
+            "total": 1,
+            "truncated": False,
+            "limit": 10,
         }
-        graph.assert_awaited_once_with("local-user", 10, None)
+        graph.assert_awaited_once_with("local-user", 10, None, thread_id="", project_id=None)
 
 
 def test_chat_history_and_checkpoint_lifecycle(tmp_path):
@@ -281,12 +298,14 @@ def test_personalization_and_profile_version_conflicts(tmp_path):
         assert client.delete(base + f"/memories/{other}").status_code == 204
         assert client.get(base + "/graph").json()["edges"] == []
         assert client.get(base + "/profile").json()["attributes"][0]["memory_id"] == memory_id
-        profile = {"expected_version": 1, "preferences": {"format": "brief"}}
+        profile = {"expected_version": 1, "attributes": attributes({"format": "brief"})}
         assert client.patch(base + "/profile", json=profile).json()["version"] == 2
         assert client.patch(base + "/profile", json=profile).status_code == 409
-        assert client.get(base + "/profile/versions/2").json()["preferences"] == {"format": "brief"}
+        assert client.get(base + "/profile/versions/2").json()["attributes"][0]["value"] == "brief"
         result = client.post(base + "/chat", json={"message": "Atlas"}).json()
-        assert result["used_memory_ids"] == [memory_id]
+        assert result["used_memory_ids"] == [
+            client.get(base + "/profile").json()["attributes"][0]["memory_id"]
+        ]
         assert result["profile_version"] == 2
         client.patch(base + "/settings", json={"personalization_enabled": False})
         result = client.post(base + "/chat", json={"message": "Atlas"}).json()
@@ -300,4 +319,7 @@ def test_personalization_and_profile_version_conflicts(tmp_path):
         )
     with TestClient(app) as client:
         assert client.get(base + "/settings").json() == {"personalization_enabled": False}
-        assert client.get(base + "/memories").json()["items"][0]["id"] == memory_id
+        assert (
+            client.get(base + "/memories").json()["items"][0]["id"]
+            == client.get(base + "/profile").json()["attributes"][0]["memory_id"]
+        )

@@ -1,4 +1,5 @@
-"""DeepSeek/MiMo 聊天协议适配。 / OpenAI-compatible Chat Completions transport."""
+"""OpenAI-compatible Chat Completions transport for DeepSeek and MiMo.
+/ DeepSeek 与 MiMo 的 OpenAI 兼容 Chat Completions 传输层。"""
 
 from copy import deepcopy
 
@@ -11,6 +12,16 @@ from app.config import LLMSettings
 
 
 def _normalize_usage(data: dict) -> dict:
+    """Normalize vendor cache-usage fields on a raw streaming chunk.
+
+    Args:
+        data: Raw response or chunk mapping from the service.
+            / 来自服务的原始响应或分块映射。
+
+    Returns:
+        The mapping with prompt-cache hits exposed as cached prompt tokens.
+        / 将 prompt 缓存命中暴露为缓存 prompt token 的映射。
+    """
     usage = data.get("usage") or {}
     cache = usage.get("prompt_cache_hit_tokens")
     if cache is None:
@@ -20,10 +31,24 @@ def _normalize_usage(data: dict) -> dict:
 
 
 class _VendorChatOpenAI(ChatOpenAI):
+    """ChatOpenAI subclass that bridges vendor thinking and reasoning fields.
+    / 桥接厂商思考与推理字段的 ChatOpenAI 子类。"""
+
     vendor: str
     effort: str | None = None
 
     def bind_tools(self, tools, **kwargs):
+        """Bind tools, disabling DeepSeek thinking when no effort is set.
+
+        Args:
+            tools: Tools to expose to the model. / 暴露给模型的工具。
+            **kwargs: Additional binding options forwarded to LangChain.
+                / 转发给 LangChain 的其他绑定选项。
+
+        Returns:
+            The tool-bound runnable from the parent class.
+            / 父类返回的已绑定工具的可运行对象。
+        """
         if self.vendor == "deepseek" and self.effort is None:
             kwargs["extra_body"] = {
                 **(self.extra_body or {}),
@@ -33,6 +58,18 @@ class _VendorChatOpenAI(ChatOpenAI):
         return super().bind_tools(tools, **kwargs)
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        """Build the wire payload, echoing prior reasoning for tool turns.
+
+        Args:
+            input_: LangChain language-model input being converted.
+                / 正在转换的 LangChain 语言模型输入。
+            stop: Optional stop sequences. / 可选的停止序列。
+            **kwargs: Additional payload options forwarded to LangChain.
+                / 转发给 LangChain 的其他载荷选项。
+
+        Returns:
+            The chat-completions request payload. / chat completions 请求载荷。
+        """
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         thinking = (payload.get("extra_body") or {}).get("thinking")
         if not payload.get("tools") or thinking == {"type": "disabled"}:
@@ -46,6 +83,18 @@ class _VendorChatOpenAI(ChatOpenAI):
         return payload
 
     def _create_chat_result(self, response, generation_info=None):
+        """Build a chat result and keep vendor cache and reasoning data.
+
+        Args:
+            response: Raw service response (mapping or SDK model).
+                / 原始服务响应（映射或 SDK 模型）。
+            generation_info: Optional generation metadata from the parent call.
+                / 父类调用传入的可选生成元数据。
+
+        Returns:
+            The parsed chat result with cache-read usage and reasoning metadata.
+            / 带有缓存读取用量与推理元数据的解析结果。
+        """
         result = super()._create_chat_result(response, generation_info)
         raw = response if isinstance(response, dict) else response.model_dump(warnings=False)
         cache = (raw.get("usage") or {}).get("prompt_cache_hit_tokens")
@@ -59,6 +108,17 @@ class _VendorChatOpenAI(ChatOpenAI):
         return result
 
     def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
+        """Convert one streamed chunk, keeping usage and reasoning deltas.
+
+        Args:
+            chunk: Raw streaming chunk mapping. / 原始流式分块映射。
+            default_chunk_class: Fallback chunk class from LangChain. / LangChain 的默认分块类。
+            base_generation_info: Generation info accumulated so far. / 已累积的生成信息。
+
+        Returns:
+            The converted generation chunk, or None when no chunk is produced.
+            / 转换后的生成分块；未产生分块时为 None。
+        """
         result = super()._convert_chunk_to_generation_chunk(
             _normalize_usage(chunk), default_chunk_class, base_generation_info,
         )
@@ -72,10 +132,11 @@ class _VendorChatOpenAI(ChatOpenAI):
 
 
 class OpenAICompatibleProvider:
-    """复用一个模型及其连接池。 / Reuse one ChatOpenAI instance and its connection pools.
+    """Reuse one ChatOpenAI instance and its connection pools.
+    / 复用一个 ChatOpenAI 实例及其连接池。
 
-    中文：可注入 HTTP 客户端用于传输配置或离线测试，注入方负责其生命周期。
-    English: Inject HTTP clients for transport configuration/tests; callers own supplied clients.
+    Inject HTTP clients for transport configuration or offline tests; the caller owns them.
+    / 可注入 HTTP 客户端用于传输配置或离线测试，其生命周期由调用方负责。
     """
 
     prompt_cache_protocol = "openai"
@@ -88,12 +149,23 @@ class OpenAICompatibleProvider:
         http_client: httpx.Client | None = None,
         http_async_client: httpx.AsyncClient | None = None,
     ) -> None:
-        """初始化适配器。 / Initialize the adapter.
+        """Initialize the adapter and construct the cached chat model.
 
         Args:
-            settings: 所选服务的已校验配置。 / Validated configuration for the selected service.
-            http_client: 可选同步 HTTP 客户端。 / Optional synchronous HTTP client.
-            http_async_client: 可选异步 HTTP 客户端。 / Optional asynchronous HTTP client.
+            settings: Validated configuration for the selected service.
+                / 所选服务的已校验配置。
+            effort: Optional reasoning effort; enables vendor thinking controls.
+                / 可选推理档位；启用厂商思考控制。
+            http_client: Optional synchronous HTTP client, owned by the caller.
+                / 可选同步 HTTP 客户端，由调用方持有。
+            http_async_client: Optional asynchronous HTTP client, owned by the caller.
+                / 可选异步 HTTP 客户端，由调用方持有。
+
+        Notes:
+            DeepSeek keeps the max_tokens field name by merging it after LangChain's
+            conversion; the Responses API is never selected.
+            / DeepSeek 在 LangChain 转换之后再合并，以保留 max_tokens 字段名；不会切换到
+            Responses API。
         """
         extra_body = deepcopy(settings.extra_body)
         vendor_options = {}
@@ -105,8 +177,8 @@ class OpenAICompatibleProvider:
                     extra_body["reasoning_effort"] = effort
         max_completion_tokens = settings.max_tokens
         if settings.provider == "deepseek" and settings.max_tokens is not None:
-            # 中文：通过 SDK 的后合并扩展保留 DeepSeek 的 max_tokens 参数名。
             # English: Merge after LangChain's conversion to preserve DeepSeek's max_tokens field.
+            # 中文：通过 SDK 的后合并扩展保留 DeepSeek 的 max_tokens 参数名。
             extra_body["max_tokens"] = settings.max_tokens
             max_completion_tokens = None
 
@@ -120,8 +192,8 @@ class OpenAICompatibleProvider:
             temperature=settings.temperature,
             max_completion_tokens=max_completion_tokens,
             extra_body=extra_body or None,
-            # 中文：固定聊天协议，避免自动切换到 Responses API。
             # English: Keep Chat Completions instead of automatically switching to Responses.
+            # 中文：固定聊天协议，避免自动切换到 Responses API。
             use_responses_api=False,
             stream_usage=settings.stream_usage,
             http_client=http_client,
@@ -130,5 +202,10 @@ class OpenAICompatibleProvider:
         )
 
     def get_chat_model(self) -> BaseChatModel:
-        """返回已创建的模型实例。 / Return the existing model instance."""
+        """Return the existing model instance.
+
+        Returns:
+            The same chat model for sync, async and streaming calls.
+            / 供同步、异步与流式调用复用的同一个聊天模型。
+        """
         return self._chat_model

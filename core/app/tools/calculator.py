@@ -1,4 +1,4 @@
-"""浮点计算与字符串金额计算。 / Floating-point arithmetic and string-based money arithmetic."""
+"""Floating-point arithmetic and string-based money arithmetic. / 浮点计算与字符串金额计算。"""
 
 import math
 from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, DecimalException, localcontext
@@ -10,12 +10,23 @@ def calculate(
     a: float,
     b: float | None = None,
 ) -> float:
-    """普通运算始终返回 float，不用于金额。 / General arithmetic returns float, never for money.
+    """
+    Perform bounded floating-point arithmetic and return a float. / 执行有界浮点运算并返回
+    float。
 
     Args:
-        operation: 加、减、乘、除、幂或平方根。 / Arithmetic operation or square root.
-        a: 有限浮点数，第一个操作数。 / Finite floating-point first operand.
-        b: 二元运算的第二个有限浮点数；sqrt 不传。 / Second operand, omitted for sqrt.
+        operation: Add, subtract, multiply, divide, power or square root. /
+        加、减、乘、除、幂或平方根。
+        a: Finite floating-point first operand. / 有限浮点第一操作数。
+        b: Second finite operand for binary operations; omit it for sqrt. /
+        二元运算的第二个有限浮点数；sqrt 不传。
+
+    Returns:
+        Finite floating-point result; never used for money. / 有限浮点结果，不用于金额。
+
+    Raises:
+        ValueError: If operands, operation or result are invalid or not finite. /
+            操作数、运算或结果无效或非有限时抛出。
     """
     if type(a) not in (int, float) or not math.isfinite(a):
         raise ValueError("a 必须是有限浮点数 / must be a finite float")
@@ -57,14 +68,25 @@ def calculate_financial(
     decimal_places: int = 2,
     rounding: Literal["half_up", "half_even"] = "half_up",
 ) -> str:
-    """金额和记账只用字符串输入输出。 / Money/bookkeeping use string inputs and outputs only.
+    """
+    Perform exact decimal money arithmetic on string operands. /
+    对字符串操作数执行精确十进制金额运算。
 
     Args:
-        operation: 加、减、乘、除。 / Add, subtract, multiply or divide.
-        a: 十进制字符串，禁止 float，例如 "0.10"。 / Decimal string, never a float.
-        b: 第二个十进制字符串，例如 "0.20"。 / Second decimal string.
-        decimal_places: 结果小数位数，0～28，默认 2。 / Output decimal places, from 0 to 28.
-        rounding: 四舍五入或半偶数舍入。 / Half-up or half-even rounding.
+        operation: Add, subtract, multiply or divide. / 加、减、乘、除。
+        a: Decimal string such as 0.10; never a float. / 如 0.10 的十进制字符串，禁止 float。
+        b: Second decimal string such as 0.20. / 第二个十进制字符串，例如 0.20。
+        decimal_places: Output decimal places from 0 to 28, default 2. / 结果小数位数
+        0～28，默认 2。
+        rounding: half_up or half_even final-result rounding. / 结果使用 half_up 或 half_even
+        舍入。
+
+    Returns:
+        Rounded decimal string with the requested scale. / 按请求精度舍入后的十进制字符串。
+
+    Raises:
+        ValueError: If an operand, bound, operation or rounding mode is invalid. /
+            操作数、边界、运算或舍入方式无效时抛出。
     """
     if not isinstance(a, str) or not isinstance(b, str):
         raise ValueError("金额必须使用字符串 / financial operands must be strings")
@@ -86,8 +108,8 @@ def calculate_financial(
                 raise ValueError("金额超出支持范围 / financial value is outside supported bounds")
             operands.append(number)
         left, right = operands
-        # 中文：足够容纳受限输入的中间结果，只在最后按明确规则舍入。
         # English: Keep bounded intermediate values precise and round only the final result.
+        # 中文：足够容纳受限输入的中间结果，只在最后按明确规则舍入。
         with localcontext() as context:
             context.prec = 512
             context.rounding = ROUND_HALF_UP if rounding == "half_up" else ROUND_HALF_EVEN

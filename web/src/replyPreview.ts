@@ -1,5 +1,18 @@
-/** Opaque-origin previews. Model HTML never becomes part of the application DOM. */
+/**
+ * Sandboxed reply previews: renders model-produced HTML/SVG inside double-nested opaque-origin iframes.
+ *
+ * 沙箱化的回复预览：在双层不透明源 iframe 中渲染模型产出的 HTML/SVG。
+ */
+
+/** Resolved preview theme passed into the sandbox. / 传入沙箱的已解析预览主题值。 */
 export interface PreviewTheme { dark: boolean; background: string; surface: string; text: string; muted: string; accent: string; font: string }
+/**
+ * Reads the active application theme into plain values the sandbox can apply.
+ *
+ * 读取当前应用主题，转换为沙箱内可直接应用的纯值。
+ *
+ * @returns Theme snapshot with resolved colors and font stack. / 含已解析颜色与字体栈的主题快照。
+ */
 export function previewTheme(): PreviewTheme {
   const style = getComputedStyle(document.documentElement)
   const dark = style.colorScheme === 'dark' || (style.colorScheme !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches)
@@ -14,10 +27,38 @@ export function previewTheme(): PreviewTheme {
     font: style.getPropertyValue('--font').trim(),
   }
 }
+/**
+ * Escapes a string for safe use inside an HTML attribute.
+ *
+ * 转义字符串，以便安全地放入 HTML 属性。
+ *
+ * @param value - Raw attribute value. / 原始属性值。
+ * @returns Escaped attribute value. / 转义后的属性值。
+ */
 const escape = (value: string) => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-// Serialize into script text without allowing a model string to close the script element.
+/**
+ * Serializes a value as a JS literal safe inside a `<script>` body.
+ *
+ * Model strings can never close the script element because `<` is escaped.
+ * 由于 `<` 被转义，模型字符串无法闭合 script 元素。
+ *
+ * 将值序列化为可安全嵌入 `<script>` 的 JS 字面量。
+ *
+ * @param value - Serializable value. / 可序列化的值。
+ * @returns JSON text with `<` escaped. / 已转义 `<` 的 JSON 文本。
+ */
 const literal = (value: unknown) => JSON.stringify(value).replace(/</g, '\\u003c')
 
+/**
+ * Builds the double-iframe preview markup for one assistant reply.
+ *
+ * 为一条助手回复构建双层 iframe 预览标记。
+ *
+ * @param source - Raw HTML or SVG emitted by the model. / 模型输出的原始 HTML 或 SVG。
+ * @param label - Accessible iframe title. / iframe 的无障碍标题。
+ * @param kind - Whether the source is a full document or an SVG fragment. / 源内容属于完整文档还是 SVG 片段。
+ * @returns Outer iframe HTML string to inject with `v-html`. / 可用 `v-html` 注入的外层 iframe HTML 字符串。
+ */
 export function replyPreview(source: string, label: string, kind: 'svg' | 'html'): string {
   const id = crypto.randomUUID()
   const initialTheme = previewTheme()
@@ -29,6 +70,8 @@ export function replyPreview(source: string, label: string, kind: 'svg' | 'html'
   }
   // A content-sized iframe must not feed its own growing height back into 100vh.
   // Keep the demo's logical viewport stable while allowing the complete document to grow.
+  // 尺寸自适应的 iframe 不能把自身增长的高度再反馈给 100vh。
+  // 保持演示稿逻辑视口稳定，同时允许完整文档继续增长。
   const viewportUnits = (css: string) => css.replace(/(\d*\.?\d+)(?:d|s|l)?vh\b/g, (_, value) => `${Number(value) * 6}px`)
   parsed.querySelectorAll('style').forEach(node => { node.textContent = viewportUnits(node.textContent ?? '') })
   parsed.querySelectorAll('[style]').forEach(node => { node.setAttribute('style', viewportUnits(node.getAttribute('style') ?? '')) })
@@ -75,6 +118,8 @@ export function replyPreview(source: string, label: string, kind: 'svg' | 'html'
   const inner = '<!doctype html>' + parsed.documentElement.outerHTML
   // The enclosing document permits only about:srcdoc frames; demos cannot navigate
   // themselves to a network URL. Neither layer has same-origin, top-navigation or popups.
+  // 外层文档只允许 about:srcdoc 框架，演示内容无法自行跳转到网络地址。
+  // 两层都不具备同源权限、顶层导航或弹窗能力。
   const policy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; frame-src about:; connect-src 'none'; base-uri 'none'; form-action 'none'"
   const wrapper = '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="' + policy + '">' +
     '<style>html,body{margin:0;width:100%;height:100%;overflow:hidden}iframe{display:block;position:absolute;left:0;top:0;width:100%;height:600px;border:0;transform-origin:0 0}</style>' +

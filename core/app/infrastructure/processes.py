@@ -1,4 +1,5 @@
-"""带超时与输出上限的独立进程。 / Independent processes with timeout and bounded output."""
+"""Independent processes with timeout and bounded output.
+/ 带超时与输出上限的独立进程。"""
 
 import asyncio
 import codecs
@@ -10,7 +11,8 @@ from typing import Any
 
 
 class ProcessRunner:
-    """执行结构化 argv，不执行 Shell 字符串。 / Execute argv without invoking a command shell."""
+    """Execute a structured argv without invoking a command shell.
+    / 执行结构化 argv，不经过命令 Shell。"""
 
     async def run(
         self,
@@ -21,14 +23,26 @@ class ProcessRunner:
         max_output_chars: int,
         environment: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
-        """执行并合并 stdout/stderr。 / Run and merge stdout/stderr.
+        """Run the argv and merge stdout and stderr.
+
+        Only a small allowlist of environment variables is inherited, so provider keys and
+        application secrets never reach the child. Output is decoded as UTF-8 with replacement
+        and capped; exceeding the cap or the timeout kills the process.
+        / 仅继承少量环境变量白名单，因此 Provider 密钥与应用机密不会进入子进程。输出按 UTF-8
+        替换解码并受限；超出上限或超时会终止进程。
 
         Args:
-            argv: 可信程序路径与已校验参数。 / Trusted executable and validated arguments.
-            cwd: 已解析的工作目录。 / Resolved working directory.
-            timeout_seconds: 最长执行秒数。 / Execution timeout in seconds.
-            max_output_chars: 返回输出字符上限。 / Returned character cap.
-            environment: 显式环境覆盖，不继承密钥。 / Explicit overrides; no inherited secrets.
+            argv: Trusted executable path and validated arguments.
+                / 可信可执行文件路径与已校验参数。
+            cwd: Resolved working directory. / 已解析的工作目录。
+            timeout_seconds: Maximum execution seconds. / 最长执行秒数。
+            max_output_chars: Returned character cap. / 返回输出字符上限。
+            environment: Explicit overrides; never used to inherit secrets.
+                / 显式环境覆盖；不会用于继承密钥。
+
+        Returns:
+            Mapping with ok, return_code, bounded output and an error code when limited.
+            / 含 ok、return_code、受限输出以及受限错误码的映射。
         """
         env = {
             name: value
@@ -69,10 +83,10 @@ class ProcessRunner:
                 try:
                     process.kill()
                 except ProcessLookupError:
-                    # 中文：进程可能恰好自行退出。 / English: The process may have just exited.
+                    # English: The process may have just exited. / 中文：进程可能恰好自行退出。
                     pass
-            # 中文：终止后排空管道，避免满管道让 wait 卡住。
             # English: Drain pipes after termination so a full pipe cannot block wait.
+            # 中文：终止后排空管道，避免满管道让 wait 卡住。
             await process.communicate()
         text = "".join(output) + decoder.decode(b"", final=True)
         if len(text) > max_output_chars:

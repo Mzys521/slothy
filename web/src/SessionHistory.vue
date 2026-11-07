@@ -15,6 +15,7 @@ const archiveLoading = ref(false)
 const archiveLoadError = ref('')
 type HistoryTurn = { message: string; response?: string; run_id?: string; attachments?: { filename: string }[] }
 const preview = ref<{ session: Session; items: HistoryTurn[]; cursor?: number; loading: boolean; error?: string }>()
+/** Sessions shown for this view: archived groups by workspace, or the active workspace's live sessions. / 当前视图的会话：归档视图按工作区分组，否则显示当前工作区的会话。 */
 const groups = computed(() => {
   const entries = sessions.value.filter(session => props.archived
     ? session.archived
@@ -25,6 +26,7 @@ const groups = computed(() => {
   })).filter(group => group.items.length) : entries.length ? [{ id: activeWorkspace.value, items: entries }] : []
 })
 
+/** Fetches archived sessions from the server. / 从服务端获取归档会话。 */
 async function loadArchive() {
   archiveLoading.value = true
   archiveLoadError.value = ''
@@ -37,14 +39,32 @@ async function loadArchive() {
   }
 }
 
+// Archived views must first sync archived sessions from the server. / 归档视图需先从服务端同步归档会话。
 onMounted(() => { if (props.archived) void loadArchive() })
 
+/**
+ * Requests one page of messages for a thread.
+ *
+ * 请求某个会话的一页消息。
+ *
+ * @param threadId - API thread id. / API 会话 ID。
+ * @param cursor - Message id to continue after; defaults to 0. / 从该消息 ID 之后继续，默认为 0。
+ * @returns Message page with items and the next cursor. / 包含消息项与下一页游标的消息页。
+ */
 function messagePage(threadId: string, cursor = 0) {
   return workRequest<{ items: HistoryTurn[]; next_cursor: number | null }>(
     threadPath(threadId) + '/messages?after_id=' + cursor,
   )
 }
 
+/**
+ * Restores an archived session, rebuilding its turn history when only the server copy remains.
+ *
+ * 恢复归档会话；若只剩服务端副本则重建其对话历史。
+ *
+ * @param session - Archived session to restore. / 要恢复的归档会话。
+ * @returns Resolves when the session is restored and its turns are available. / 会话恢复且轮次可用后结束。
+ */
 async function restore(session: Session) {
   if (!session.apiThreadId || session.turns.length) {
     await archiveSession(session.id, false)
@@ -64,6 +84,14 @@ async function restore(session: Session) {
   session.turns = history
 }
 
+/**
+ * Opens a live session or toggles an archived-session preview.
+ *
+ * 打开活动会话，或切换归档会话的预览。
+ *
+ * @param session - Session clicked in the history list. / 历史列表中点击的会话。
+ * @returns Nothing. / 无返回值。
+ */
 function open(session: Session) {
   if (!props.archived) {
     emit('open', session.id)
@@ -85,6 +113,7 @@ function open(session: Session) {
   if (session.apiThreadId) void loadPreview()
 }
 
+/** Loads the next page of the archived-session preview. / 加载归档会话预览的下一页。 */
 async function loadPreview() {
   const current = preview.value
   if (!current?.session.apiThreadId || current.loading) return
@@ -101,6 +130,14 @@ async function loadPreview() {
   }
 }
 
+/**
+ * Runs a session mutation with busy/error handling and clears a stale preview.
+ *
+ * 以忙碌/错误处理执行会话修改，并清除已失效的预览。
+ *
+ * @param action - Async mutation to execute. / 要执行的异步修改操作。
+ * @returns Resolves when the mutation and cleanup complete. / 修改与清理完成后结束。
+ */
 async function change(action: () => Promise<void>) {
   if (busy.value) return
   error.value = ''

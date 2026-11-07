@@ -113,47 +113,41 @@ Execution properties:
 - A per-request approval policy (`ask` | `every`) decides which calls pause;
   safe tools and read-only commands never pause under `ask`.
 
-## 5. Memory and user profile
+## 5. Memory and user profile V3
 
-```
-finished turn ──▶ archive (sessions.sqlite) ──▶ learning queue
-                                                │
-                       independent memory_learning graph: LLM judgment + evidence validation
-                                                ▼
-                              memory_claims + memory_evidence (workspace.sqlite)
-                                                │
-                          auto apply / manual review ──▶ confirmed memory
-                                                │
-                        profile projection (preference/habit/goal) ──▶ profile version +N
-                                                │
-                       next turn: scoped retrieval + profile snapshot injection
-```
+`archive → durable learning queue → LLM concepts/facts → evidence and scope
+validation → fact transaction → reinforcement → profile/search/graph projection`.
+The online agent remains read-only. No embedding service is introduced.
 
-- Claims have a scope (`global` / `project` / `thread`), a dimension, a stable
-  topic key where possible, and evidence quotes.
-- `app/memory/learning.py` owns background orchestration. The model proposes strict
-  JSON without executable tools; `app/personalization/evolution.py` retains domain
-  transactions for confirmation, projection, deletion and relationships.
-- Network calls hold no memory write lock and do not block chat. An event-driven
-  durable queue recovers on startup; commit markers close the apply/ack crash window.
-  Settings, source state, versions and the personalization gate are rechecked before writes.
-- Auto saves eligible evidence-backed memories; review requires confirmation;
-  shadow evaluates without changing memory; off pauses. Inferences need corroboration,
-  uncertain/sensitive candidates remain reviewable, and historical reanalysis cannot
-  resurrect erased or rejected source material.
-- Daily reservations bound model spending, large batches shrink to fit, and actual
-  reported background usage contributes to account token activity without adding chat
-  turns. Missing usage stays partial. Decay, TTL and periodic consolidation remain
-  explicitly reserved settings.
-- The profile is an immutable version chain; edits use optimistic concurrency
-  (`expected_version`), deletions redact old snapshots, and only content changes
-  create a new version (last 200 kept).
-- Memory relationships (`shared_conversation`, manual links) are stored in the
-  same workspace database; the graph API supports directed/undirected links and
-  deletion.
-- Workspaces map to real directories; tool instances and artifact roots are
-  isolated per resolved directory without changing the process working directory.
-  This is a path policy, not an OS sandbox.
+- `app/memory/learning.py` retains background orchestration and strict bounded JSON
+  (32 concepts, 16 facts). `MemoryService` reuses the existing transaction/review
+  lifecycle while owning V3 writes; `MemoryStore` owns scoped local recall and graph
+  projections. Provider calls never hold the write lock.
+- Concepts contain typed canonical keys and supported aliases per user/scope.
+  Facts own subject, predicate, target, value, evidence, state and version chain.
+  A semantic edge is the same fact ID. A proficiency value must retain its skill
+  target. Shared conversation alone never creates a semantic relationship.
+- Concept and fact reinforcement use separate unique session events. Qualified
+  evidence is distinct from reinforcement credit. Strength is independently
+  `f/(f+c)`, default c=4; no collection normalization, TTL or time decay. Capacity
+  (default 500 active facts) deduplicates, then archives unprotected low utility
+  facts. Identity, explicit preferences and manual protection are preserved.
+- Identity and personal skills are global; project statements retain their scope.
+  Scoped FTS5, Chinese bigrams, English terms, aliases and identity intent feed
+  one-hop recall, ranked `.75 relevance + .15 fact strength + .10 importance`.
+  Unrelated high-frequency skills are excluded. Eight facts share a 1200-token
+  personalization budget with their concept metadata.
+- Facts are the only authority. Manual and automatic writes project immutable
+  `identity/skill/preference/habit/goal` attributes; there is no writable
+  profile_json/preferences branch. Optimistic profile edits create new fact
+  versions, and deletion redacts evidence and all historical profile bodies.
+- Direct self-identity questions bypass generation and use live global facts.
+  Absence, pending learning/review, conflicts, disabled memory and read errors are
+  explicit. Bounded memory_trace records supplied evidence IDs, relationship paths,
+  scores and reasons, without copying fact text or claiming model adoption.
+- Durable queue generations, configuration revisions, source exclusions and SQLite
+  unique events prevent stale application and replay. Network failures and daily
+  token reservations retain the existing observable worker lifecycle.
 
 ## 6. Prompt layering and caching
 
@@ -192,17 +186,53 @@ upgrades are idempotent `ALTER TABLE` migrations executed on open.
 
 ## 8. Tools and execution boundaries
 
+`ToolDescriptor → ToolRegistry → ToolGateway → ToolNode → executor` is the shared
+assembly path for built-ins, attachments and connectors. Descriptors define schema,
+mode/platform availability, review, static instructions and limits. Model bindings
+exclude hidden aliases. Runtime names retain registration order; prompt guidance
+and schemas remain sorted. Independent arithmetic/executor helpers retain native APIs.
+
+Every model-visible result uses `ToolResult`: `ok`, `summary`, `data`, `artifacts`,
+`next_offset`, `error`. Errors include a stable code, retryability and correction hint.
+Default review covers write/execute/network; `every` covers every available valid
+call. Skill references are read-only in both modes; imported executable connectors
+are Work-only. Review cards expose risk, affected path and structured arguments.
+
+Batches execute sequentially. Defaults are 12 calls, 64,000 output characters,
+120 seconds of tool execution and three consecutive failures of one tool per run.
+Budgets resume from checkpointed result telemetry; approval waiting is separate.
+Bounded diagnostics still complete call/result pairs after budget exhaustion.
+`RunMetrics.tools` reaches SSE, archives and daily/account tool aggregation.
+`usage_reported=false` distinguishes absent model usage from reported zero tokens.
+
 | Tool | Execution | Boundary |
 |---|---|---|
-| `calculate` / `calculate_financial` | in-process | float / Decimal arithmetic only |
-| `run_command` | in-process for allowlisted commands, subprocess for `rg` | enum commands, argv list, workspace-confined paths, no shell |
-| `write_document_python` | separate Python process | fresh run directory, audit policy, artifact budgets |
-| `list_uploaded_files` / `read_uploaded_file` | in-process SQLite reads | per-thread isolation, paged reads |
+| `calculate` / `calculate_financial` | in-process | float / Decimal string arithmetic |
+| `workspace_read` | in-process | bounded UTF-8 pages, directory list and literal search; private/linked paths excluded |
+| `workspace_write` | in-process | approved mkdir/write; no overwrite by default |
+| `export_document` | standard library / python-docx | approved md/txt/csv/json/docx templates; no model code |
+| `run_python` | separate Python process | approved code, journaled output directory, existing audit and artifact limits |
+| `get_datetime` | in-process | current time and offset-aware IANA conversion; bundled tzdata |
+| `list_uploaded_files` / `read_uploaded_file` | in-process SQLite reads | per-thread isolation and paged text |
 
-Subprocesses use `create_subprocess_exec` (argv only), a minimal environment
-allowlist, merged stderr, output caps and timeout kills. Document generation is
-policy-checked but **not** an OS sandbox; the security boundary is documented
-rather than implied.
+File effects claim an invocation journal before executing. Completed results are
+reused after checking paths, sizes and SHA-256 digests. Uncertain execution or changed
+artifacts return `RECOVERY_REQUIRED` with a journal path. Retention defaults to 100
+completed/failed managed run directories, preserving uncertain runs and workspace
+business files. Files and SQLite remain separate transaction boundaries. Legacy
+`run_command` / `write_document_python` aliases only recover pre-upgrade runs and stay
+out of model bindings/runtime lists. Prompt version `2026-11-07.memory-v3` intentionally
+resets the changed tool prefix once.
+
+Subprocess execution keeps argv-only calls, minimal environments, output caps,
+timeout termination and cancellation cleanup. Python audit checks are policy-level
+constraints, not an OS sandbox.
+
+Optional `web_fetch` is disabled by default and advertised only with an explicit
+domain allowlist. It accepts HTTPS/443 without URL credentials, checks all DNS
+results and every redirect, dials a validated public IP and verifies TLS against
+the original hostname. Bytes, text and redirects are bounded; script/style content
+is omitted. This setting is separate from imported MCP connection URLs.
 
 ## 9. Connectors
 
@@ -257,3 +287,13 @@ scripts.
   reserved settings and are not executed automatically.
 - Memory retrieval is lexical today; embeddings are an explicit future step.
 - Conversation branching is documented but not implemented yet.
+
+## V3 data epoch
+
+Before opening stores, `prepare_storage` resets exactly the three business databases
+under an exclusive lock and writes an atomic `.storage.json` marker. Independent
+configuration files and actual workspace files remain. The marker precedes opening
+new stores, so restart never deletes accepted V3 data. The renderer clears legacy
+conversation caches on `/runtime.data_epoch` change and does not import old messages.
+Every model call and approval resumption revalidates frozen fact IDs, states and
+values; corrected/archived/deleted values leave L1 and new values enter L3.

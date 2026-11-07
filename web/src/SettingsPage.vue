@@ -21,12 +21,22 @@ const palettes = [
 ]
 const customDraft = ref(settings.customAccent)
 const invalidAccent = ref(false)
+// Keep the HEX draft in sync when the stored custom accent changes elsewhere. / 存储的自定义强调色在其他位置变化时同步 HEX 草稿。
 watch(() => settings.customAccent, value => { customDraft.value = value; invalidAccent.value = false })
+/** Normalizes the draft HEX color and stores it when valid. / 规整草稿中的 HEX 颜色，有效时写入设置。 */
 function applyCustomAccent() {
   const color = normalizeAccent(customDraft.value)
   invalidAccent.value = !color
   if (color) { settings.customAccent = color; customDraft.value = color }
 }
+/**
+ * Applies the color chosen in the native color picker.
+ *
+ * 应用原生取色器选择的颜色。
+ *
+ * @param event - Input event from the color picker. / 取色器触发的输入事件。
+ * @returns Nothing. / 无返回值。
+ */
 function pickCustomAccent(event: Event) {
   customDraft.value = (event.target as HTMLInputElement).value
   applyCustomAccent()

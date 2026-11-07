@@ -109,10 +109,20 @@ First run checklist:
 - **New conversation**: send a message and confirm the answer streams.
 - **Tool approval**: ask for a document or a shell command; the run pauses and
   shows the exact call — approve to continue.
-- **Memory**: complete a turn that states a real preference (for example
-  “我喜欢简洁的回答。”), then open the memory page. The background LLM learning
-  engine saves reliable, evidence-backed information automatically in `auto`
-  mode; switch memory mode to `review` if you prefer to confirm candidates first.
+- **Memory V3**: state a preference, habit, goal or fact. The background model
+  extracts typed concepts and evidence-backed directed facts; identity questions
+  answer from reliable facts, and the context panel shows the provided evidence.
+  On first V3 startup the three business databases reset once (old messages are not
+  relearned) — export anything you need before upgrading.
+
+### Composer commands and references
+
+Type `/` in the composer to open the 20 grouped, searchable commands (session, model,
+context, artifacts and help); file upload now lives in the same plus menu. Type `@`
+to reference a workspace folder or file, an owned conversation, or an enabled plugin:
+the server revalidates ownership and scope, then injects bounded low-trust L3 data.
+`/compact` and `/export` require confirmation, and plugin tool calls keep the normal
+approval policy.
 
 ## 5. Data locations
 
@@ -122,7 +132,9 @@ First run checklist:
 | Installed app | `%APPDATA%\slothy\data\` |
 
 Both contain `checkpoints.sqlite`, `checkpoints.sessions.sqlite`,
-`checkpoints.workspace.sqlite`, `providers.json` and `artifacts/`. Delete the
+`checkpoints.workspace.sqlite`, `providers.json` and `artifacts/`. **Memory V3**:
+the first V3 startup resets the three business databases once; provider keys,
+connector configuration files, UI preferences and workspace files remain. Delete the
 directory to reset the app; back it up to keep your memory.
 
 ## 6. Build a Windows installer

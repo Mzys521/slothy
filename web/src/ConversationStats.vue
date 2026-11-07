@@ -6,9 +6,11 @@ import { settings, t } from './preferences'
 
 const props = defineProps<{ turns: Turn[] }>()
 const rounds = computed(() => props.turns.filter(turn => turn.serverRunId).length)
-const known = computed(() => props.turns.flatMap(turn => turn.metrics ? [turn.metrics] : []))
-const latest = computed(() => props.turns.at(-1)?.metrics)
+const known = computed(() => props.turns.flatMap(turn => turn.metrics && turn.metrics.usage_reported !== false ? [turn.metrics] : []))
+const latest = computed(() => { const metrics = props.turns.at(-1)?.metrics; return metrics?.usage_reported !== false ? metrics : undefined })
 const total = computed(() => known.value.reduce((sum, run) => sum + run.total_tokens, 0))
+// Cache-hit ratio across runs that reported input tokens; null when nothing was reported.
+// 缓存命中率：仅统计报告了输入 token 的轮次，无数据时为 null。
 const cache = computed(() => {
   const reported = known.value.reduce((sum, run) => sum + run.cache_reported_input_tokens, 0)
   return reported ? known.value.reduce((sum, run) => sum + run.cached_input_tokens, 0) / reported : null
@@ -18,6 +20,13 @@ const context = computed(() => latest.value?.context_window
 const rate = computed(() => latest.value?.model_seconds
   ? latest.value.output_tokens / latest.value.model_seconds : null)
 const locale = computed(() => settings.language === 'zh-CN' ? 'zh-CN' : 'en-US')
+/**
+ * Format a 0–1 ratio as a localized percentage.
+ * 将 0–1 的比率格式化为本地化百分比。
+ *
+ * @param value - Ratio to format, or null when unavailable. / 待格式化的比率，无数据时为 null。
+ * @returns Localized percentage string, or an em dash when unavailable. / 本地化百分比字符串，无数据时返回破折号。
+ */
 const percent = (value: number | null) => value == null ? '—' : new Intl.NumberFormat(locale.value, {
   style: 'percent', maximumFractionDigits: 2,
 }).format(value)

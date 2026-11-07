@@ -1,19 +1,30 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ChevronDown, ChevronRight, File as FileIcon, History, Layers, LoaderCircle, PanelRight, Plus, Send, ShieldCheck, SquarePlus, Trash2, X } from 'lucide-vue-next'
-import { activeSession, activeWorkspace, clearSession, newChat, runningSessions, selectSession, sessions, sessionWorkspace, syncThreadMessages, type ChatMode, type Session, type Turn, type WorkOptions } from './chat'
+import { ChevronDown, ChevronRight, File as FileIcon, History, LoaderCircle, PanelRight, Plus, Send, ShieldCheck, Square, SquarePlus, Trash2, X } from 'lucide-vue-next'
+import { activeSession, activeWorkspace, clearSession, newChat, runningRequests as requestControllers, runningSessions, runningTurnIds, selectSession, sessions, sessionWorkspace, syncThreadMessages, workspaces, type ChatMode, type Session, type Turn, type WorkOptions } from './chat'
 import { readLocal, settings, t, writeLocal } from './preferences'
 import MarkdownText from './MarkdownText.vue'
 import CopyMessage from './CopyMessage.vue'
 import SessionHistory from './SessionHistory.vue'
 import AgentContextPanel from './AgentContextPanel.vue'
-import { memoryScope, streamWorkRequest, threadPath, uploadAttachment, workRequest, type MemoryReceipt, type ModelItem, type ToolReview, type WorkReply } from './workApi'
+import { ApiError, memoryScope, streamWorkRequest, threadPath, uploadAttachment, workRequest, type MemoryReceipt, type ModelItem, type ToolReview, type WorkReply, type ToolArtifact } from './workApi'
 import RunActivityTrace from './RunActivityTrace.vue'
 import ModelPicker from './ModelPicker.vue'
 import ConversationRail from './ConversationRail.vue'
 import ConversationStats from './ConversationStats.vue'
 import UserAvatar from './UserAvatar.vue'
 import { brandAsset } from './brand'
+import { downloadArtifact, riskLabel } from './toolResults'
+import ComposerPalette from './composer/ComposerPalette.vue'
+import ReferenceChip from './composer/ReferenceChip.vue'
+import { useComposerPalette } from './composer/useComposerPalette'
+import { useComposerCommands } from './composer/useComposerCommands'
+import type { PaletteItem } from './composer/types'
+import { commandAvailable, filterCommands, findCommand, parseCommand } from './commands/registry'
+import type { CommandName } from './commands/types'
+import { searchReferences } from './references/providers'
+import { referenceKey, referencePayload, type ReferenceItem, type ReferenceKind } from './references/types'
+import { replaceToken, unresolvedMentions, type ComposerTrigger } from './references/parser'
 
 const emit = defineEmits<{ memory: [id: string]; evidence: [thread: string, run: string]; memoryReview: []; closeContext: [] }>()
 const props = defineProps<{ memoryId?: string }>()
@@ -36,12 +47,20 @@ const reasoningLevels = ref(readLocal<Record<string, string>>('adaptive.reasonin
 const selectedModel = computed(() => models.value.find(item =>
   item.id === (model.value === 'auto' ? defaultModel.value : model.value),
 ))
+// Prefer the saved effort when the model still supports it, otherwise fall back to its default.
+// 优先使用已保存且模型仍支持的强度，否则回退到该模型的默认值。
 const reasoningEffort = computed(() => {
   const selected = selectedModel.value
   if (!selected) return undefined
   const saved = reasoningLevels.value[selected.id]
   return saved && selected.reasoning_levels.includes(saved) ? saved : selected.default_effort ?? undefined
 })
+/**
+ * Persist the reasoning effort chosen for the active model.
+ * 保存当前模型所选的思考强度。
+ *
+ * @param value - Effort id reported by the model picker. / 模型选择器返回的强度标识。
+ */
 function setReasoningEffort(value: string) {
   if (!selectedModel.value) return
   reasoningLevels.value[selectedModel.value.id] = value
@@ -53,9 +72,24 @@ const fileInput = ref<HTMLInputElement>()
 const workBusy = ref(false)
 const liveReplies = ref<Record<string, string>>({})
 const workError = ref('')
+const selectedReferences = ref<ReferenceItem[]>([])
+const referenceTextConfirm = ref(false)
+const composerArea = ref<HTMLElement>()
+const modelPicker = ref<InstanceType<typeof ModelPicker>>()
+const confirmationArea = ref<HTMLElement>()
+const command = useComposerCommands({ session, mode, model, models, draft, busy: workBusy,
+  create: createSession, switchMode, clear: resetDraft, attach: () => fileInput.value?.click(),
+  openModel: () => modelPicker.value?.openModels(), arguments: askCommandArguments,
+  stop: stopCurrent, retry: retryCurrent, error: showWorkError })
+const palette = useComposerPalette(draft, composer, paletteItems, commitPalette)
+const paletteTitle = computed(() => palette.trigger.value?.kind === 'add' ? t('Add and commands', '添加与命令')
+  : palette.trigger.value?.kind === 'reference' ? t('References', '引用')
+    : palette.trigger.value?.kind === 'argument' ? '/' + palette.trigger.value.command : t('Commands', '命令'))
+watch(command.confirmation, value => { if (value) void nextTick(() => confirmationArea.value?.querySelector<HTMLButtonElement>('button')?.focus()) })
 const pendingReview = computed(() => session.value?.pendingReview)
 const panelOpen = ref(Boolean(props.memoryId))
 watch(() => props.memoryId, id => { panelOpen.value = Boolean(id) })
+/** Close the context panel and notify the parent when it was opened from memory detail. / 关闭上下文面板，并在从记忆详情打开时通知父组件。 */
 function closePanel() {
   panelOpen.value = false
   if (props.memoryId) emit('closeContext')
@@ -63,6 +97,8 @@ function closePanel() {
 watch(model, value => writeLocal('adaptive.model', value))
 watch(work, value => writeLocal('adaptive.workOptions', value), { deep: true })
 watch(mode, value => writeLocal('adaptive.chatMode', value))
+// Switching sessions resets the local draft and mirrors the session mode.
+// 切换会话时重置本地草稿，并同步该会话的模式。
 watch(activeSession, () => {
   if (session.value) mode.value = session.value.mode ?? 'chat'
   panelOpen.value = Boolean(props.memoryId)
@@ -89,7 +125,9 @@ onUnmounted(() => {
 })
 const turns = computed(() => session.value?.turns ?? [])
 const empty = computed(() => !turns.value.length)
-const canSend = computed(() => Boolean(draft.value.trim() || files.value.length))
+const canSend = computed(() => Boolean(draft.value.trim() || files.value.length || selectedReferences.value.length))
+// Reload pending review and transcript whenever the selected session changes.
+// 选中会话变化时重新加载待审批状态与消息记录。
 watch(() => session.value, async target => {
   if (!target?.apiThreadId || runningSessions.has(target.id)) return
   await refreshReview(target)
@@ -101,16 +139,37 @@ watch(() => session.value, async target => {
   }
 }, { immediate: true })
 
+/**
+ * Toggle a string id inside one of the collapsible state sets.
+ * 在可折叠状态集合中切换某个 id。
+ *
+ * @param items - Set to mutate. / 待修改的集合。
+ * @param id - Id to add or remove. / 要添加或移除的 id。
+ */
 function toggle(items: Set<string>, id: string) {
   if (items.has(id)) items.delete(id)
   else items.add(id)
 }
+/** Pin the transcript to its latest message on the next tick. / 在下一个 tick 将对话记录滚动到底部。 */
 function scrollToEnd() {
   void nextTick(() => {
     if (transcript.value) transcript.value.scrollTop = transcript.value.scrollHeight
   })
 }
-function submit() {
+/** Append the draft as a new turn and hand it to the agent. / 将草稿作为新一轮追加并交给 Agent 处理。 */
+function submit(allowUnresolved?: unknown) {
+  const parsed = parseCommand(draft.value)
+  if (parsed) {
+    const input = draft.value
+    palette.close()
+    void command.run(parsed.name, parsed.argument).then(accepted => {
+      if (accepted && draft.value === input) draft.value = ''
+    }).catch(showWorkError)
+    return
+  }
+  if (draft.value.trim() === '/') { palette.update(); return }
+  if (command.busy.value) return
+  if (allowUnresolved !== true && unresolvedMentions(draft.value).length) { referenceTextConfirm.value = true; return }
   if (archived.value || workBusy.value || runningSessions.has(activeSession.value) || pendingReview.value || !canSend.value) return
   const text = draft.value.trim()
   const uploads = [...files.value]
@@ -119,6 +178,7 @@ function submit() {
     id: crypto.randomUUID(), prompt: text, memory: settings.personalizedMemory,
     time: new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date()),
     files: attachments, model: model.value, reasoningEffort: reasoningEffort.value,
+    references: [...selectedReferences.value],
     ...(mode.value === 'work'
       ? { work: { ...work.value } }
       : {}),
@@ -130,12 +190,26 @@ function submit() {
   session.value.turns.push(turn)
   draft.value = ''
   files.value = []
+  selectedReferences.value = []
+  palette.close()
   scrollToEnd()
   void sendToAgent(session.value, session.value.turns.at(-1)!, uploads)
 }
+/**
+ * Surface a work request failure as the composer-level error message.
+ * 将工作请求失败显示为输入区级别的错误信息。
+ *
+ * @param cause - Value thrown by the failed request. / 请求失败时抛出的值。
+ */
 function showWorkError(cause: unknown) {
   workError.value = cause instanceof Error ? cause.message : t('Work request failed.', '工作请求失败。')
 }
+/**
+ * Reload any pending tool review for a session and merge it into its turn.
+ * 重新读取会话中待处理的工具审批，并合并到对应轮次。
+ *
+ * @param target - Session to refresh. / 需要刷新的会话。
+ */
 async function refreshReview(target: Session) {
   if (!target.apiThreadId) return
   try {
@@ -146,23 +220,40 @@ async function refreshReview(target: Session) {
     if (existing) {
       existing.activity = review.activity
       existing.metrics = review.metrics
+      existing.memoryTrace = review.memory_trace
+      existing.responseSource = review.response_source
       existing.usedMemoryIds = review.used_memory_ids
+      existing.references = review.references ?? existing.references
+      existing.usedReferenceIds = review.used_reference_ids ?? existing.usedReferenceIds
     } else if (review.message !== undefined) {
       target.turns.push({
         id: review.run_id, serverRunId: review.run_id, prompt: review.message,
         time: '', files: [], memory: false, activity: review.activity, metrics: review.metrics,
-        usedMemoryIds: review.used_memory_ids,
+        usedMemoryIds: review.used_memory_ids, memoryTrace: review.memory_trace, responseSource: review.response_source,
+        references: review.references, usedReferenceIds: review.used_reference_ids,
       })
     }
   } catch (cause) {
     if (target.id === activeSession.value) showWorkError(cause)
   }
 }
+/**
+ * Copy a completed or paused run's metadata into its turn and update pending state.
+ * 将完成或暂停运行的元数据写入对应轮次，并更新待审批状态。
+ *
+ * @param target - Session that owns the turn. / 轮次所属会话。
+ * @param turn - Turn receiving the reply metadata. / 接收回复元数据的轮次。
+ * @param result - Completed reply or approval request returned by the server. / 服务端返回的完成回复或审批请求。
+ */
 function applyWorkReply(target: Session, turn: Turn, result: ToolReview | WorkReply) {
   turn.serverRunId = result.run_id
+  turn.memoryTrace = result.memory_trace
+  turn.responseSource = result.response_source
   turn.usedMemoryIds = result.used_memory_ids
   if (result.activity) turn.activity = result.activity
   turn.metrics = result.metrics
+  if ('references' in result && result.references) turn.references = result.references
+  if ('used_reference_ids' in result) turn.usedReferenceIds = result.used_reference_ids
   if ('approval_id' in result) {
     target.pendingReview = result
   } else {
@@ -173,10 +264,20 @@ function applyWorkReply(target: Session, turn: Turn, result: ToolReview | WorkRe
   }
   scrollToEnd()
 }
-function runStream(path: string, body: object, turn: Turn) {
+/**
+ * Stream one agent request and fold activity and delta events into the turn.
+ * 流式执行一次 Agent 请求，并将活动与增量事件写入该轮次。
+ *
+ * @param path - API path to stream from. / 流式请求的接口路径。
+ * @param body - JSON body sent to the endpoint. / 发送给接口的 JSON 请求体。
+ * @param turn - Turn whose live state is updated while streaming. / 流式过程中持续更新的轮次。
+ * @returns The final work reply or approval request. / 最终的回复或审批请求。
+ */
+function runStream(path: string, body: object, turn: Turn, signal?: AbortSignal, resolveTurn?: (run: string) => Turn) {
   let toolCount = turn.activity?.filter(entry => entry.kind === 'tool').length ?? 0
   return streamWorkRequest(path, body, update => {
     if (update.event === 'activity') {
+      if (resolveTurn) turn = resolveTurn(update.run_id)
       turn.serverRunId = update.run_id
       const count = update.items.filter(entry => entry.kind === 'tool').length
       if (count > toolCount) delete liveReplies.value[turn.id]
@@ -188,8 +289,16 @@ function runStream(path: string, body: object, turn: Turn) {
     }
     const area = transcript.value
     if (area && area.scrollHeight - area.scrollTop - area.clientHeight < 100) scrollToEnd()
-  })
+  }, signal)
 }
+/**
+ * Poll memory receipts until the background learning pass settles.
+ * 轮询记忆回执，直到后台学习任务完成。
+ *
+ * @param thread - API thread id that produced the turn. / 产生该轮次的接口会话 id。
+ * @param turn - Turn receiving saved memories and suggestions. / 接收已保存记忆与建议的轮次。
+ * @param run - Run id whose receipts are requested. / 请求回执的运行 id。
+ */
 async function loadMemoryReceipts(thread: string, turn: Turn, run: string) {
   const path = threadPath(thread) + '/memory-receipts?run_id=' + encodeURIComponent(run)
   try {
@@ -204,49 +313,71 @@ async function loadMemoryReceipts(thread: string, turn: Turn, run: string) {
     turn.memoryReceiptError = t('Could not load memory receipts.', '无法读取记忆回执。')
   }
 }
+/**
+ * Create the thread if needed, upload attachments, stream the run and record its outcome.
+ * 按需创建会话、上传附件、流式执行并记录结果。
+ *
+ * @param target - Session the turn belongs to. / 该轮次所属会话。
+ * @param turn - Turn to send and complete. / 要发送并补全的轮次。
+ * @param uploads - Files to upload before sending. / 发送前要上传的文件。
+ */
 async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
   const agentMode = turn.work ? 'work' : 'chat'
   workBusy.value = true
   runningSessions.add(target.id)
+  runningTurnIds[target.id] = turn.id
   workError.value = ''
   const startedAt = performance.now()
+  const controller = new AbortController()
+  requestControllers.set(target.id, controller)
   try {
     if (!target.apiThreadId) {
       const input = { mode: agentMode, title: target.title }
       const thread = await workRequest<{ thread_id: string }>('/threads', 'POST', {
         ...input, workspace_id: sessionWorkspace(target),
-      })
+      }, { signal: controller.signal })
       target.apiThreadId = thread.thread_id
     }
-    const attachmentIds = []
+    const attachmentIds = uploads.length ? [] : [...(turn.attachmentIds ?? [])]
     for (const file of uploads) {
-      const attachment = await uploadAttachment(target.apiThreadId, file)
+      const attachment = await uploadAttachment(target.apiThreadId, file, controller.signal)
       attachmentIds.push(attachment.id)
     }
+    turn.attachmentIds = attachmentIds
     const result = await runStream('/chat', {
       stream: true,
       attachment_ids: attachmentIds,
+      references: (turn.references ?? []).map(referencePayload),
       model: turn.model === 'auto' ? undefined : turn.model,
       reasoning_effort: turn.reasoningEffort,
       thread_id: target.apiThreadId, message: turn.prompt, mode: agentMode,
       project_id: sessionWorkspace(target) === 'personal' ? undefined : sessionWorkspace(target),
       personalization_enabled: turn.memory, approval_policy: turn.work?.approval === 'every' ? 'every' : 'ask',
-    }, turn)
+    }, turn, controller.signal)
     turn.activityMs = performance.now() - startedAt
     applyWorkReply(target, turn, result)
   } catch (cause) {
-    turn.serverError = cause instanceof Error ? cause.message : t('Could not get a reply.', '无法获取回复。')
+    turn.serverError = controller.signal.aborted ? t('Run stopped. Use /retry to resume.', '已停止运行，可使用 /retry 恢复。') : cause instanceof Error ? cause.message : t('Could not get a reply.', '无法获取回复。')
     if (target.id === activeSession.value && !draft.value && !files.value.length) {
       draft.value = turn.prompt
       files.value = uploads
+      selectedReferences.value = [...(turn.references ?? [])]
     }
     if (target.apiThreadId) await refreshReview(target)
   } finally {
     delete liveReplies.value[turn.id]
     runningSessions.delete(target.id)
+    delete runningTurnIds[target.id]
+    requestControllers.delete(target.id)
     workBusy.value = false
   }
 }
+/**
+ * Approve or reject the pending tool review and continue the same run.
+ * 批准或拒绝待处理的工具审批，并继续同一运行。
+ *
+ * @param approved - Whether the user approved the paused actions. / 用户是否批准了暂停的操作。
+ */
 async function resolveReview(approved: boolean) {
   const target = session.value
   const review = target?.pendingReview
@@ -255,13 +386,16 @@ async function resolveReview(approved: boolean) {
   activityOpen.value.delete(turn.id)
   workBusy.value = true
   runningSessions.add(target.id)
+  runningTurnIds[target.id] = turn.id
   workError.value = ''
   turn.serverError = undefined
   const startedAt = performance.now()
+  const controller = new AbortController()
+  requestControllers.set(target.id, controller)
   try {
     const result = await runStream(
       threadPath(target.apiThreadId) + '/approval/' + encodeURIComponent(review.approval_id) + '?stream=true',
-      { approved }, turn,
+      { approved }, turn, controller.signal,
     )
     turn.activityMs = (turn.activityMs ?? 0) + performance.now() - startedAt
     applyWorkReply(target, turn, result)
@@ -271,25 +405,58 @@ async function resolveReview(approved: boolean) {
   } finally {
     delete liveReplies.value[turn.id]
     runningSessions.delete(target.id)
+    delete runningTurnIds[target.id]
+    requestControllers.delete(target.id)
     workBusy.value = false
   }
 }
+/** Start a fresh session in the current mode and focus the composer. / 以当前模式新建会话并聚焦输入框。 */
 function createSession() {
   newChat(mode.value)
   historyOpen.value = false
   void nextTick(() => composer.value?.focus())
 }
+/**
+ * Whether a turn currently represents the in-flight agent run.
+ * 判断某个轮次是否对应当前正在执行的 Agent 运行。
+ *
+ * @param turn - Turn to test. / 待判断的轮次。
+ * @returns True while the run is streaming or waiting on approval. / 运行流式执行或等待审批时为 true。
+ */
 function workRunning(turn: Turn) {
+  const owner = runningTurnIds[activeSession.value]
+  if (owner) return runningSessions.has(activeSession.value) && owner === turn.id && !turn.serverReply
   const runningId = pendingReview.value?.run_id
   return runningSessions.has(activeSession.value) && !turn.serverReply &&
     (runningId ? turn.serverRunId === runningId : turns.value.at(-1)?.id === turn.id)
 }
+/**
+ * Whether a turn is paused on the current tool review.
+ * 判断某个轮次是否正等待当前工具审批。
+ *
+ * @param turn - Turn to test. / 待判断的轮次。
+ * @returns True when the pending review belongs to this turn. / 待审批属于该轮次时为 true。
+ */
 function waitingForReview(turn: Turn) {
   return Boolean(turn.serverRunId && pendingReview.value?.run_id === turn.serverRunId)
 }
+/**
+ * Whether the activity trace should be expanded for a turn.
+ * 判断某轮次的活动记录是否应展开。
+ *
+ * @param turn - Turn to test. / 待判断的轮次。
+ * @returns True when running, awaiting review or manually opened. / 运行中、等待审批或手动展开时为 true。
+ */
 function showActivity(turn: Turn) {
   return workRunning(turn) || waitingForReview(turn) || activityOpen.value.has(turn.id)
 }
+/**
+ * Label for the activity disclosure, including run timing when known.
+ * 生成活动记录标题，并在可用时显示运行耗时。
+ *
+ * @param turn - Turn whose activity label is rendered. / 要渲染活动标题的轮次。
+ * @returns Localized activity label. / 本地化活动标题。
+ */
 function activityLabel(turn: Turn) {
   if (waitingForReview(turn) && !workRunning(turn)) return t('Awaiting approval', '等待审批')
   if (workRunning(turn)) return t('Agent is working…', 'Agent 正在处理…')
@@ -298,22 +465,39 @@ function activityLabel(turn: Turn) {
   const seconds = Math.max(1, Math.round(turn.activityMs / 1000))
   return t(`Processed in ${seconds}s`, `已处理（用时 ${seconds} 秒）`)
 }
+/**
+ * Switch between chat and work mode, starting a new session to apply it.
+ * 在聊天与工作模式间切换，并新建会话来应用该模式。
+ *
+ * @param value - Requested conversation mode. / 请求的对话模式。
+ */
 function switchMode(value: ChatMode) {
   if (mode.value === value) return
   mode.value = value
   createSession()
 }
+/** Clear the draft, attachments and transient composer errors. / 清空草稿、附件与临时输入区错误。 */
 function resetDraft() {
   draft.value = ''
   files.value = []
+  selectedReferences.value = []
+  referenceTextConfirm.value = false
+  palette.close()
   workError.value = ''
   confirmClear.value = false
   if (!disposed) scrollToEnd()
 }
+/**
+ * Open a session chosen from the history popover.
+ * 打开从历史弹层中选择的会话。
+ *
+ * @param id - Session id to activate. / 要激活的会话 id。
+ */
 function openFromHistory(id: string) {
   selectSession(id)
   historyOpen.value = false
 }
+/** Clear all messages of the active session after confirmation. / 确认后清空当前会话的全部消息。 */
 async function clearCurrent() {
   if (!session.value || archived.value || workBusy.value) return
   const id = session.value.id
@@ -331,18 +515,32 @@ async function clearCurrent() {
     workBusy.value = false
   }
 }
+/**
+ * Close the history popover when a pointerdown lands outside it.
+ * 当指针按在历史弹层之外时关闭该弹层。
+ *
+ * @param event - Document-level pointerdown event. / 文档级 pointerdown 事件。
+ */
 function closeMenus(event: PointerEvent) {
   const target = event.target as Node
+  if (!composerArea.value?.contains(target)) palette.close()
   if (!historyArea.value?.contains(target)) {
     historyOpen.value = false
     confirmClear.value = false
   }
 }
+/** Close the history popover and return focus to its trigger. / 关闭历史弹层并将焦点还给触发按钮。 */
 function dismissHistory() {
   historyOpen.value = false
   confirmClear.value = false
   historyTrigger.value?.focus()
 }
+/**
+ * Validate and append files chosen by the attachment picker.
+ * 校验并追加附件选择器选中的文件。
+ *
+ * @param event - Change event from the hidden file input. / 隐藏文件输入框的 change 事件。
+ */
 function addFiles(event: Event) {
   const input = event.target as HTMLInputElement
   const selected = Array.from(input.files ?? [])
@@ -358,7 +556,179 @@ function addFiles(event: Event) {
   workError.value = ''
   files.value.push(...selected)
 }
+/**
+ * Send on Enter while keeping Shift+Enter and IME composition for new lines.
+ * 回车发送，保留 Shift+Enter 与输入法组合状态用于换行。
+ *
+ * @param event - Keydown event from the composer textarea. / 输入框的键盘事件。
+ */
+function groupLabel(group: string) {
+  const labels: Record<string, [string, string]> = { run: ['Run', '运行'], context: ['Context', '上下文'], model: ['Model', '模型'], artifact: ['Artifacts', '产物'], capability: ['Capabilities', '能力'], ui: ['Interface', '界面'], help: ['Help', '帮助'], folder: ['Folders', '文件夹'], file: ['Files', '文件'], session: ['Conversations', '会话'], plugin: ['Plugins', '插件'] }
+  return labels[group] ? t(...labels[group]) : group
+}
+
+async function paletteItems(trigger: ComposerTrigger, signal: AbortSignal): Promise<PaletteItem[]> {
+  const scope = { workspace: activeWorkspace.value, thread: session.value?.apiThreadId }
+  if (trigger.kind === 'argument') {
+    const definition = findCommand(trigger.command ?? '')
+    const argumentLabels: Record<string, string> = { chat: t('Chat', '聊天'), work: t('Work', '工作'),
+      light: t('Light', '浅色'), dark: t('Dark', '深色'), system: t('System', '跟随系统'),
+      en: 'English', zh: '简体中文', md: 'Markdown (.md)', docx: 'Word (.docx)' }
+    let choices = (definition?.choices ?? []).map(value => ({ value, title: argumentLabels[value] ?? value, description: value }))
+    if (trigger.command === 'model') choices = [{ value: 'auto', title: t('Default model', '默认模型'), description: '' }, ...models.value.map(item => ({ value: item.id, title: item.display_name || item.id, description: item.provider }))]
+    if (trigger.command === 'workspace') choices = workspaces.value.map(item => ({ value: item.id, title: item.name, description: item.directory ?? '' }))
+    return choices.filter(item => (item.title + ' ' + item.value).toLowerCase().includes(trigger.query.toLowerCase()))
+      .map(item => ({ id: 'argument:' + item.value, title: item.title, description: item.description,
+        group: '/' + trigger.command, icon: 'command', command: definition!.name, argument: item.value }))
+  }
+  const categories: ReferenceKind[] = ['folder', 'file', 'session', 'plugin']
+  const categoryRows = categories.map(kind => ({ id: 'category:' + kind, title: groupLabel(kind),
+    description: t('Add a reference', '添加引用'), group: t('References', '引用'), icon: kind, category: kind }))
+  const referenceRow = (item: ReferenceItem): PaletteItem => ({ id: referenceKey(item), title: item.label,
+    description: item.sublabel ?? '', group: groupLabel(item.kind), icon: item.kind, reference: item })
+  if (trigger.kind === 'reference') {
+    if (trigger.referenceKind) return (await searchReferences(trigger.referenceKind, trigger.query, scope, signal)).map(referenceRow)
+    const results = await Promise.allSettled(categories.map(kind => searchReferences(kind, trigger.query, scope, signal)))
+    if (results.every(item => item.status === 'rejected')) throw new Error('Reference suggestions unavailable')
+    const found = results.flatMap(item => item.status === 'fulfilled' ? item.value.slice(0, 2).map(referenceRow) : [])
+    return trigger.query ? found.slice(0, 8) : [...categoryRows, ...found.slice(0, 4)]
+  }
+  const candidates = filterCommands(trigger.query).map(item => ({ id: item.id, title: t(...item.title),
+    description: commandAvailable(item, command.state.value) ? t(...item.description) : t('Unavailable in the current state', '当前状态不可用'),
+    group: groupLabel(item.group), icon: 'command', command: item.name,
+    disabled: !commandAvailable(item, command.state.value) }))
+  if (trigger.kind !== 'add') return candidates
+  const attach = candidates.find(item => item.command === 'attach')!
+  let plugins: PaletteItem[] = []
+  try { plugins = (await searchReferences('plugin', '', scope, signal)).map(referenceRow) } catch { /* Commands and file upload remain local. / 命令和文件入口仍可使用。 */ }
+  const primary = ['new', 'model', 'mode', 'compact', 'export', 'tools', 'plugins', 'help']
+  return [{ ...attach, group: t('Add', '添加'), icon: 'file' },
+    ...primary.flatMap(name => candidates.filter(item => item.command === name).map(item => ({ ...item, group: t('Commands', '命令') }))),
+    ...categoryRows, ...candidates.filter(item => item.command !== 'attach' && !primary.includes(item.command)), ...plugins]
+}
+
+async function commitPalette(item: PaletteItem, trigger: ComposerTrigger) {
+  workError.value = ''
+  if (item.category) {
+    const text = '@' + item.category + ':'
+    draft.value = trigger.kind === 'add' ? draft.value + (draft.value && !/\s$/.test(draft.value) ? ' ' : '') + text : replaceToken(draft.value, trigger, text)
+    await focusComposer(draft.value.length)
+    palette.update()
+    return
+  }
+  if (item.reference) {
+    if (selectedReferences.value.length >= 8) { showWorkError(new Error(t('Select at most eight references.', '每条消息最多引用 8 项。'))); return }
+    if (!selectedReferences.value.some(entry => referenceKey(entry) === referenceKey(item.reference!))) selectedReferences.value.push(item.reference)
+    if (trigger.kind !== 'add') draft.value = replaceToken(draft.value, trigger)
+    await focusComposer(Math.min(trigger.start, draft.value.length))
+    return
+  }
+  if (item.command) {
+    const previous = draft.value
+    if (trigger.kind !== 'add') draft.value = replaceToken(draft.value, trigger)
+    if (!await command.run(item.command, item.argument ?? '')) draft.value = previous
+    if (!['model', 'attach'].includes(item.command) && !command.confirmation.value) await focusComposer(draft.value.length)
+  }
+}
+
+async function focusComposer(position = draft.value.length) {
+  await nextTick()
+  composer.value?.focus()
+  composer.value?.setSelectionRange(position, position)
+}
+
+function askCommandArguments(name: CommandName) {
+  draft.value = '/' + name + ' '
+  void focusComposer().then(() => {
+    if (name === 'rename') command.notice.value = { title: t('Rename conversation', '重命名会话'), lines: [t('Enter the title, then press Enter.', '输入标题后按 Enter。')] }
+    else palette.show({ kind: 'argument', command: name, query: '', start: 0, end: draft.value.length })
+  })
+}
+
+function stopCurrent() {
+  const controller = requestControllers.get(activeSession.value)
+  if (!controller) throw new Error(t('No active request in this conversation.', '当前会话没有正在运行的请求。'))
+  controller.abort()
+}
+
+async function retryCurrent(message: string) {
+  const target = session.value
+  const last = target?.turns.at(-1)
+  if (!target || !last || target.pendingReview) throw new Error(t('No message to retry, or approval is pending.', '没有可重试消息，或当前仍有待审批操作。'))
+  if (last.serverError && target.apiThreadId && !message) {
+    const controller = new AbortController()
+    requestControllers.set(target.id, controller)
+    workBusy.value = true
+    runningSessions.add(target.id)
+    runningTurnIds[target.id] = last.id
+    const previousError = last.serverError
+    const previousRun = last.serverRunId
+    let restored = last
+    last.serverError = undefined
+    try {
+      const result = await runStream(threadPath(target.apiThreadId) + '/resume', { stream: true }, last, controller.signal, run => {
+        restored = target.turns.find(item => item.serverRunId === run) ?? last
+        runningTurnIds[target.id] = restored.id
+        restored.serverError = undefined
+        return restored
+      })
+      restored = target.turns.find(item => item.serverRunId === result.run_id && item.prompt === result.message)
+        ?? target.turns.find(item => item.prompt === result.message && item !== last && item.serverError)
+        ?? restored
+      if (restored !== last) { last.serverError = previousError; last.serverRunId = previousRun }
+      if (result.message != null && restored.prompt !== result.message) {
+        restored.prompt = result.message
+        restored.files = []
+        restored.attachmentIds = []
+      }
+      restored.serverError = undefined
+      applyWorkReply(target, restored, result)
+      resetDraft()
+      // The archive supplies the authoritative prompt, attachment names and references.
+      // 归档提供权威原文、附件名称与引用，不能用修改后的草稿冒充原始请求。
+      runningSessions.delete(target.id)
+      await syncThreadMessages(target).catch(showWorkError)
+      return
+    } catch (error) {
+      if (restored !== last) { last.serverError = previousError; last.serverRunId = previousRun }
+      if (!(error instanceof ApiError && error.code === 'NO_PENDING_RUN')) { restored.serverError = error instanceof Error ? error.message : t('Retry failed.', '重试失败。'); throw error }
+      last.serverError = previousError
+      last.serverRunId = previousRun
+    } finally {
+      delete liveReplies.value[last.id]; delete liveReplies.value[restored.id]
+      workBusy.value = false; runningSessions.delete(target.id); requestControllers.delete(target.id)
+      delete runningTurnIds[target.id]
+    }
+  }
+  const turn: Turn = { id: crypto.randomUUID(), prompt: message || last.prompt, time: '',
+    files: [...last.files], attachmentIds: last.attachmentIds, references: last.references,
+    memory: settings.personalizedMemory, model: model.value, reasoningEffort: reasoningEffort.value,
+    ...(mode.value === 'work' ? { work: { ...work.value } } : {}) }
+  target.turns.push(turn)
+  resetDraft()
+  await sendToAgent(target, turn, [])
+}
+
+async function downloadDocument(artifact: ToolArtifact) {
+  try { await downloadArtifact(artifact) } catch (error) { showWorkError(error) }
+}
+
+async function confirmCommand() { await command.confirm(); await focusComposer() }
+function cancelCommand() { command.confirmation.value = null; void focusComposer() }
+function focusReference(index: number) { composerArea.value?.querySelectorAll<HTMLButtonElement>('.composer-references button')[index]?.focus() }
+
+function removeUnresolved() {
+  for (const item of unresolvedMentions(draft.value).reverse()) draft.value = draft.value.slice(0, item.start) + draft.value.slice(item.end)
+  referenceTextConfirm.value = false
+  void focusComposer()
+}
+
 function onComposerKey(event: KeyboardEvent) {
+  if (palette.keydown(event) || event.isComposing || event.keyCode === 229) return
+  if (composer.value?.selectionStart === 0 && composer.value.selectionEnd === 0 && selectedReferences.value.length) {
+    if (event.key === 'Backspace') { event.preventDefault(); selectedReferences.value.pop(); return }
+    if (event.key === 'ArrowLeft') { event.preventDefault(); focusReference(selectedReferences.value.length - 1); return }
+  }
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
     event.preventDefault()
     submit()
@@ -398,7 +768,7 @@ function onComposerKey(event: KeyboardEvent) {
       <div v-if="!empty" ref="transcript" class="transcript" :aria-label="t('Conversation', '对话记录')">
         <article v-for="turn in turns" :key="turn.id" class="chat-turn" :data-run-id="turn.serverRunId">
           <div class="user-message">
-            <div class="user-content"><div class="user-bubble"><MarkdownText v-if="turn.prompt" :text="turn.prompt" /><div v-if="turn.files.length" class="message-files"><FileIcon />{{ turn.files.join(', ') }}</div></div><div class="user-message-footer"><CopyMessage v-if="turn.prompt" :text="turn.prompt" /><time>{{ turn.time }}</time></div></div>
+            <div class="user-content"><div class="user-bubble"><MarkdownText v-if="turn.prompt" :text="turn.prompt" /><div v-if="turn.references?.length" class="reference-list"><ReferenceChip v-for="item in turn.references" :key="referenceKey(item)" :item="item" /></div><div v-if="turn.files.length" class="message-files"><FileIcon />{{ turn.files.join(', ') }}</div></div><div class="user-message-footer"><CopyMessage v-if="turn.prompt" :text="turn.prompt" /><time>{{ turn.time }}</time></div></div>
             <UserAvatar />
           </div>
           <div v-if="workRunning(turn) || waitingForReview(turn) || turn.serverReply || turn.serverError || turn.activity?.length" class="assistant-message">
@@ -413,7 +783,7 @@ function onComposerKey(event: KeyboardEvent) {
               <div class="activity-collapse" :class="{ 'activity-expanded': showActivity(turn) }" :inert="!showActivity(turn)">
                 <div class="activity-inner">
                   <div class="activity-trace">
-                    <RunActivityTrace :items="turn.activity ?? []" :interrupted="Boolean(turn.serverError && !workRunning(turn))" />
+                    <RunActivityTrace :items="turn.activity ?? []" :metrics="turn.metrics" :interrupted="Boolean(turn.serverError && !workRunning(turn))" />
                     <p v-if="workRunning(turn) && !turn.activity?.length" class="tool-line"><LoaderCircle class="loading-icon" />{{ t('Waiting for the Agent', '等待 Agent 返回') }}</p>
                     <p v-for="decision in turn.activity?.length ? [] : turn.toolDecisions" :key="decision.id" class="tool-line">
                       {{ decision.approved ? t('Approved', '已批准') : t('Rejected', '已拒绝') }} · {{ decision.names.join(', ') }}
@@ -444,7 +814,9 @@ function onComposerKey(event: KeyboardEvent) {
           <ul>
             <li v-for="(call, index) in pendingReview.calls" :key="index">
               <strong>{{ call.name }}</strong>
-              <pre>{{ JSON.stringify(call.arguments, null, 2) }}</pre>
+              <span v-if="call.risk"> · {{ riskLabel(call.risk, t) }}</span>
+              <p v-if="call.review_hint">{{ call.review_hint }}</p>
+              <details><summary>{{ t('View arguments', '查看参数') }}</summary><pre>{{ JSON.stringify(call.arguments, null, 2) }}</pre></details>
             </li>
           </ul>
           <div class="tool-review-actions">
@@ -454,17 +826,37 @@ function onComposerKey(event: KeyboardEvent) {
         </section>
       </div>
 
-      <div v-if="!archived" class="composer-region">
+      <div v-if="!archived" ref="composerArea" class="composer-region">
         <div v-if="empty" class="welcome-identity">
           <img class="welcome-mark" :src="brandAsset('mark.png')" alt="">
           <h1>{{ mode === 'work' ? t('What should we work on?', '我们要做什么？') : t('What’s on your mind?', '今天想聊点什么？') }}</h1>
         </div>
-        <form class="composer" :class="{ 'composer-with-files': files.length }" @submit.prevent="submit">
-          <textarea ref="composer" v-model="draft" rows="1" :placeholder="mode === 'work' ? t('Ask slothy to work…', '使用 slothy 工作…') : t('Ask slothy…', '询问 slothy…')" :aria-label="t('Message slothy', '发消息给 slothy')" @keydown="onComposerKey"></textarea>
+        <section v-if="command.confirmation.value" ref="confirmationArea" class="composer-command-card" role="region" :aria-label="command.confirmation.value.title">
+          <strong>{{ command.confirmation.value.title }}</strong><p>{{ command.confirmation.value.description }}</p>
+          <div><button type="button" class="quiet-button" @click="cancelCommand">{{ t('Cancel', '取消') }}</button><button type="button" class="quiet-button" @click="confirmCommand">{{ t('Confirm', '确认') }}</button></div>
+        </section>
+        <section v-if="referenceTextConfirm" class="composer-command-card" role="region" :aria-label="t('Unresolved references', '未解析的引用')">
+          <p>{{ t('Some @ references have not been selected. Send them as ordinary text?', '有尚未选择的 @ 引用，是否作为普通文本发送？') }}</p>
+          <div><button type="button" class="quiet-button" @click="referenceTextConfirm = false">{{ t('Cancel', '取消') }}</button><button type="button" class="quiet-button" @click="removeUnresolved">{{ t('Remove', '移除') }}</button><button type="button" class="quiet-button" @click="referenceTextConfirm = false; submit(true)">{{ t('Send as text', '作为文本发送') }}</button></div>
+        </section>
+        <section v-if="command.notice.value" class="composer-command-card composer-command-notice" role="status">
+          <header><strong>{{ command.notice.value.title }}</strong><button type="button" class="chat-icon" :aria-label="t('Dismiss', '关闭')" @click="command.notice.value = null"><X /></button></header>
+          <ul><li v-for="(line, index) in command.notice.value.lines" :key="index">{{ line }}</li></ul>
+          <button v-for="artifact in command.notice.value.artifacts" :key="artifact.id" type="button" class="quiet-button" @click="downloadDocument(artifact)"><FileIcon />{{ artifact.name }} · {{ artifact.bytes }} B</button>
+        </section>
+        <form class="composer" :class="{ 'composer-with-files': files.length || selectedReferences.length }" @submit.prevent="submit">
+          <ComposerPalette v-if="palette.trigger.value" :items="palette.items.value" :selected="palette.selected.value" :loading="palette.loading.value" :failed="palette.failed.value" :title="paletteTitle" @choose="palette.choose" @hover="palette.selected.value = $event" />
+          <div v-if="selectedReferences.length" class="reference-list composer-references"><ReferenceChip v-for="(item, index) in selectedReferences" :key="referenceKey(item)" :item="item" removable @remove="selectedReferences.splice(index, 1); focusComposer()" @keydown.right.prevent="focusComposer(0)" @keydown.left.prevent="focusReference(Math.max(0, index - 1))" /></div>
+          <textarea ref="composer" v-model="draft" rows="1" role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
+            :aria-expanded="Boolean(palette.trigger.value)" :aria-controls="palette.trigger.value ? 'composer-palette-list' : undefined"
+            :aria-activedescendant="palette.trigger.value && palette.items.value.length && !palette.loading.value ? 'composer-option-' + palette.selected.value : undefined"
+            :placeholder="mode === 'work' ? t('Ask slothy to work…', '使用 slothy 工作…') : t('Ask slothy…', '询问 slothy…')" :aria-label="t('Message slothy', '发消息给 slothy')"
+            @input="palette.update" @click="palette.update" @blur="palette.close()" @keyup.left="palette.update()" @keyup.right="palette.update()"
+            @compositionstart="palette.compositionStart" @compositionend="palette.compositionEnd" @keydown="onComposerKey"></textarea>
           <ul v-if="files.length" class="attachment-list"><li v-for="(file, index) in files" :key="index"><span>{{ file.name }}</span><button type="button" class="quiet-button" :aria-label="t('Remove attachment', '移除附件')" @click="files.splice(index, 1)"><X /></button></li></ul>
           <div class="composer-actions">
             <input ref="fileInput" type="file" multiple hidden @change="addFiles">
-            <button class="chat-icon composer-add" type="button" :title="t('Attach files', '添加附件')" :aria-label="t('Attach files', '添加附件')" @click="fileInput?.click()"><Plus /></button>
+            <button class="chat-icon composer-add" type="button" :title="t('Commands, files and references', '命令、文件与引用')" :aria-label="t('Commands, files and references', '命令、文件与引用')" :aria-expanded="palette.trigger.value?.kind === 'add'" aria-controls="composer-palette-list" @pointerdown.prevent @click="palette.toggleAdd"><Plus /></button>
             <label v-if="mode === 'work'" class="composer-select approval-select">
               <ShieldCheck aria-hidden="true" />
               <select v-model="work.approval" :aria-label="t('Approval mode', '审批模式')">
@@ -472,14 +864,12 @@ function onComposerKey(event: KeyboardEvent) {
                 <option value="every">{{ t('Approve each action', '逐项批准') }}</option>
               </select>
             </label>
-            <ModelPicker v-model="model" :items="models" :selected="selectedModel"
+            <ModelPicker ref="modelPicker" v-model="model" :items="models" :selected="selectedModel"
               :effort="reasoningEffort" @effort="setReasoningEffort" />
-            <button class="voice-button" type="submit" :disabled="workBusy || Boolean(pendingReview) || !canSend" :aria-label="t('Send message', '发送消息')"><Send /></button>
+            <button v-if="requestControllers.has(activeSession) && runningSessions.has(activeSession)" class="voice-button" type="button" :aria-label="t('Stop run', '停止运行')" @click="stopCurrent"><Square /></button>
+            <button v-else class="voice-button" type="submit" :disabled="workBusy || command.busy.value || Boolean(pendingReview) || !canSend" :aria-label="t('Send message', '发送消息')"><Send /></button>
           </div>
         </form>
-        <div v-if="mode === 'work'" class="work-dock">
-          <button type="button" class="dock-button" @click="fileInput?.click()"><Layers />{{ t('Files', '文件') }}</button>
-        </div>
         <ConversationStats :turns="turns" />
         <p v-if="workError" class="voice-status" role="alert">{{ workError }}</p>
         <p v-else-if="workBusy" class="voice-status" role="status">{{ t('Working…', '正在处理…') }}</p>
@@ -493,3 +883,15 @@ function onComposerKey(event: KeyboardEvent) {
     </AgentContextPanel>
   </main>
 </template>
+
+<style scoped>
+.reference-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.composer-references { width: 100%; margin: 6px 6px 0; }
+.composer-command-card { padding: 16px 18px; margin-bottom: 10px; border-radius: 16px; background: var(--neutral); font-size: 13px; }
+.composer-command-card p { margin: 7px 0 12px; color: var(--muted); line-height: 1.6; }
+.composer-command-card > div, .composer-command-card header { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.composer-command-card header { justify-content: space-between; }
+.composer-command-notice { max-height: 260px; overflow: auto; }
+.composer-command-notice ul { padding-left: 18px; line-height: 1.8; }
+.composer-command-card strong { font-weight: 500; }
+</style>

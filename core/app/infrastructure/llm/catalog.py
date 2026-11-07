@@ -1,4 +1,5 @@
-"""Public model capabilities and privately configured vendor connections."""
+"""Public model capabilities derived from privately configured vendor connections.
+/ 由私有配置的厂商连接生成的公开模型能力目录。"""
 
 from pydantic import BaseModel, ValidationError
 
@@ -13,6 +14,9 @@ OLDER_MODELS = {"deepseek": ("deepseek-v4-flash",), "mimo": ("mimo-v2.5", "mimo-
 
 
 class ModelItem(BaseModel):
+    """Public description of one selectable model.
+    / 一个可选模型的公开描述。"""
+
     id: str
     provider: str
     display_name: str | None = None
@@ -22,6 +26,18 @@ class ModelItem(BaseModel):
 
 
 def configured_models() -> dict[str, tuple[ModelItem, LLMSettings]]:
+    """Build the environment-configured catalog without exposing credentials.
+
+    Every readable vendor connection contributes its configured model plus the known
+    vendor models; invalid or missing vendor environments are skipped. Known models get
+    the documented context window and reasoning levels, and force stream usage so token
+    accounting stays accurate. / 每个可读的厂商连接贡献其配置模型与已知厂商模型；无效或缺失的
+    厂商环境会被跳过。已知模型使用文档化的上下文窗口与推理档位，并强制流式用量以保证计数准确。
+
+    Returns:
+        Mapping of model id to its public description and per-model settings.
+        / 模型 ID 到公开描述及该模型专用配置的映射。
+    """
     try:
         primary = LLMSettings()
     except (ValidationError, ValueError):

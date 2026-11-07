@@ -5,6 +5,7 @@ import { brandAsset } from './brand'
 
 defineProps<{ page: string; setupRequired: boolean }>()
 const version = __APP_VERSION__
+/** Settings navigation entries; routes are hash targets rendered by the shell. / 设置导航项；路由为壳层渲染的 hash 目标。 */
 const sections = [
   { route: 'settings', en: 'Appearance', zh: '外观', icon: Palette },
   { route: 'settings/language', en: 'Language', zh: '语言', icon: Languages },
@@ -13,6 +14,15 @@ const sections = [
   { route: 'settings/archives', en: 'Archived sessions', zh: '已归档会话', icon: Archive },
   { route: 'settings/about', en: 'About slothy', zh: '关于 slothy', icon: Info },
 ]
+/**
+ * Whether a settings section is disabled until an API provider is configured.
+ *
+ * 判断设置分区是否在配置 API 提供商前被禁用。
+ *
+ * @param route - Settings hash route for the section. / 该分区的设置 hash 路由。
+ * @param required - True while initial setup is still required. / 初始设置仍未完成时为 true。
+ * @returns True when the section should be locked. / 该分区应被锁定时返回 true。
+ */
 function locked(route: string, required: boolean) {
   return required && route !== 'settings/api' && route !== 'settings/about'
 }

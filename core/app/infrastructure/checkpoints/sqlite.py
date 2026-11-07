@@ -1,4 +1,5 @@
-"""SQLite 快照连接的生命周期。 / SQLite checkpoint connection lifecycle."""
+"""SQLite checkpoint connection lifecycle.
+/ SQLite 快照连接的生命周期。"""
 
 from types import TracebackType
 
@@ -10,22 +11,39 @@ from app.config import CheckpointSettings
 
 
 class SQLiteCheckpointStore:
-    """在应用启动/关闭边界管理 SQLite。 / Own SQLite at application startup/shutdown.
+    """Own the SQLite connection at application startup and shutdown.
 
     Args:
-        settings: 路径与锁等待，默认读环境。 / Path and lock timeout; environment defaults.
+        settings: Validated path and lock timeout; environment defaults when omitted.
+            / 已校验的路径与锁等待；省略时使用环境默认值。
 
-    中文：返回官方 Saver 供 Graph 注入；本模块不导入节点、State、模型或领域服务。
-    English: Yield the official saver for injection; never import nodes, state, models or domains.
+    Yields the official LangGraph saver for injection; this module never imports nodes,
+    state, models or domain services. / 返回官方 Saver 供 Graph 注入；本模块不导入节点、
+    State、模型或领域服务。
     """
 
     def __init__(self, settings: CheckpointSettings | None = None) -> None:
+        """Store the resolved settings and pending handles.
+
+        Args:
+            settings: Checkpoint settings; loaded from the environment when None.
+                / 快照配置；为 None 时读取环境。
+        """
         self.settings = settings if settings is not None else CheckpointSettings()
         self.connection: aiosqlite.Connection | None = None
         self.saver: AsyncSqliteSaver | None = None
 
     async def __aenter__(self) -> AsyncSqliteSaver:
-        """打开连接并初始化官方表。 / Open the connection and initialize official tables."""
+        """Open the database, apply PRAGMAs and initialize saver tables.
+
+        Returns:
+            The LangGraph SQLite saver bound to the opened connection.
+            / 绑定到已打开连接的 LangGraph SQLite Saver。
+        Raises:
+            RuntimeError: When the store is already open. / 存储已处于打开状态时抛出。
+            Exception: When the connection cannot be established; handles are closed first.
+                / 连接建立失败时抛出；抛出前会先关闭句柄。
+        """
         if self.connection is not None:
             raise RuntimeError("SQLiteCheckpointStore is already open")
         self.settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,8 +52,8 @@ class SQLiteCheckpointStore:
         )
         try:
             await self.connection
-            # 中文：PRAGMA 值只来自已校验整数；FULL 提交与 WAL 共同用于持久化。
             # English: PRAGMA values are validated integers; combine WAL with FULL commits.
+            # 中文：PRAGMA 值只来自已校验整数；FULL 提交与 WAL 共同用于持久化。
             async with self.connection.executescript(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"
                 f"PRAGMA busy_timeout={self.settings.busy_timeout_ms};"
@@ -48,8 +66,8 @@ class SQLiteCheckpointStore:
             await self.saver.setup()
             return self.saver
         except BaseException:
-            # 中文：启动失败或取消也关闭连接，避免残留工作线程与文件句柄。
             # English: Close on failure/cancellation to release worker threads and file handles.
+            # 中文：启动失败或取消也关闭连接，避免残留工作线程与文件句柄。
             await self.connection.close()
             self.connection = None
             self.saver = None
@@ -61,12 +79,12 @@ class SQLiteCheckpointStore:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """退出时关闭资源，不吞掉异常。 / Close resources without suppressing exceptions.
+        """Close the connection without suppressing exceptions.
 
         Args:
-            exc_type: 异常类型或 None。 / Exception type, or None.
-            exc: 原始异常或 None。 / Original exception, or None.
-            traceback: 原始调用栈或 None。 / Original traceback, or None.
+            exc_type: Exception type, or None. / 异常类型或 None。
+            exc: Original exception, or None. / 原始异常或 None。
+            traceback: Original traceback, or None. / 原始调用栈或 None。
         """
         if self.connection is not None:
             await self.connection.close()

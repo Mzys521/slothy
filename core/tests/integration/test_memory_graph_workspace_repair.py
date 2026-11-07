@@ -11,6 +11,7 @@ from langchain_core.runnables import RunnableLambda
 from app.agent.tools import create_builtin_tools
 from app.config import CheckpointSettings
 from tests.support.legacy_app import create_app
+from tests.support.profiles import attributes
 
 BASE = "/api/v1"
 
@@ -76,8 +77,18 @@ def test_multiline_learning_profile_injection_trace_and_reanalysis(tmp_path):
         assert history["used_memory_ids"] == answer["used_memory_ids"]
         assert history["profile_version"] == profile["version"]
         graph = client.get(BASE + "/graph").json()
-        assert graph["edges"] and all(edge["origin"] == "conversation" for edge in graph["edges"])
-        edge = graph["edges"][0]
+        assert graph["edges"] == []  # Shared source alone is not a semantic assertion.
+        nodes = graph["nodes"]
+        manual = client.put(
+            BASE + "/graph/links",
+            json={
+                "source_id": nodes[0]["id"],
+                "target_id": nodes[1]["id"],
+                "relation": "explicit-test-link",
+            },
+        )
+        assert manual.status_code == 200
+        edge = client.get(BASE + "/graph").json()["edges"][0]
         assert (
             client.delete(
                 BASE + "/graph/links",
@@ -105,6 +116,8 @@ def test_manual_profile_memory_scopes_conflicts_archive_restore_and_erasure(tmp_
     app = application(tmp_path, inputs)
     with TestClient(app) as client:
         ids = []
+        client.post(BASE + "/workspaces", json={"id": "alpha", "name": "Alpha"})
+        client.post(BASE + "/workspaces", json={"id": "beta", "name": "Beta"})
         source_thread = client.post(BASE + "/threads", json={}).json()["thread_id"]
         for title, content, scope, ref in [
             ("饮品", "我喜欢喝咖啡", "global", None),
@@ -145,15 +158,24 @@ def test_manual_profile_memory_scopes_conflicts_archive_restore_and_erasure(tmp_
             BASE + "/memories",
             json={"title": "饮品", "content": "我不喜欢喝咖啡", "type": "preference"},
         ).json()
-        assert client.get(BASE + "/memories/" + ids[0]).json()["status"] == "archived"
+        assert client.get(BASE + "/memories/" + ids[0]).json()["status"] == "superseded"
         assert any(
             item["id"] == ids[0]
-            for item in client.get(BASE + "/memories?status=archived").json()["items"]
+            for item in client.get(BASE + "/memories?status=superseded").json()["items"]
         )
         assert (
-            client.patch(BASE + "/memories/" + ids[0], json={"status": "active"}).status_code == 200
+            client.patch(BASE + "/memories/" + ids[0], json={"status": "active"}).status_code == 409
         )
-        assert client.get(BASE + "/memories/" + newer["id"]).json()["status"] == "archived"
+        assert client.get(BASE + "/memories/" + newer["id"]).json()["status"] == "active"
+        assert (
+            client.patch(BASE + "/memories/" + newer["id"], json={"status": "archived"}).status_code
+            == 200
+        )
+        assert (
+            client.patch(BASE + "/memories/" + newer["id"], json={"status": "active"}).status_code
+            == 200
+        )
+        assert client.delete(BASE + "/memories/" + newer["id"]).status_code == 204
         assert client.delete(BASE + "/memories/" + ids[0]).status_code == 204
         deleted_profile = client.get(BASE + "/profile").json()
         assert deleted_profile["removed_attributes"] == 1
@@ -223,7 +245,10 @@ def test_profile_history_pagination_retention_conflict_and_capacity(tmp_path):
         for version in range(205):
             result = client.patch(
                 BASE + "/profile",
-                json={"expected_version": version, "preferences": {"answer_detail": str(version)}},
+                json={
+                    "expected_version": version,
+                    "attributes": attributes({"answer_detail": str(version)}),
+                },
             )
             assert result.status_code == 200
         first = client.get(BASE + "/profile/versions").json()
@@ -239,23 +264,24 @@ def test_profile_history_pagination_retention_conflict_and_capacity(tmp_path):
         assert len(client.get(BASE + "/profile/versions?limit=200").json()["items"]) == 200
         assert client.get(BASE + "/profile/versions/1").status_code == 404
         assert (
-            client.patch(BASE + "/profile", json={"expected_version": 0, "preferences": {}}).json()[
-                "code"
-            ]
+            client.patch(
+                BASE + "/profile", json={"expected_version": 0, "attributes": attributes({})}
+            ).json()["code"]
             == "VERSION_CONFLICT"
         )
 
         async def seed_capacity():
             await app.state.workspace.connection.execute(
-                "INSERT INTO workspace_profiles (user_id,version,profile_json,change_summary) "
+                "INSERT INTO workspace_profiles (user_id,version,attributes_json,change_summary) "
                 "VALUES (?,?,?,?)",
-                ("local-user", 2**63 - 2, "{}", "capacity boundary"),
+                ("local-user", 2**63 - 2, "[]", "capacity boundary"),
             )
 
         client.portal.call(seed_capacity)
         assert (
             client.patch(
-                BASE + "/profile", json={"expected_version": 2**63 - 2, "preferences": {}}
+                BASE + "/profile",
+                json={"expected_version": 2**63 - 2, "attributes": attributes({})},
             ).json()["code"]
             == "PROFILE_VERSION_LIMIT"
         )
@@ -300,7 +326,7 @@ def test_review_can_replace_an_existing_generic_attribute_without_erasing_other_
             },
         )
         assert accepted.status_code == 200
-        assert client.get(BASE + "/memories/" + old["id"]).json()["status"] == "archived"
+        assert client.get(BASE + "/memories/" + old["id"]).json()["status"] == "superseded"
         profile = client.get(BASE + "/profile").json()
         assert len(profile["attributes"]) == 2
         assert any(attribute["memory_id"] == other["id"] for attribute in profile["attributes"])
@@ -337,8 +363,8 @@ class WorkspaceModel:
             tool_calls=[
                 {
                     "id": "call-test",
-                    "name": "run_command",
-                    "args": {"command": command, "arguments": [argument]},
+                    "name": "workspace_write" if command == "mkdir" else "workspace_read",
+                    "args": {"action": "mkdir" if command == "mkdir" else "read", "path": argument},
                 }
             ],
         )
