@@ -20,6 +20,9 @@ let calls = 0
 let fileRead = false
 const sdkRequests = []
 const memoryRequests = []
+const parallelStarted = new Set()
+let releaseParallel
+const parallelGate = new Promise(resolve => { releaseParallel = resolve })
 const documentCode = [
   'from pathlib import Path', "Path('verification.txt').write_text('SLOTHY_DOCUMENT_OK', encoding='utf-8')",
   'from docx import Document', "d=Document(); d.add_paragraph('slothy'); d.save('verification.docx')",
@@ -46,6 +49,10 @@ const upstream = createServer(async (request, response) => {
   if (isMemory) assert.ok(!body.tools?.length, 'memory learning must not receive executable tools')
   else assert.ok(body.tools.length)
   const prompt = body.messages.filter(message => message.role === 'user' && !message.name).at(-1)?.content || ''
+  if (String(prompt).startsWith('RUNTIME_PARALLEL_')) {
+    parallelStarted.add(prompt)
+    await parallelGate
+  }
   const toolResults = body.messages.filter(message => message.role === 'tool')
   let content = 'SLOTHY_CONNECTED'
   let toolCall
@@ -74,6 +81,8 @@ const upstream = createServer(async (request, response) => {
     if (identity) facts.push({ ...common, kind: 'identity', key: 'identity.name', title: '姓名',
       content: '用户姓名是林舟', value: '林舟', evidence: [{ turn: identity.turn, quote: identity.text }] })
     content = JSON.stringify({ concepts, facts })
+  } else if (String(prompt).startsWith('RUNTIME_PARALLEL_')) {
+    content = prompt + '_OK'
   } else if (String(prompt).includes('CALCULATE') && !toolResults.length) {
     toolCall = { id: 'call-calculator', type: 'function', function: { name: 'calculate', arguments: JSON.stringify({ operation: 'add', a: 2, b: 3 }) } }
   } else if (String(prompt).includes('DOCUMENT') && !toolResults.length) {
@@ -175,6 +184,25 @@ try {
   assert.ok(events.includes('event: activity'))
   assert.ok(events.includes('event: delta'))
   assert.ok(events.includes('event: done'))
+
+  const parallelThreads = await Promise.all(['chat', 'work'].map(mode => request('/threads', 'POST', { mode })))
+  const parallelRuns = parallelThreads.map((item, index) => request('/chat', 'POST', {
+    thread_id: item.thread_id, mode: index ? 'work' : 'chat', message: 'RUNTIME_PARALLEL_' + index, personalization_enabled: false,
+  }))
+  let parallelResults
+  try {
+    for (let attempt = 0; attempt < 200 && parallelStarted.size < 2; attempt++) await new Promise(resolve => setTimeout(resolve, 40))
+    assert.equal(parallelStarted.size, 2, 'Frozen Chat and Work must enter the model concurrently')
+  } finally {
+    releaseParallel()
+    parallelResults = await Promise.all(parallelRuns)
+  }
+  for (let index = 0; index < 2; index++) {
+    assert.equal(parallelResults[index].response, 'RUNTIME_PARALLEL_' + index + '_OK')
+    const archived = (await request('/threads/' + parallelThreads[index].thread_id + '/messages')).items
+    assert.equal(archived.length, 1)
+    assert.equal(archived[0].response, parallelResults[index].response)
+  }
 
   const pending = await request('/chat', 'POST', { message: 'DOCUMENT', mode: 'work' })
   assert.ok(pending.approval_id)
@@ -338,8 +366,9 @@ try {
   assert.equal((await request('/runtime')).data_epoch, cacheRuntime.data_epoch)
   const afterRestartName = await request('/chat', 'POST', { message: '我叫什么名字？' })
   assert.ok(!afterRestartName.response.includes('林舟'))
-  console.log('Frozen runtime acceptance passed: SDK/tools/SSE/review/documents, composer, cache revocation, semantic concepts and independent relationship reinforcement, deterministic identity, deletion, evidence, data epoch and restart persistence.')
+  console.log('Frozen runtime acceptance passed: concurrent Chat/Work with isolated archives, SDK/tools/SSE/review/documents, composer, cache revocation, semantic concepts and independent relationship reinforcement, deterministic identity, deletion, evidence, data epoch and restart persistence.')
 } finally {
+  releaseParallel()
   await stopBackend(backend)
   upstream.closeAllConnections()
   await new Promise(resolve => upstream.close(resolve))

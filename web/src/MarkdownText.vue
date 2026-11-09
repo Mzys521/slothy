@@ -126,22 +126,24 @@ function syncTheme() {
   }
 }
 /**
- * Resize a preview iframe to the height reported by its sandboxed document.
- * 根据沙箱文档上报的高度调整预览 iframe。
+ * Resize SVG previews from authenticated frame messages; HTML keeps its fixed viewport.
+ * 根据已验证来源的消息调整 SVG 预览；HTML 保持固定视口。
  *
  * @param event - Message event sent by a preview iframe. / 预览 iframe 发送的消息事件。
  */
 function resize(event: MessageEvent) {
   if (event.data?.kind !== 'reply-preview-size' || !Number.isFinite(event.data.height)) return
   for (const frame of container.value?.querySelectorAll<HTMLIFrameElement>('iframe[data-preview-id]') ?? []) {
-    if (event.source === frame.contentWindow && event.data.id === frame.dataset.previewId) {
+    // HTML has a fixed CSS viewport, so animations cannot resize the surrounding turn.
+    // HTML 使用固定 CSS 视口，动画不能改变外部对话气泡的尺寸。
+    if (!frame.classList.contains('reply-html') && event.source === frame.contentWindow && event.data.id === frame.dataset.previewId) {
       frame.style.height = Math.max(1, Math.min(100000, event.data.height)) + 'px'
     }
   }
 }
 // Re-sync preview themes after a re-render or a theme, font or mode change.
 // 重新渲染，或主题、字体、模式变化后，重新同步预览主题。
-watch([rendered, () => settings.mode, () => settings.palette, () => settings.font], () => { void nextTick(syncTheme) })
+watch([rendered, () => settings.mode, () => settings.palette, () => settings.customAccent, () => settings.font], () => { void nextTick(syncTheme) })
 // Preview iframes report their height and need theme updates while this component is mounted.
 // 预览 iframe 会回报高度，且在本组件挂载期间需要主题更新。
 onMounted(() => { window.addEventListener('message', resize); media.addEventListener('change', syncTheme); syncTheme() })

@@ -1,5 +1,6 @@
 import { computed, ref, watch, type Ref } from 'vue'
 import { activeSession, activeWorkspace, runningSessions, selectWorkspace, workspaces, type ChatMode, type Session, type Turn } from '../chat'
+import { pendingSessionCommands } from '../sessionRuns'
 import { settings, t } from '../preferences'
 import { threadPath, workRequest, type ModelItem, type ToolArtifact, type ToolResult } from '../workApi'
 import { commandAvailable, commands, executeCommand, findCommand, validateArgument } from '../commands/registry'
@@ -28,7 +29,7 @@ export interface CommandNotice { title: string; lines: string[]; artifacts?: Too
 export function useComposerCommands(host: Host) {
   const notice = ref<CommandNotice | null>(null)
   const confirmation = ref<{ title: string; description: string; action: () => Promise<boolean> } | null>(null)
-  const busy = ref(false)
+  const busy = computed(() => pendingSessionCommands.has(activeSession.value))
   const state = computed(() => ({ running: host.busy.value || runningSessions.has(activeSession.value),
     hasSession: Boolean(host.session.value?.apiThreadId), archived: Boolean(host.session.value?.archived) }))
   const tell = (title: string, ...lines: string[]) => { notice.value = { title, lines } }
@@ -41,8 +42,9 @@ export function useComposerCommands(host: Host) {
     new: () => host.create(),
     rename: async title => {
       if (!title || title.length > 80) throw new Error(t('Enter a title of 1–80 characters.', '请输入 1–80 字的标题。'))
+      const target = host.session.value!
       await workRequest(currentThread(), 'PATCH', { title })
-      host.session.value!.title = title
+      target.title = title
       tell(t('Conversation renamed', '会话已重命名'), title)
     },
     stop: () => host.stop(),
@@ -98,7 +100,8 @@ export function useComposerCommands(host: Host) {
       t('↑ ↓ / Home / End browse · Enter / Tab select · Esc close · Shift+Enter newline', '↑ ↓ / Home / End 浏览 · Enter / Tab 选择 · Esc 关闭 · Shift+Enter 换行')),
   }
   async function perform(name: CommandName, argument: string) {
-    busy.value = true
+    const owner = activeSession.value
+    if (name !== 'stop') pendingSessionCommands.add(owner)
     const thread = host.session.value?.apiThreadId
     try {
       await executeCommand(name, argument, { ...state.value, actions })
@@ -107,8 +110,8 @@ export function useComposerCommands(host: Host) {
           .catch(() => {}) // Audit transport must not repeat a completed action. / 审计失败不得重做已完成操作。
       }
       return true
-    } catch (error) { host.error(error); return false }
-    finally { busy.value = false }
+    } catch (error) { if (owner === activeSession.value) host.error(error); return false }
+    finally { if (name !== 'stop') pendingSessionCommands.delete(owner) }
   }
   async function run(name: string, argument = '') {
     if (busy.value && name !== 'stop') { host.error(new Error(t('Wait for the current command.', '请等待当前命令完成。'))); return false }

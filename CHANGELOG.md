@@ -9,6 +9,27 @@ the four-part Windows version followed by a prerelease suffix.
 > 0.1.0 – 0.3.0). This line continues with the current desktop application and
 > keeps that history for reference.
 
+## [0.1.4.1-exp.2] — 2026-11-09
+
+Development exploration prerelease. Not production-stable; use with backups.
+
+### Fixed
+
+- **P0 — multi-session isolation**: shared busy, command and live-output state could block
+  another conversation or lose its visible output after navigation. Requests and cleanup
+  now belong to their session; stopping or retrying one conversation leaves others running.
+  Exact session locks replace the colliding fixed lock pool, and disconnect cleanup reaps
+  only that run's graph/model tasks. Same-session writes remain serialized.
+- **P1 — HTML preview stability**: interactive replies use a fixed viewport (60% of window
+  height, bounded to 240–560 CSS px) with internal scrolling, so content animation cannot
+  resize the surrounding message bubble.
+- **P1 — SVG theme fills**: neutral fills, text, strokes and gradient stops follow the
+  current appearance, including modern CSS color syntax and live system-theme changes.
+  Semantic colors, transparent fills and `fill="none"` are preserved.
+- **Memory suggestion confirmation**: suggestions with an ambiguous skill target can now
+  be edited and confirmed; the confirm button enables after a real content/profile change,
+  and the action buttons no longer clip.
+
 ## [0.1.4.1-exp.1] — 2026-11-09
 
 Development exploration prerelease. Not production-stable; use with backups.

@@ -166,6 +166,23 @@ function review(item: Suggestion, action: 'confirm' | 'ignore') {
 }
 
 /**
+ * Decides whether the confirm action can run for one suggestion.
+ *
+ * 判断一条建议是否允许确认。技能目标不明确时，必须先在编辑态修改内容或目标属性，
+ * 以编辑后的值走人工确认路径；普通未编辑的歧义建议仍保持禁用并提示先修改。
+ *
+ * @param item - Suggestion being reviewed. / 正在审核的建议。
+ * @returns True when the confirm button should be disabled. / 确认按钮应禁用时返回 true。
+ */
+function confirmDisabled(item: Suggestion) {
+  if (busy.value) return true
+  if (editing.value !== item.id) return item.pending_reason === 'ambiguous_target'
+  const changed = draft.value.trim() !== item.value.trim()
+    || Boolean(draftKey.value && draftKey.value !== item.profile_key)
+  return draft.value.trim().length < 2 || !changed
+}
+
+/**
  * Loads one historical profile version for comparison with the current one.
  *
  * 加载一个历史画像版本，用于与当前版本对比。
@@ -200,7 +217,7 @@ async function showVersion(version: number) {
       <p v-if="!suggestions.length && !loading" class="muted">{{ t('No suggestions waiting for review.', '暂无待审核建议。') }}</p>
       <article v-for="item in suggestions" :key="item.id" class="memory-review-item">
         <h3>{{ item.title }}</h3>
-        <p class="muted">{{ dimensionName(item.dimension) }} · {{ memoryScope(item.scope, t) }}</p><p v-if="item.pending_reason" class="muted">{{ item.pending_reason === 'ambiguous_target' ? t('The skill target is unclear. Add a target-specific fact before confirming.', '技能对象不明确，请先补充带对象的事实。') : t('Capacity is full; review protected facts first.', '容量已满，请先检查受保护的事实。') }}</p>
+        <p class="muted">{{ dimensionName(item.dimension) }} · {{ memoryScope(item.scope, t) }}</p><p v-if="item.pending_reason" class="muted">{{ item.pending_reason === 'ambiguous_target' ? t('The skill target is unclear. Edit and confirm this suggestion with a target-specific value.', '技能对象不明确，请修改后以带对象的内容确认。') : t('Capacity is full; review protected facts first.', '容量已满，请先检查受保护的事实。') }}</p>
         <label v-if="editing === item.id">
           {{ t('Proposed memory', '建议记忆') }}
           <textarea v-model="draft" maxlength="800" rows="2"></textarea>
@@ -212,7 +229,7 @@ async function showVersion(version: number) {
           </select>
           <small class="muted">{{ t('Choose an existing attribute when this statement changes an earlier preference.', '如果这条陈述改变了先前的偏好，请选择对应的已有属性。') }}</small>
         </label>
-        <p v-else>{{ item.value }}</p>
+        <p v-if="editing !== item.id">{{ item.value }}</p>
         <details>
           <summary>{{ t('Evidence', '原始证据') }} ({{ item.evidence.length }})</summary>
           <blockquote v-for="entry in item.evidence" :key="entry.thread_id + entry.run_id">
@@ -224,7 +241,7 @@ async function showVersion(version: number) {
         <footer>
           <button class="quiet-button" :disabled="busy" @click="review(item, 'ignore')">{{ t('Ignore', '忽略') }}</button>
           <button v-if="editing !== item.id" class="outline-button" :disabled="busy" @click="editing = item.id; draft = item.value; draftKey = item.profile_key">{{ t('Edit', '修改') }}</button>
-          <button class="accent-button" :disabled="busy || item.pending_reason === 'ambiguous_target' || (editing === item.id && draft.trim().length < 2)" @click="review(item, 'confirm')">{{ t('Confirm memory', '确认记忆') }}</button>
+          <button class="accent-button" :disabled="confirmDisabled(item)" @click="review(item, 'confirm')">{{ t('Confirm memory', '确认记忆') }}</button>
         </footer>
       </article>
     </section>

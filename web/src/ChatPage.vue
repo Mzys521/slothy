@@ -21,6 +21,7 @@ import ReferenceChip from './composer/ReferenceChip.vue'
 import { useComposerPalette } from './composer/useComposerPalette'
 import { useComposerCommands } from './composer/useComposerCommands'
 import type { PaletteItem } from './composer/types'
+import { beginSessionRequest, finishSessionRequest, liveReplies, liveReasoning, pendingSessionActions } from './sessionRuns'
 import { commandAvailable, filterCommands, findCommand, parseCommand } from './commands/registry'
 import type { CommandName } from './commands/types'
 import { searchReferences } from './references/providers'
@@ -70,9 +71,7 @@ function setReasoningEffort(value: string) {
 const transcript = ref<HTMLElement>()
 const composer = ref<HTMLTextAreaElement>()
 const fileInput = ref<HTMLInputElement>()
-const workBusy = ref(false)
-const liveReplies = ref<Record<string, string>>({})
-const liveReasoning = ref<Record<string, string>>({})
+const workBusy = computed(() => runningSessions.has(activeSession.value) || pendingSessionActions.has(activeSession.value))
 const workError = ref('')
 const selectedReferences = ref<ReferenceItem[]>([])
 const referenceTextConfirm = ref(false)
@@ -126,6 +125,13 @@ onUnmounted(() => {
   resetDraft()
 })
 const turns = computed(() => session.value?.turns ?? [])
+watch([
+  () => { const id = runningTurnIds[activeSession.value]; return id ? liveReplies.value[id] : undefined },
+  () => { const id = runningTurnIds[activeSession.value]; return id ? liveReasoning.value[id] : undefined },
+], () => {
+  const area = transcript.value
+  if (area && area.scrollHeight - area.scrollTop - area.clientHeight < 100) scrollToEnd()
+})
 const empty = computed(() => !turns.value.length)
 const canSend = computed(() => Boolean(draft.value.trim() || files.value.length || selectedReferences.value.length))
 // Reload pending review and transcript whenever the selected session changes.
@@ -266,7 +272,7 @@ function applyWorkReply(target: Session, turn: Turn, result: ToolReview | WorkRe
     turn.profileVersion = result.profile_version
     if (turn.memory && target.apiThreadId) void loadMemoryReceipts(target.apiThreadId, turn, result.run_id)
   }
-  scrollToEnd()
+  if (!disposed && target.id === activeSession.value) scrollToEnd()
 }
 /**
  * Stream one agent request and fold activity and delta events into the turn.
@@ -277,7 +283,7 @@ function applyWorkReply(target: Session, turn: Turn, result: ToolReview | WorkRe
  * @param turn - Turn whose live state is updated while streaming. / 流式过程中持续更新的轮次。
  * @returns The final work reply or approval request. / 最终的回复或审批请求。
  */
-function runStream(path: string, body: object, turn: Turn, signal?: AbortSignal, resolveTurn?: (run: string) => Turn) {
+function runStream(owner: string, path: string, body: object, turn: Turn, signal?: AbortSignal, resolveTurn?: (run: string) => Turn) {
   let toolCount = turn.activity?.filter(entry => entry.kind === 'tool').length ?? 0
   return streamWorkRequest(path, body, update => {
     if (update.event === 'activity') {
@@ -294,7 +300,7 @@ function runStream(path: string, body: object, turn: Turn, signal?: AbortSignal,
       liveReplies.value[turn.id] = (liveReplies.value[turn.id] ?? '') + update.text
     }
     const area = transcript.value
-    if (area && area.scrollHeight - area.scrollTop - area.clientHeight < 100) scrollToEnd()
+    if (!disposed && owner === activeSession.value && area && area.scrollHeight - area.scrollTop - area.clientHeight < 100) scrollToEnd()
   }, signal)
 }
 /**
@@ -329,13 +335,9 @@ async function loadMemoryReceipts(thread: string, turn: Turn, run: string) {
  */
 async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
   const agentMode = turn.work ? 'work' : 'chat'
-  workBusy.value = true
-  runningSessions.add(target.id)
-  runningTurnIds[target.id] = turn.id
+  const controller = beginSessionRequest(target.id, turn.id)
   workError.value = ''
   const startedAt = performance.now()
-  const controller = new AbortController()
-  requestControllers.set(target.id, controller)
   try {
     if (!target.apiThreadId) {
       const input = { mode: agentMode, title: target.title }
@@ -350,7 +352,7 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
       attachmentIds.push(attachment.id)
     }
     turn.attachmentIds = attachmentIds
-    const result = await runStream('/chat', {
+    const result = await runStream(target.id, '/chat', {
       stream: true,
       attachment_ids: attachmentIds,
       references: (turn.references ?? []).map(referencePayload),
@@ -364,19 +366,14 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
     applyWorkReply(target, turn, result)
   } catch (cause) {
     turn.serverError = controller.signal.aborted ? t('Run stopped. Use /retry to resume.', '已停止运行，可使用 /retry 恢复。') : cause instanceof Error ? cause.message : t('Could not get a reply.', '无法获取回复。')
-    if (target.id === activeSession.value && !draft.value && !files.value.length) {
+    if (!disposed && target.id === activeSession.value && !draft.value && !files.value.length) {
       draft.value = turn.prompt
       files.value = uploads
       selectedReferences.value = [...(turn.references ?? [])]
     }
     if (target.apiThreadId) await refreshReview(target)
   } finally {
-    delete liveReplies.value[turn.id]
-    delete liveReasoning.value[turn.id]
-    runningSessions.delete(target.id)
-    delete runningTurnIds[target.id]
-    requestControllers.delete(target.id)
-    workBusy.value = false
+    finishSessionRequest(target.id, controller)
   }
 }
 /**
@@ -391,16 +388,12 @@ async function resolveReview(approved: boolean) {
   const turn = target?.turns.find(item => item.serverRunId === review?.run_id) ?? target?.turns.at(-1)
   if (!target?.apiThreadId || !review || !turn || workBusy.value || runningSessions.has(target.id) || archived.value) return
   activityOpen.value.delete(turn.id)
-  workBusy.value = true
-  runningSessions.add(target.id)
-  runningTurnIds[target.id] = turn.id
+  const controller = beginSessionRequest(target.id, turn.id)
   workError.value = ''
   turn.serverError = undefined
   const startedAt = performance.now()
-  const controller = new AbortController()
-  requestControllers.set(target.id, controller)
   try {
-    const result = await runStream(
+    const result = await runStream(target.id,
       threadPath(target.apiThreadId) + '/approval/' + encodeURIComponent(review.approval_id) + '?stream=true',
       { approved }, turn, controller.signal,
     )
@@ -410,12 +403,7 @@ async function resolveReview(approved: boolean) {
     turn.serverError = cause instanceof Error ? cause.message : t('Could not resume the Agent.', '无法继续执行 Agent。')
     await refreshReview(target)
   } finally {
-    delete liveReplies.value[turn.id]
-    delete liveReasoning.value[turn.id]
-    runningSessions.delete(target.id)
-    delete runningTurnIds[target.id]
-    requestControllers.delete(target.id)
-    workBusy.value = false
+    finishSessionRequest(target.id, controller)
   }
 }
 /** Start a fresh session in the current mode and focus the composer. / 以当前模式新建会话并聚焦输入框。 */
@@ -509,7 +497,7 @@ function openFromHistory(id: string) {
 async function clearCurrent() {
   if (!session.value || archived.value || workBusy.value) return
   const id = session.value.id
-  workBusy.value = true
+  pendingSessionActions.add(id)
   try {
     await clearSession(id)
     if (id === activeSession.value) {
@@ -518,9 +506,9 @@ async function clearCurrent() {
       void nextTick(() => composer.value?.focus())
     }
   } catch (cause) {
-    showWorkError(cause)
+    if (id === activeSession.value) showWorkError(cause)
   } finally {
-    workBusy.value = false
+    pendingSessionActions.delete(id)
   }
 }
 /**
@@ -723,18 +711,16 @@ async function retryCurrent(message: string) {
   const target = session.value
   const last = target?.turns.at(-1)
   if (!target || !last || target.pendingReview) throw new Error(t('No message to retry, or approval is pending.', '没有可重试消息，或当前仍有待审批操作。'))
+  const retryOptions = { memory: settings.personalizedMemory, model: model.value, reasoningEffort: reasoningEffort.value,
+    ...(target.mode === 'work' ? { work: { ...work.value } } : {}) }
   if (last.serverError && target.apiThreadId && !message) {
-    const controller = new AbortController()
-    requestControllers.set(target.id, controller)
-    workBusy.value = true
-    runningSessions.add(target.id)
-    runningTurnIds[target.id] = last.id
+    const controller = beginSessionRequest(target.id, last.id)
     const previousError = last.serverError
     const previousRun = last.serverRunId
     let restored = last
     last.serverError = undefined
     try {
-      const result = await runStream(threadPath(target.apiThreadId) + '/resume', { stream: true }, last, controller.signal, run => {
+      const result = await runStream(target.id, threadPath(target.apiThreadId) + '/resume', { stream: true }, last, controller.signal, run => {
         restored = target.turns.find(item => item.serverRunId === run) ?? last
         runningTurnIds[target.id] = restored.id
         restored.serverError = undefined
@@ -751,11 +737,13 @@ async function retryCurrent(message: string) {
       }
       restored.serverError = undefined
       applyWorkReply(target, restored, result)
-      resetDraft()
+      if (!disposed && target.id === activeSession.value) resetDraft()
       // The archive supplies the authoritative prompt, attachment names and references.
       // 归档提供权威原文、附件名称与引用，不能用修改后的草稿冒充原始请求。
-      runningSessions.delete(target.id)
-      await syncThreadMessages(target).catch(showWorkError)
+      if (finishSessionRequest(target.id, controller)) {
+        delete liveReplies.value[last.id]; delete liveReasoning.value[last.id]
+      }
+      await syncThreadMessages(target).catch(error => { if (!disposed && target.id === activeSession.value) showWorkError(error) })
       return
     } catch (error) {
       if (restored !== last) { last.serverError = previousError; last.serverRunId = previousRun }
@@ -763,18 +751,16 @@ async function retryCurrent(message: string) {
       last.serverError = previousError
       last.serverRunId = previousRun
     } finally {
-      delete liveReplies.value[last.id]; delete liveReplies.value[restored.id]
-    delete liveReasoning.value[last.id]; delete liveReasoning.value[restored.id]
-      workBusy.value = false; runningSessions.delete(target.id); requestControllers.delete(target.id)
-      delete runningTurnIds[target.id]
+      if (finishSessionRequest(target.id, controller)) {
+        delete liveReplies.value[last.id]; delete liveReasoning.value[last.id]
+      }
     }
   }
   const turn: Turn = { id: crypto.randomUUID(), prompt: message || last.prompt, time: '',
     files: [...last.files], attachmentIds: last.attachmentIds, references: last.references,
-    memory: settings.personalizedMemory, model: model.value, reasoningEffort: reasoningEffort.value,
-    ...(mode.value === 'work' ? { work: { ...work.value } } : {}) }
+    ...retryOptions }
   target.turns.push(turn)
-  resetDraft()
+  if (!disposed && target.id === activeSession.value) resetDraft()
   await sendToAgent(target, turn, [])
 }
 

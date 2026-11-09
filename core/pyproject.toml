@@ -9,6 +9,7 @@ description = "Backend for the Personalized Adaptive Agent"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.22,<1",
+    "anyio>=4.6,<5",
     "fastapi>=0.136,<1",
     "httpx>=0.28,<1",
     "langchain-core>=1.6.0,<2",

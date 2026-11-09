@@ -4,10 +4,12 @@
  * 客户端会话存储：会话、轮次、工作区及其与服务端的同步。
  */
 
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { readLocal, t, writeLocal } from './preferences'
 import { ApiError, threadPath, workRequest, type MemoryTrace, type MemoryReceipt, type RunActivity, type RunMetrics, type ToolReview } from './workApi'
 import type { ReferenceItem } from './references/types'
+import { pendingSessionActions, pendingSessionCommands, runningRequests, runningSessions, runningTurnIds, liveReplies, liveReasoning } from './sessionRuns'
+export { runningRequests, runningSessions, runningTurnIds } from './sessionRuns'
 
 /** Chat surface mode; `work` enables tools and approvals. / 对话界面模式；`work` 会启用工具与审批。 */
 export type ChatMode = 'chat' | 'work'
@@ -139,10 +141,6 @@ if (existingDraft) {
 }
 export const activeSession = ref(sessions.value.some(session => !session.archived &&
   session.id === savedSession && sessionWorkspace(session) === activeWorkspace.value) ? savedSession : '')
-export const runningSessions = reactive(new Set<string>())
-// Live request handles are memory-only and survive page navigation. / 运行句柄只留内存，跨页面保留。
-export const runningRequests = new Map<string, AbortController>()
-export const runningTurnIds = reactive<Record<string, string>>({})
 let deletionVersion = 0
 watch(activeWorkspace, value => writeLocal('adaptive.activeWorkspace', value))
 watch(sessions, value => writeLocal('adaptive.sessions', value), { deep: true })
@@ -344,13 +342,18 @@ async function fetchThreads(archived: boolean) {
  */
 export async function syncThreads() {
   const version = deletionVersion
+  const knownRemoteIds = new Set(sessions.value.flatMap(item => item.apiThreadId ? [item.apiThreadId] : []))
   const pages = await Promise.all([fetchThreads(false), fetchThreads(true)])
   // A deletion during the request invalidates this snapshot.
   // 请求期间发生的删除会让本次快照失效。
   if (version !== deletionVersion) return
   const existing = new Map(sessions.value.filter(item => item.apiThreadId).map(item => [item.apiThreadId, item]))
+  const remoteIds = new Set(pages.flat().map(thread => thread.thread_id))
   sessions.value = [
-    ...sessions.value.filter(item => isDraft(item) || runningSessions.has(item.id) && !item.apiThreadId),
+    ...sessions.value.filter(item => isDraft(item) ||
+      (runningSessions.has(item.id) || pendingSessionActions.has(item.id) || pendingSessionCommands.has(item.id) ||
+        Boolean(item.apiThreadId && !knownRemoteIds.has(item.apiThreadId))) &&
+      (!item.apiThreadId || !remoteIds.has(item.apiThreadId))),
     ...pages.flat().map(thread => sessionFromThread(thread, existing.get(thread.thread_id))),
   ]
   if (!sessions.value.some(item => item.id === activeSession.value && !item.archived)) activeSession.value = ''
@@ -368,6 +371,10 @@ export async function syncWorkspaceData() {
     if (epoch !== runtime.data_epoch) {
       for (const controller of runningRequests.values()) controller.abort()
       runningRequests.clear(); runningSessions.clear()
+      pendingSessionActions.clear()
+      pendingSessionCommands.clear()
+      for (const key of Object.keys(runningTurnIds)) delete runningTurnIds[key]
+      liveReplies.value = {}; liveReasoning.value = {}
       sessions.value = []; activeSession.value = ''; activeWorkspace.value = personalWorkspaceId
       writeLocal('adaptive.legacyLocalSessions', [])
       writeLocal('adaptive.workspaces', [])

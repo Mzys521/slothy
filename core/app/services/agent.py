@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
+from anyio import CancelScope
 from langchain_core.messages import BaseMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
@@ -13,6 +14,7 @@ from app.agent.graph import AgentState, build_graph_config, create_initial_state
 from app.agent.graph.review import ApprovalPolicy, pending_review
 from app.agent.metrics import run_metrics
 from app.agent.reasoning import reasoning_text
+from app.concurrency import SessionLocks
 from app.config import AgentSettings
 from app.conversations import ConversationTurn, ConversationWriter
 
@@ -51,7 +53,7 @@ class AgentRunner:
         self.graph = graph
         self.settings = settings if settings is not None else AgentSettings()
         self.conversation_writer = conversation_writer
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks = SessionLocks()
 
     async def _archive_completed(self, snapshot: StateSnapshot) -> None:
         """Archive a completed turn from saved state. / 归档已完成的轮次。
@@ -169,7 +171,7 @@ class AgentRunner:
         if isinstance(run_id, str):
             run_id = run_id.strip()
         key = config["configurable"]["thread_id"]
-        lock = self._locks.setdefault(key, asyncio.Lock())
+        lock = self._locks.for_session(key)
         async with lock:
             snapshot = await self.graph.aget_state(config)
             if snapshot.values and (
@@ -249,9 +251,27 @@ class AgentRunner:
                 config = build_graph_config(state, self.settings)
             # 中文：等当前步快照落盘后再前进，避免响应完成后快照仍留在异步写队列中。
             # English: Commit each step before advancing rather than leave writes queued at return.
-            async for event in self.graph.astream(
-                state, config, stream_mode=stream_mode, durability="sync"
-            ):
-                yield event
+            events = self.graph.astream(state, config, stream_mode=stream_mode, durability="sync")
+            try:
+                while True:
+                    # ASGI cancellation is level-triggered. Let the graph unwind under one
+                    # cancellation, rather than repeatedly cancelling its cleanup tasks.
+                    # ASGI 会重复投递取消；图执行只接收一次取消，等待它收回模型/工具任务。
+                    pending = asyncio.create_task(anext(events))
+                    try:
+                        event = await asyncio.shield(pending)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.CancelledError:
+                        pending.cancel()
+                        with CancelScope(shield=True):
+                            await asyncio.gather(pending, return_exceptions=True)
+                        raise
+                    yield event
+            finally:
+                # Also close the graph when a consumer stops between two events.
+                # 消费者在两个事件之间停止时，也必须显式关闭图迭代器。
+                with CancelScope(shield=True):
+                    await events.aclose()
             if self.conversation_writer is not None:
                 await self._archive_completed(await self.graph.aget_state(config))

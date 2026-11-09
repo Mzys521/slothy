@@ -22,6 +22,16 @@ constraints: **the model runs remotely but the user's data stays local**,
 
 ## 2. Runtime topology
 
+Chat and Work sessions run independently. Request handles, command state and live
+text belong to their session and survive page navigation. Stopping a run cancels
+only its own graph; exact per-session locks still serialize writes to the same
+conversation. In-flight work remains local to the current backend process.
+
+HTML replies render in a double sandbox with a stable 240–560 CSS px viewport
+(60% of window height) and internal scrolling. SVG diagrams keep responsive sizing;
+neutral fills, strokes and gradient stops follow appearance changes while semantic
+colors and transparency remain intact. Neither preview gains same-origin access.
+
 ```
 Electron main process                 Electron renderer (Vue 3)
 ├─ BrowserWindow, frameless UI        ├─ chat / memory / profile / graph pages

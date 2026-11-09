@@ -53,6 +53,7 @@ from app.agent.reasoning import reasoning_text
 from app.agent.tools import ToolRegistry, create_builtin_tools
 from app.agent.tools.attachments import create_attachment_tools
 from app.composer_api import install_composer_routes
+from app.concurrency import SessionLocks
 from app.config import (
     AgentSettings,
     CheckpointSettings,
@@ -780,7 +781,7 @@ def workspace(request: Request) -> WorkspaceStore:
 
 
 def lock_for(request: Request, thread_id: str) -> asyncio.Lock:
-    """Pick the striped asyncio lock that serializes one session. / 选取用于串行化单个会话的条带锁。
+    """Serialize exactly one session, without hash collisions. / 只串行化同一会话，无哈希碰撞。
 
     Args:
         request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
@@ -790,9 +791,7 @@ def lock_for(request: Request, thread_id: str) -> asyncio.Lock:
         The lock guarding this session. / 保护该会话的锁。
     """
 
-    # Striped locks limit contention without per-session locks. / 条带锁限制竞争，无需每会话建锁。
-    locks = request.app.state.thread_locks
-    return locks[hash(thread_id) % len(locks)]
+    return request.app.state.thread_locks.for_session(thread_id)
 
 
 async def require_thread(request: Request, thread_id: str, *, writable: bool = False) -> dict:
@@ -3100,7 +3099,7 @@ def create_app(
             app.state.memory_evolution = evolution
             app.state.checkpointer = checkpointer
             app.state.agent_settings = agent_settings
-            app.state.thread_locks = [asyncio.Lock() for _ in range(64)]
+            app.state.thread_locks = SessionLocks()
             app.state.workspace_lock = asyncio.Lock()
             app.state.providers = providers
             app.state.directories = WorkspaceDirectories(
