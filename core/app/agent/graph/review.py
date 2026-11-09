@@ -178,6 +178,14 @@ def review_call(registry: ToolRegistry, call: dict) -> dict:
         }[risk]
         if path := arguments.get("path") or arguments.get("filename"):
             hint += f" Target: {str(path)[:500]}."
+        if call["name"] == "workspace_delete":
+            hint = (
+                "HIGH RISK: permanently deletes a workspace "
+                + ("directory" if arguments.get("recursive") else "file or empty directory")
+                + f". Target: {str(arguments.get('path', ''))[:500]}."
+            )
+            if arguments.get("recursive"):
+                hint += " Recursive deletion removes every child entry and cannot be undone."
         if isinstance(arguments.get("content"), str):
             hint += f" UTF-8 bytes: {len(arguments['content'].encode())}."
         if arguments.get("overwrite"):

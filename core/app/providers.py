@@ -10,6 +10,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Literal
 
 import httpx
@@ -218,7 +219,7 @@ class ProviderConnection:
     key: SecretStr
     model: str
 
-    def build_provider(self, effort: str | None):
+    def build_provider(self, effort: str | None, *, max_tokens: int | None = None):
         """Build the chat model adapter for this connection. / 为该连接构建聊天模型适配器。
 
         Args:
@@ -232,7 +233,7 @@ class ProviderConnection:
                 model_name=self.model,
                 api_key=self.key.get_secret_value(),
                 base_url=str(self.settings.base_url).rstrip("/"),
-                max_tokens=8192,
+                max_tokens=max_tokens or 8192,
                 timeout=60,
                 max_retries=2,
             )
@@ -256,6 +257,7 @@ class ProviderConnection:
             api_key=self.key,
             base_url=self.settings.base_url,
             extra_body={},
+            max_tokens=max_tokens,
             stream_usage=True,
         )
         return OpenAICompatibleProvider(llm, effort=effort)
@@ -263,6 +265,8 @@ class ProviderConnection:
 
 class ProviderStore:
     """JSON-backed provider records with encrypted secrets. / 加密存储的服务商记录。"""
+
+    SEARCH_ID = "deepseek-search"
 
     def __init__(self, path: Path):
         """Load version-1 provider records from a JSON file. / 从 JSON 文件加载版本 1 的服务商记录。
@@ -299,8 +303,76 @@ class ProviderStore:
         )
 
     def list(self) -> list[ProviderPublic]:
-        """Return public views of all stored providers. / 返回所有已存服务商的公开视图。"""
-        return [self.public(provider_id) for provider_id in self.records]
+        """Return public views of all stored model providers. / 返回所有已存模型服务商。"""
+        return [
+            self.public(provider_id)
+            for provider_id in self.records
+            if provider_id != self.SEARCH_ID
+        ]
+
+    def search_key(self) -> str | None:
+        """Resolve the independent Search key, then the DeepSeek model key.
+
+        / 优先独立 Search 密钥，其次复用 DeepSeek 模型密钥。
+
+        Returns:
+            Plaintext key for the search adapter, or None when unconfigured.
+            / 未配置时返回 None。
+        """
+        independent = self.records.get(self.SEARCH_ID)
+        if independent and independent["secret"]:
+            return protect_secret(independent["secret"], decrypt=True)
+        for record in self.records.values():
+            if record["config"].template == "deepseek" and record["config"].enabled:
+                if record["secret"]:
+                    return protect_secret(record["secret"], decrypt=True)
+        return None
+
+    def search_source(self) -> str | None:
+        """Report which credential source powers Search. / 返回搜索凭据来源。"""
+        independent = self.records.get(self.SEARCH_ID)
+        if independent and independent["secret"]:
+            return "independent"
+        for record in self.records.values():
+            if record["config"].template == "deepseek" and record["config"].enabled:
+                if record["secret"]:
+                    return "model"
+        return None
+
+    def save_search_key(self, key: str) -> None:
+        """Persist the independent Search key with the existing DPAPI protection.
+
+        / 使用现有 DPAPI 保护保存独立搜索密钥。
+
+        Args:
+            key: Plaintext Search API key. / 明文搜索密钥。
+
+        Raises:
+            ValueError: When the key is blank. / 密钥为空时抛出。
+        """
+        value = key.strip()
+        if not value:
+            raise ValueError("Search API key must not be blank.")
+        config = ProviderInput(
+            id=self.SEARCH_ID,
+            name="DeepSeek Search",
+            template="deepseek",
+            protocol="openai",
+            base_url="https://api.deepseek.com",
+            models=[],
+            enabled=True,
+        )
+        self._write(
+            {
+                **self.records,
+                self.SEARCH_ID: {"config": config, "secret": protect_secret(value)},
+            }
+        )
+
+    def clear_search_key(self) -> None:
+        """Remove only the independent Search key. / 仅删除独立搜索密钥。"""
+        if self.SEARCH_ID in self.records:
+            self._write({k: v for k, v in self.records.items() if k != self.SEARCH_ID})
 
     def _write(self, records: dict[str, dict]):
         """Atomically replace providers.json with the given records. / 原子替换 providers.json。
@@ -360,6 +432,8 @@ class ProviderStore:
         """
         catalog = {}
         for provider_id, record in self.records.items():
+            if provider_id == self.SEARCH_ID:
+                continue
             config = record["config"]
             if not config.enabled:
                 continue
@@ -380,6 +454,67 @@ class ProviderStore:
                     ProviderConnection(config, key, model.id),
                 )
         return catalog
+
+    async def test_models(self, body: ProviderInput, model_ids: list[str]) -> list[dict]:
+        """Call each selected model once with a tiny prompt. / 逐个用极小请求验证模型。
+
+        Args:
+            body: Provider connection input with candidate models. / 含候选模型的服务商配置。
+            model_ids: Selected model IDs. / 待测试的模型 ID。
+
+        Returns:
+            Per-model success/failure records, preserving partial success. / 每个模型的独立结果。
+        """
+        async def resolve_key() -> str:
+            secret = body.api_key
+            if secret is None:
+                previous = self.records.get(body.id)
+                if previous:
+                    secret = SecretStr(protect_secret(previous["secret"], decrypt=True))
+            if not secret:
+                raise ValueError("Enter an API key to test models.")
+            return secret.get_secret_value().strip()
+
+        key = await resolve_key()
+        from langchain_core.messages import HumanMessage
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def one(model_id: str) -> dict:
+            async with semaphore:
+                started = perf_counter()
+                try:
+                    connection = ProviderConnection(body, SecretStr(key), model_id)
+                    provider = connection.build_provider(None, max_tokens=64)
+                    response = await asyncio.wait_for(
+                        provider.get_chat_model().ainvoke([HumanMessage("Reply with OK.")]),
+                        timeout=30,
+                    )
+                    if type(response).__name__ != "AIMessage":
+                        raise ValueError("The model returned an unexpected response.")
+                    text = getattr(response, "text", "") or ""
+                    reasoning = getattr(response, "additional_kwargs", {}) or {}
+                    if (
+                        not text.strip()
+                        and not reasoning
+                        and not getattr(response, "tool_calls", None)
+                    ):
+                        raise ValueError("The model returned an empty response.")
+                    return {
+                        "id": model_id,
+                        "ok": True,
+                        "message": "Model responded successfully.",
+                        "duration_ms": round((perf_counter() - started) * 1000),
+                    }
+                except Exception as error:  # noqa: BLE001 - per-model isolation is intentional
+                    return {
+                        "id": model_id,
+                        "ok": False,
+                        "message": str(error)[:500],
+                        "duration_ms": round((perf_counter() - started) * 1000),
+                    }
+
+        return await asyncio.gather(*(one(model_id) for model_id in model_ids))
 
     async def discover(self, body: ProviderInput) -> list[ProviderModel]:
         """Fetch model IDs from the provider's model endpoint. / 从服务商的模型端点拉取模型 ID。

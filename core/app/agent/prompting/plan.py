@@ -146,6 +146,7 @@ def compose(
     snapshot: dict | None = None,
     summary: dict | None = None,
     toolset_hash: str = "",
+    context_by_anchor: dict[str, list[AnyMessage]] | None = None,
 ) -> PromptPlan:
     """Compose the layered prompt plan for one run. / 为单次运行组装分层提示计划。
 
@@ -180,10 +181,17 @@ def compose(
     l1: list[AnyMessage] = [SystemMessage(content=system + "\nprompt_version=" + settings.version)]
     if snapshot:
         l1.append(reference("profile_snapshot", snapshot))
-    history = list(messages[:start])
+    def materialize(items):
+        result = []
+        for item in items:
+            result.append(item)
+            result.extend((context_by_anchor or {}).get(item.id, []))
+        return result
+
+    history = materialize(messages[:start])
     if summary:
         history.insert(0, reference("conversation_summary", summary))
-    current = messages[start:]
+    current = materialize(messages[start:])
     if settings.layout == "legacy" or not settings.layered_l3:
         ordered = [*l1, *references, *history, *current]
         l2_end = len(l1) - 1

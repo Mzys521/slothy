@@ -105,6 +105,7 @@ async def test_plain_graph_runs_the_documented_nodes_without_memory_services() -
     ]
     assert [next(iter(update)) for update in updates] == [
         "prepare_run",
+        "decide",
         "load_profile",
         "retrieve_memories",
         "build_personalized_context",

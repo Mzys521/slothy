@@ -6,9 +6,11 @@
 
 const { app, BrowserWindow, clipboard, dialog, ipcMain, net, screen, session, shell } = require('electron')
 const path = require('node:path')
+const fs = require('node:fs/promises')
 const { fileURLToPath } = require('node:url')
 const { startBackend, stopBackend } = require('./backend.cjs')
 const { selectWorkingDirectory } = require('./directory.cjs')
+const { confirmed, purgeManagedData } = require('./purge.cjs')
 const desktop = require('../desktop.config.cjs')
 const { displayVersion } = require('../package.json')
 
@@ -259,6 +261,48 @@ app.whenReady().then(async () => {
     fromWindow(event)
     if (typeof text !== 'string' || text.length > 2_000_000) throw new Error('Invalid clipboard text.')
     clipboard.writeText(text)
+  })
+
+  /**
+   * Stops the backend, purges application-managed data and clears browser storage.
+   *
+   * 停止后端、清除应用管理的数据并清理浏览器存储；返回失败与残留清单。
+   */
+  ipcMain.handle('desktop:purge-local-data', async (event, confirmation) => {
+    if (!isAppFrame(event.senderFrame)) throw new Error('Untrusted IPC sender.')
+    if (!confirmed(confirmation)) throw new Error('Explicit confirmation phrase is required.')
+    if (backend) {
+      await stopBackend(backend)
+      backend = undefined
+    }
+    const result = await purgeManagedData(app.getPath('userData'))
+    try {
+      await session.defaultSession.clearStorageData()
+      await session.defaultSession.clearCache()
+      await session.defaultSession.clearCodeCaches?.({})
+    } catch (error) {
+      result.failed.push({
+        path: 'browser storage',
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    return { ok: result.failed.length === 0 && result.remaining.length === 0, ...result }
+  })
+
+  /** Opens the application-managed log directory in the OS file manager. / 打开应用日志目录。 */
+  ipcMain.handle('desktop:open-logs', async event => {
+    fromWindow(event)
+    const logs = path.join(app.getPath('userData'), 'data', 'logs')
+    await fs.mkdir(logs, { recursive: true })
+    const error = await shell.openPath(logs)
+    if (error) throw new Error(error)
+  })
+
+  /** Relaunches the desktop process after a completed purge. / 清除完成后重新启动桌面进程。 */
+  ipcMain.handle('desktop:restart-app', event => {
+    if (!isAppFrame(event.senderFrame)) throw new Error('Untrusted IPC sender.')
+    app.relaunch()
+    app.quit()
   })
   await createWindow()
   app.on('activate', () => {

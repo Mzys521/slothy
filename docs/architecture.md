@@ -79,7 +79,7 @@ cached; tools are bound to the model at compile time.
 ## 4. Agent graph
 
 ```
-START → prepare_run → load_profile → retrieve_memories
+START → prepare_run → decide → load_profile → retrieve_memories
       → build_personalized_context → agent ─┬─ no tool calls → finalize_response → END
                                             └─ tool calls ──▶ tools ──▶ agent
                                                              │
@@ -90,6 +90,9 @@ START → prepare_run → load_profile → retrieve_memories
 
 - **prepare_run** validates the new request, resets per-run fields and bounds
   working history by complete user turns.
+- **decide** optionally asks the dedicated decision model for a guarded plan
+  (route/tools/context/recovery); disabled, shadow and enforce modes are described
+  in §4.1.
 - **load_profile / retrieve_memories / build_personalized_context** are read-only
   ports: profile snapshot, scoped memory candidates, and a budgeted reference
   text. Recoverable failures become warnings, not fake answers.
@@ -112,6 +115,21 @@ Execution properties:
   missing archive entry for the previous turn before advancing.
 - A per-request approval policy (`ask` | `every`) decides which calls pause;
   safe tools and read-only commands never pause under `ask`.
+
+### 4.1 Model-driven decision layer
+
+One `decide` node runs between `prepare_run` and `load_profile`. The decision model is
+selected in Settings → API from the configured provider catalog; its key and base URL
+come from that provider, and the selection is stored without secrets. It returns a
+structured plan: route (identity/model/tool), tool subset, context budget and recovery
+hints. Deterministic guards clamp the plan against the model catalog, the live tool
+registry, approval requirements and budgets; a proposal can never relax approval or add
+an unknown tool. With no decision model selected, the chat model decides autonomously.
+If a configured decision model times out, returns invalid JSON or exceeds its budget,
+control is handed back to the chat model; the legacy `DECISION_MODE` / `DASHSCOPE__*`
+environment variables remain available for backend-only runs. Plans and reason codes are
+persisted in graph state and metrics and never enter prompt-cache text. The plan and reason codes live in graph state and metrics;
+they never enter L1/L2 prompt text.
 
 ## 5. Memory and user profile V3
 
@@ -150,6 +168,22 @@ The online agent remains read-only. No embedding service is introduced.
   token reservations retain the existing observable worker lifecycle.
 
 ## 6. Prompt layering and caching
+
+The 2026-11-09 context update follows DSH's separation of static prompt sections
+and dynamic runtime snapshots. Named static sections sort by order/name. Skills,
+explicit references and attachments form a separately checkpointed request surface:
+unchanged snapshots retain their position, changes append after current history,
+and compaction reprojects removed snapshots. Source revocation and scope changes
+remove old reference bodies before dispatch. The log is capped at 8 snapshots and
+32768 bytes by default; oversized single snapshots remain request-local.
+
+These events are separate from real user messages and never enter conversation
+archives, turn counts or memory learning. Long-term memory, profile snapshots and
+personalization retrieval retain their existing injection and revocation behavior.
+DeepSeek final-answer reasoning is display-only; reasoning needed by tool calls
+is passed back. Context accounting counts the actual current user and system once.
+Default prompt version: `2026-11-09.context-v1`. Offline prefix overlap measures
+eligibility for reuse; only provider-reported usage establishes real cache hits.
 
 Requests are assembled as three layers, ordered by change frequency:
 
@@ -210,6 +244,8 @@ Bounded diagnostics still complete call/result pairs after budget exhaustion.
 | `calculate` / `calculate_financial` | in-process | float / Decimal string arithmetic |
 | `workspace_read` | in-process | bounded UTF-8 pages, directory list and literal search; private/linked paths excluded |
 | `workspace_write` | in-process | approved mkdir/write; no overwrite by default |
+| `workspace_delete` | in-process | approved Chat/Work file/directory delete; symlink/root/private paths rejected; recursive target revalidated |
+| `deepseek_search` | HTTPS | official DeepSeek Search API; registered only when a Search/model key resolves; structured sources, timeout/rate/auth errors |
 | `export_document` | standard library / python-docx | approved md/txt/csv/json/docx templates; no model code |
 | `run_python` | separate Python process | approved code, journaled output directory, existing audit and artifact limits |
 | `get_datetime` | in-process | current time and offset-aware IANA conversion; bundled tzdata |

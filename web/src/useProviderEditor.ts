@@ -52,6 +52,20 @@ export function useProviderEditor() {
   const showKey = ref(false)
   const addModelOpen = ref(false)
   const catalog = ref<ProviderModel[]>([])
+  const selectedModels = ref<string[]>([])
+  const modelQuery = ref('')
+  const modelTesting = ref(false)
+  const modelResults = ref<Record<string, { ok: boolean; message: string; duration_ms: number }>>({})
+  const visibleModels = computed(() => {
+    const query = modelQuery.value.trim().toLowerCase()
+    return catalog.value.filter(item => !query
+      || item.id.toLowerCase().includes(query)
+      || (item.name ?? '').toLowerCase().includes(query))
+  })
+  const configuredIds = computed(() => new Set(form.models.map(item => item.id)))
+  const canTestModels = computed(() =>
+    !busy.value && !modelTesting.value && selectedModels.value.length > 0
+    && !providerIssue(form, savedKey.value, false))
   const lastOperation = ref<'save' | 'discover'>('save')
   const discoverManual = ref(false)
   const newModel = reactive({ id: '', name: '', context: '' })
@@ -93,8 +107,9 @@ export function useProviderEditor() {
     form.name = template.name
     form.base_url = template.base_url
     form.protocol = template.protocol
-    form.models = template.model_ids.map(id => ({ id, name: id }))
-    catalog.value = form.models.map(item => ({ ...item }))
+    catalog.value = template.model_ids.map(id => ({ id, name: id }))
+    selectedModels.value = []
+    form.models = []
   }
   /**
    * Switches between built-in and custom provider input.
@@ -123,6 +138,7 @@ export function useProviderEditor() {
     if (provider) {
       Object.assign(form, { ...provider, models: provider.models.map(item => ({ ...item })), api_key: '' })
       catalog.value = provider.models.map(item => ({ ...item }))
+      selectedModels.value = []
     } else {
       Object.assign(form, { id: '', name: '', template: templates.value[0]?.id ?? '', api_key: '', enabled: true, models: [] })
       selectTemplate()
@@ -176,12 +192,9 @@ export function useProviderEditor() {
     discovering.value = true; error.value = ''; notice.value = ''; discoverManual.value = false
     try {
       const result = await workRequest<{ items: ProviderModel[] }>('/settings/providers/discover', 'POST', providerPayload(form, kind.value))
-      const existing = new Map(form.models.map(item => [item.id, item]))
-      const available = new Map(catalog.value.map(item => [item.id, item]))
-      for (const item of result.items) { if (!existing.has(item.id)) existing.set(item.id, item); available.set(item.id, item) }
-      form.models = [...existing.values()].slice(0, 200)
-      catalog.value = [...available.values()].slice(0, 200)
-      notice.value = result.items.length ? t(`Fetched ${result.items.length} models.`, `已获取 ${result.items.length} 个模型。`) : t('The provider returned an empty catalog. Add a model ID manually.', '服务商返回了空目录，请手动添加模型 ID。')
+      catalog.value = result.items.slice(0, 200)
+      selectedModels.value = []
+      notice.value = result.items.length ? t(`Fetched ${result.items.length} models. Select and test the ones to add.`, `已获取 ${result.items.length} 个模型，请勾选并测试后添加。`) : t('The provider returned an empty catalog. Add a model ID manually.', '服务商返回了空目录，请手动添加模型 ID。')
       return result
     } catch (reason) { discoverManual.value = reason instanceof ApiError && [501, 502].includes(reason.status); report(reason) }
     finally { discovering.value = false }
@@ -195,14 +208,62 @@ export function useProviderEditor() {
    */
   function addModel() {
     const model: ProviderModel = { id: newModel.id.trim(), name: newModel.name.trim() || newModel.id.trim(), context_window: newModel.context ? Number(newModel.context) : null }
-    const issue = providerModelIssue([...form.models, model])
+    const issue = providerModelIssue([...catalog.value, model])
     if (issue) { error.value = issueMessage(issue); return false }
-    form.models.push(model)
     const existing = catalog.value.findIndex(item => item.id === model.id)
     if (existing < 0) catalog.value.push(model)
     else catalog.value[existing] = model
     addModelOpen.value = false; error.value = ''
     return true
+  }
+
+  /** Toggles one discovered model selection. / 切换一个发现模型的选择状态。 */
+  function toggleModel(id: string) {
+    selectedModels.value = selectedModels.value.includes(id)
+      ? selectedModels.value.filter(item => item !== id)
+      : [...selectedModels.value, id]
+  }
+
+  /** Selects every currently filtered, not-yet-configured model. / 全选当前筛选结果。 */
+  function selectAllVisible() {
+    selectedModels.value = visibleModels.value
+      .filter(item => !configuredIds.value.has(item.id))
+      .map(item => item.id)
+  }
+
+  /** Clears the pending selection. / 清空待添加选择。 */
+  function clearSelection() { selectedModels.value = [] }
+
+  /**
+   * Tests each selected model with a real tiny API call and adds only successes.
+   *
+   * 对每个选中模型发起真实小请求，仅添加测试通过的模型。
+   */
+  async function testAndAdd() {
+    if (!canTestModels.value) return
+    modelTesting.value = true; error.value = ''; notice.value = ''
+    modelResults.value = {}
+    try {
+      const selected = catalog.value.filter(item => selectedModels.value.includes(item.id))
+      const result = await workRequest<{ items: { id: string; ok: boolean; message: string; duration_ms: number }[] }>(
+        '/settings/providers/test-models', 'POST',
+        { ...providerPayload(form, kind.value), models: selected },
+      )
+      const passed: ProviderModel[] = []
+      for (const item of result.items) {
+        modelResults.value[item.id] = item
+        if (!item.ok) continue
+        const model = catalog.value.find(entry => entry.id === item.id)
+        if (model && !form.models.some(entry => entry.id === item.id)) passed.push(model)
+      }
+      form.models.push(...passed)
+      selectedModels.value = selectedModels.value.filter(id => !passed.some(item => item.id === id))
+      const failed = result.items.filter(item => !item.ok).length
+      notice.value = failed
+        ? t(`Added ${passed.length} model(s); ${failed} failed and stayed in the catalog.`, `已添加 ${passed.length} 个模型；${failed} 个失败并保留在目录中。`)
+        : t(`Added ${passed.length} validated model(s).`, `已添加 ${passed.length} 个已验证模型。`)
+    } catch (reason) { report(reason) }
+    finally { modelTesting.value = false }
   }
   /**
    * Resets the add-model form and reveals it.
@@ -212,5 +273,7 @@ export function useProviderEditor() {
   function showModelForm() { Object.assign(newModel, { id: '', name: '', context: '' }); addModelOpen.value = true; error.value = '' }
   onUnmounted(() => { form.api_key = ''; showKey.value = false })
   return { providers, templates, editing, editId, kind, saving, discovering, busy, error, notice, showKey, addModelOpen, catalog, lastOperation, discoverManual, newModel, form, savedKey, canSave, canDiscover,
-    selectTemplate, changeKind, openEditor, closeEditor, save, discover, addModel, showModelForm }
+    selectedModels, modelQuery, modelTesting, modelResults, visibleModels, configuredIds, canTestModels,
+    selectTemplate, changeKind, openEditor, closeEditor, save, discover, addModel, showModelForm,
+    toggleModel, selectAllVisible, clearSelection, testAndAdd }
 }

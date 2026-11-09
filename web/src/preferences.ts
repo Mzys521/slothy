@@ -47,6 +47,7 @@ const saved = readLocal<Partial<{
   palette: string
   customAccent: string
   font: string
+  fontScale: number
   language: string
   personalizedMemory: boolean
   appearanceVersion: number
@@ -61,6 +62,7 @@ export const settings = reactive({
   palette: savedPalette(saved.palette),
   customAccent: normalizeAccent(saved.customAccent) ?? DEFAULT_ACCENT,
   font: saved.font === 'geist' || saved.font === 'serif' ? saved.font : 'system',
+  fontScale: [0.9, 1, 1.15, 1.3].includes(Number(saved.fontScale)) ? Number(saved.fontScale) : 1,
   appearanceVersion: 3,
 })
 
@@ -88,5 +90,7 @@ watch(settings, () => {
   root.dataset.font = settings.font
   root.lang = settings.language
   for (const [token, value] of Object.entries(customAccentTokens(settings.customAccent))) root.style.setProperty(token, value)
+  const base: Record<string, number> = { xs: 11, sm: 12, body: 14, reading: 16, section: 18, title: 24, hero: 32 }
+  for (const [name, size] of Object.entries(base)) root.style.setProperty(`--type-${name}`, `${Math.round(size * settings.fontScale)}px`)
   writeLocal('adaptive.preferences', settings)
 }, { immediate: true })

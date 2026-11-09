@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
+from langchain_core.messages import BaseMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
 
@@ -11,6 +12,7 @@ from app.agent.activity import run_activity
 from app.agent.graph import AgentState, build_graph_config, create_initial_state
 from app.agent.graph.review import ApprovalPolicy, pending_review
 from app.agent.metrics import run_metrics
+from app.agent.reasoning import reasoning_text
 from app.config import AgentSettings
 from app.conversations import ConversationTurn, ConversationWriter
 
@@ -67,6 +69,7 @@ class AgentRunner:
                 values["run_id"],
                 values["user_input"],
                 values["response"],
+                reasoning=reasoning_text(values.get("messages", [])),
                 learn_memory=values.get("personalization_enabled", False)
                 and values.get("response_source") != "identity_fact",
                 project_id=values.get("project_id"),
@@ -133,6 +136,7 @@ class AgentRunner:
         approval_policy: ApprovalPolicy | None = None,
         attachment_ids: list[str] | None = None,
         references: list[dict] | None = None,
+        history: list[BaseMessage] | None = None,
         model_selection: dict | None = None,
         decision: tuple[str, bool] | None = None,
         stream_mode: Literal["values", "updates", "messages", "custom"]
@@ -237,6 +241,11 @@ class AgentRunner:
                 )
                 state["approval_policy"] = approval_policy or "ask"
                 state["model_selection"] = model_selection or {}
+                if history:
+                    # Recovery after a failed checkpoint run: keep the archived conversation
+                    # context without reusing the failed graph state.
+                    # 失败运行恢复：用归档历史继续对话，不复用失败的图状态。
+                    state["messages"] = [*history, *state["messages"]]
                 config = build_graph_config(state, self.settings)
             # 中文：等当前步快照落盘后再前进，避免响应完成后快照仍留在异步写队列中。
             # English: Commit each step before advancing rather than leave writes queued at return.

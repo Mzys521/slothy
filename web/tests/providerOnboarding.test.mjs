@@ -96,7 +96,9 @@ test('template choice uses server data and save clears the key before the settin
   const {editor,close}=mountEditor()
   editor.openEditor()
   assert.equal(editor.form.template,templates[0].id)
-  assert.deepEqual(editor.form.models.map(model=>model.id),templates[0].model_ids)
+  assert.deepEqual(editor.catalog.value.map(model=>model.id),templates[0].model_ids)
+  assert.deepEqual(editor.form.models,[])
+  editor.form.models.push({id:'model-a',name:'Model A'})
   editor.form.api_key='LOCAL-TEST-KEY'
   const reload=deferred();let calls=[]
   transport(async(path,method,body)=>{calls.push({path,method,body});if(method==='POST')return{};return reload.promise})
@@ -159,6 +161,9 @@ test('discover failure allows manual model entry and does not block saving a com
   assert.equal(editor.lastOperation.value,'discover')
   Object.assign(editor.newModel,{id:'manual-model',name:'Manual',context:'131072'})
   assert.equal(editor.addModel(),true)
+  assert.ok(editor.catalog.value.some(model=>model.id==='manual-model'))
+  assert.equal(editor.canSave.value,false)
+  editor.form.models.push(editor.catalog.value.find(model=>model.id==='manual-model'))
   assert.equal(editor.canSave.value,true)
   transport(async(path,method)=>method==='POST'?{}:snapshot(false))
   assert.ok(await editor.save())
@@ -169,7 +174,8 @@ test('discover merges real catalog items without duplicates and a busy editor ca
   const {editor,close}=mountEditor();Object.assign(editor.form,draft())
   transport(async()=>({items:[{id:'model-a'},{id:'model-c'}]}))
   await editor.discover()
-  assert.deepEqual(editor.form.models.map(model=>model.id),['model-a','model-c'])
+  assert.deepEqual(editor.form.models.map(model=>model.id),['model-a'])
+  assert.deepEqual(editor.catalog.value.map(model=>model.id),['model-a','model-c'])
   const posted=deferred();let writes=0
   transport(async(path,method)=>{if(method==='POST'){writes++;return posted.promise}return snapshot(false)})
   const first=editor.save();await editor.save();assert.equal(writes,1)

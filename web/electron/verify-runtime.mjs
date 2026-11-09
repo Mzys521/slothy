@@ -45,7 +45,7 @@ const upstream = createServer(async (request, response) => {
   assert.equal(body.model, 'runtime-model')
   if (isMemory) assert.ok(!body.tools?.length, 'memory learning must not receive executable tools')
   else assert.ok(body.tools.length)
-  const prompt = body.messages.filter(message => message.role === 'user').at(-1)?.content || ''
+  const prompt = body.messages.filter(message => message.role === 'user' && !message.name).at(-1)?.content || ''
   const toolResults = body.messages.filter(message => message.role === 'tool')
   let content = 'SLOTHY_CONNECTED'
   let toolCall
@@ -242,13 +242,15 @@ try {
     cacheWire.findIndex(message => message.content === 'CACHE_FIRST'))
   assert.ok(cacheWire.find(message => message.name === 'personalization_reference')?.content.includes('Go'))
   assert.notEqual(firstCacheTurn.metrics.l1_hash, secondCacheTurn.metrics.l1_hash)
-  assert.equal(secondCacheTurn.metrics.prompt_version, '2026-11-07.memory-v3')
+  assert.equal(secondCacheTurn.metrics.prompt_version, '2026-11-09.context-v1')
   assert.equal(secondCacheTurn.metrics.l2_turns, 1)
   const cacheRuntime = await request('/runtime')
   assert.equal(cacheRuntime.prompt_layout, 'layered')
   assert.equal(cacheRuntime.cache_stats.prefix_hit_ratio, null, 'unreported cache usage stays unknown')
-  assert.equal(cacheRuntime.work_tools.length, 9)
-  assert.equal(cacheRuntime.chat_tools.length, 7)
+  assert.equal(cacheRuntime.work_tools.length, 10)
+  assert.ok(cacheRuntime.work_tools.includes('workspace_delete'))
+  assert.equal(cacheRuntime.chat_tools.length, 8)
+  assert.ok(cacheRuntime.chat_tools.includes('workspace_delete'))
   assert.ok(!cacheRuntime.work_tools.includes('run_command'))
   assert.ok(!cacheRuntime.work_tools.includes('write_document_python'))
   assert.ok(!cacheRuntime.work_tools.includes('web_fetch'))

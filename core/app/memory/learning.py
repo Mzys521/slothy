@@ -869,8 +869,19 @@ class MemoryLearner:
                     key=lambda item: max(turn["id"] for turn, _ in item["evidence"]),
                 ):
                     applied += await self._apply(user, candidate, configuration)
-                await self.evolution.rebuild(user)
-                await self.evolution.refresh_relationships(user)
+                # Profile projection must never wedge the durable learning queue: a broken
+                # projection is logged and the turns still settle, so the next batch can retry.
+                # 画像投影不得卡死持久学习队列：投影失败只记录日志，轮次仍正常结算，
+                # 下一批可再次尝试投影。
+                try:
+                    async with asyncio.timeout(15):
+                        await self.evolution.rebuild(user)
+                        await self.evolution.refresh_relationships(user)
+                except Exception:
+                    logger.warning(
+                        "Memory profile projection failed; learning queue continues",
+                        exc_info=False,
+                    )
             for turn in state["turns"]:
                 await self.evolution.db.execute(
                     "INSERT OR IGNORE INTO memory_learning_turns VALUES(?,?,?,?,?)",

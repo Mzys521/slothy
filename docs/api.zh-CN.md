@@ -28,6 +28,13 @@
 | PUT | `/settings/providers/{id}` | 更新服务 |
 | DELETE | `/settings/providers/{id}` | 删除服务 |
 | POST | `/settings/providers/discover` | 用给定凭据请求 `{base_url}/models` |
+| POST | `/settings/providers/test-models` | 用真实小请求验证所选模型，支持部分成功 |
+| GET | `/settings/decision` | 决策模型选择与可用模型 ID |
+| PUT | `/settings/decision` | 选择/清除决策模型并重建 Runner |
+| GET | `/settings/search` | DeepSeek 搜索凭据状态（不含密钥） |
+| PUT | `/settings/search` | 保存独立搜索密钥 |
+| DELETE | `/settings/search` | 删除独立搜索密钥 |
+| POST | `/settings/search/test` | 发起一次真实搜索测试 |
 | GET | `/settings` | 全局个性化开关 |
 | PATCH | `/settings` | 设置全局个性化开关 |
 | GET | `/settings/memory` | 记忆规划器配置（14 项，带 revision） |
@@ -236,15 +243,27 @@ Connector 字段为 `id, kind, name, description, enabled, builtin, tools, trans
 ## 统一工具契约
 
 `GET /runtime` 增加按 read/write/execute/network 分组的 `tool_groups` 和
-`deprecated_tools`。默认桌面端 Work 9 个、Chat 7 个内置工具；Skill 引用读取按启用状态提供，
-`web_fetch` 为可选项，隐藏旧名不进入可见清单。连接器增加 `risk/platforms/available` 与逐工具
-`capabilities`；配置、凭据、环境变量和包路径不公开。
+`deprecated_tools`。默认桌面端 Work 10 个、Chat 8 个内置工具；Skill 引用读取按启用状态提供，
+`deepseek_search` 仅在解析到搜索密钥后出现，`web_fetch` 为可选项，隐藏旧名不进入可见清单。
+`workspace_delete` 在 Chat/Work 均需审批：路径限制在工作区，拒绝链接与根目录，执行时复验
+递归目标。连接器增加 `risk/platforms/available` 与逐工具 `capabilities`；配置、凭据、
+环境变量和包路径不公开。
 
-模型工具消息统一为 `ToolResult`：`ok/summary/data/artifacts/next_offset/error`。
-失败的 `error` 含 `code/message/retryable/hint`。错误码包括 `INVALID_ARGS/UNKNOWN_TOOL/
+### DeepSeek 搜索
+
+`GET /settings/search` 返回 `{configured,source,independent}`，不回传密钥；
+`PUT /settings/search` 保存独立 DPAPI 加密密钥，`DELETE` 仅删除独立密钥，
+`POST /settings/search/test` 发起一次真实搜索测试。可选 `deepseek_search` 工具调用
+`POST https://api.deepseek.com/v1/tools/search`，参数为 `query/count/ori_question/
+need_content`；结果包含标题、URL、摘要、正文、站点、发布时间、权威性与排序分数。
+未配置独立密钥时复用 DeepSeek 模型密钥；两者都没有则不注册工具。
+
+模型工具消息统一为 `ToolResult`：`ok/summary/data/artifacts/next_offset/error`。失败的 `error` 含 `code/message/retryable/hint`。错误码包括 `INVALID_ARGS/UNKNOWN_TOOL/
 UNAVAILABLE/OUT_OF_WORKSPACE/OUTPUT_TOO_LARGE/TIMEOUT/DENIED/CONNECTOR_DISABLED/
 EXEC_FAILED/NETWORK_BLOCKED/BUDGET_EXCEEDED/RECOVERY_REQUIRED`。
 分页用 `next_offset`；产物包含 `id/name/bytes/rel_path/sha256/url`。
+`ChatResult`、done SSE 帧与归档 `ThreadMessage` 增加 `reasoning`；它仅用于展示，不进入
+提示词或历史消息正文；流式响应用独立 `reasoning` 事件与 `delta` 分开传输。
 `GET /threads/{thread_id}/artifacts/{artifact_id}` 校验归属、路径、大小和摘要后下载真实产物，
 不可用时返回 404。
 

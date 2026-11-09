@@ -42,7 +42,7 @@ def test_review_metadata_metrics_archive_account_and_owned_artifact_download(tmp
     )
     with TestClient(app) as client:
         runtime = client.get("/api/v1/runtime").json()
-        assert len(runtime["chat_tools"]) == 7 and len(runtime["work_tools"]) == 9
+        assert len(runtime["chat_tools"]) == 8 and len(runtime["work_tools"]) == 10
         assert runtime["deprecated_tools"] == ["run_command", "write_document_python"]
         assert "export_document" in runtime["tool_groups"]["write"]
         review = client.post("/api/v1/chat", json={"message": "Export a report"}).json()

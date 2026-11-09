@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { t } from './preferences'
-import { memoryScope, memoryTypeName, workRequest, type MemoryReceipt } from './workApi'
+import { memoryScope, workRequest, type MemoryReceipt } from './workApi'
 import ProfileEditor from './ProfileEditor.vue'
 import MemoryCreateDialog from './MemoryCreateDialog.vue'
+import MemoryLearningStatus from './MemoryLearningStatus.vue'
+import MemoryList from './MemoryList.vue'
 
 type Evidence = { thread_id: string; run_id: string; quote: string; source: string; recorded_at?: string | null }
 /** Memory candidate awaiting user review, including its evidence and target profile attribute. / 待用户审核的记忆候选，包含证据与目标画像属性。 */
@@ -12,39 +14,24 @@ type Attribute = { key: string; value: unknown; dimension: string; scope: Memory
 /** Versioned user profile snapshot plus counters for attributes removed or permanently erased. / 带版本的用户画像快照，以及被移除或永久清除的属性计数。 */
 type Profile = { version: number; attributes?: Attribute[]; removed_attributes?: number; redacted_attributes?: number }
 type Version = { version: number; change_summary: string; created_at: string; removed_attributes?: number; redacted_attributes?: number }
-/** Background memory-learning status reported by the server. / 服务端返回的后台记忆学习状态。 */
-type Learning = { enabled: boolean; total_turns: number; pending: number; processed: number; failed: number; suggestions: number; observed: number; profile_version: number; engine: 'rule_review' | 'llm_learning'; mode: string; dead: number; last_error: string | null; statistics?: { states: Record<string, number>; events: Record<string, number>; reinforcement_dedup_rate: number | null } }
 
 const emit = defineEmits<{ memory: [id: string]; evidence: [thread: string, run: string] }>()
 const suggestions = ref<Suggestion[]>([])
-const memories = ref<(MemoryReceipt & { content: string })[]>([])
 const profile = ref<Profile>()
 const versions = ref<Version[]>([])
 const historical = ref<Profile>()
 const editing = ref('')
 const draft = ref('')
 const draftKey = ref('')
-const deleting = ref<MemoryReceipt>()
 const busy = ref(false)
 const loading = ref(false)
 const loadError = ref('')
 const actionError = ref('')
-const learning = ref<Learning>()
-/** Explains the empty learning state for the current engine/mode. / 根据当前引擎与模式解释学习状态为空的原因。 */
-const emptyLearningDescription = computed(() => {
-  if (learning.value?.mode === 'shadow') return t('Shadow mode evaluates conversations without saving memory or profile changes.', '影子运行只评估对话，不保存记忆或画像变更。')
-  if (learning.value?.mode === 'off') return t('Resume background learning in settings to analyze completed conversations.', '在设置中恢复后台学习后，将继续分析已完成的对话。')
-  return learning.value?.engine === 'llm_learning' && learning.value?.mode === 'auto'
-    ? t('The model saves durable, evidence-backed memories automatically. Ordinary task questions do not create a user profile.', '模型会自动沉淀有证据的长期记忆；普通任务提问不会被编造成用户画像。')
-    : t('Confirmed identity, skill and preference facts project into one profile.', '已确认的身份、技能和偏好等事实投影到同一份画像。')
-})
 const notice = ref('')
-const memoryStatus = ref('active')
-const restoring = ref<MemoryReceipt>()
 const nextVersion = ref<number | null>(null)
 const historyLimit = ref(200)
 const loadingVersions = ref(false)
-let poll: number | undefined
+const list = ref<InstanceType<typeof MemoryList>>()
 let disposed = false
 const selectedProfile = computed(() => historical.value ?? profile.value)
 const dimensionNames: Record<string, [string, string]> = {
@@ -92,31 +79,35 @@ const differences = computed(() => {
   return attributes
 })
 
-/** Loads suggestions, memories, profile, versions and learning status; schedules a follow-up refresh while work is pending. / 加载建议、记忆、画像、版本与学习状态，并在有待处理任务时安排轮询刷新。 */
+/** Loads suggestions, profile and versions once; live learning/list data lives in child panels. / 一次性加载建议、画像与版本；实时学习与列表数据在子面板中维护。 */
 async function load() {
   if (disposed || loading.value) return
-  window.clearTimeout(poll)
   loading.value = true
   loadError.value = ''
   const results = await Promise.allSettled([
     workRequest<{ items: Suggestion[] }>('/memory-suggestions').then(value => { suggestions.value = value.items }),
-    workRequest<{ items: (MemoryReceipt & { content: string })[] }>('/memories?limit=200&status=' + memoryStatus.value).then(value => { memories.value = value.items }),
     workRequest<Profile>('/profile').then(value => { profile.value = value }),
     workRequest<{ items: Version[]; next_cursor: number | null; retention_limit: number }>('/profile/versions').then(value => { versions.value = value.items; nextVersion.value = value.next_cursor; historyLimit.value = value.retention_limit }),
-    workRequest<Learning>('/memory-learning').then(value => { learning.value = value }),
   ])
   if (results.some(result => result.status === 'rejected')) {
     loadError.value = t('Some memory data could not be loaded.', '部分记忆数据加载失败。')
   }
   loading.value = false
-  // Poll again while learning is busy or newer profile/suggestion data is expected. / 当学习任务繁忙或预计会有更新的画像/建议数据时再次轮询。
-  if (!disposed && (learning.value?.pending || (learning.value?.profile_version ?? 0) > (profile.value?.version ?? 0) || (learning.value?.suggestions ?? 0) > suggestions.value.length)) {
-    poll = window.setTimeout(load, 1800)
-  }
 }
-// Refresh when the window regains focus, and clean up listeners/timers on unmount. / 窗口重获焦点时刷新，并在卸载时清理监听器与定时器。
+// Refresh when the window regains focus, and clean up the listener on unmount. / 窗口重获焦点时刷新，并在卸载时清理监听器。
 onMounted(() => { void load(); window.addEventListener('focus', load) })
-onBeforeUnmount(() => { disposed = true; window.clearTimeout(poll); window.removeEventListener('focus', load) })
+onBeforeUnmount(() => { disposed = true; window.removeEventListener('focus', load) })
+
+/** Refreshes the page panels and the saved-memory list after new data is available. / 有新数据时刷新页面面板与已保存记忆列表。 */
+function reloadAll() {
+  void load()
+  list.value?.refresh()
+}
+
+/** Refreshes everything after a new memory is created. / 新建记忆后刷新全部面板。 */
+function onSaved() {
+  reloadAll()
+}
 
 /** Appends the next page of older profile versions. / 追加下一页更早的画像版本。 */
 async function moreVersions() {
@@ -128,13 +119,6 @@ async function moreVersions() {
     nextVersion.value = result.next_cursor
   } catch (error) { actionError.value = error instanceof Error ? error.message : String(error) }
   finally { loadingVersions.value = false }
-}
-/** Queues all completed turns for background reanalysis. / 将所有已完成对话加入后台重新分析队列。 */
-async function reprocess() {
-  await change(async () => {
-    const result = await workRequest<{ queued: number }>('/memory-learning/reprocess', 'POST', {})
-    notice.value = t(`${result.queued} completed turns queued for reanalysis.`, `已提交 ${result.queued} 轮已完成对话重新分析。`)
-  })
 }
 /** Number of attributes permanently erased from the displayed historical snapshot. / 当前展示的历史快照中被永久清除的属性数量。 */
 const erasedCount = computed(() => historical.value?.redacted_attributes ?? 0)
@@ -154,10 +138,9 @@ async function change(action: () => Promise<void>) {
   try {
     await action()
     editing.value = ''
-    deleting.value = undefined
-    restoring.value = undefined
     historical.value = undefined
     await load()
+    list.value?.refresh()
   } catch (error) {
     actionError.value = error instanceof Error ? error.message : t('Could not save changes.', '无法保存更改。')
   } finally {
@@ -202,27 +185,17 @@ async function showVersion(version: number) {
 
 <template>
   <main class="simple-page memory-management">
-    <header>
+    <header v-once>
       <h1>{{ t('Memory and user profile', '长期记忆与用户画像') }}</h1>
-      <div class="memory-page-actions"><MemoryCreateDialog @saved="load" /><button class="outline-button" :disabled="loading || busy" @click="load">{{ t('Refresh', '刷新') }}</button></div>
+      <div class="memory-page-actions"><MemoryCreateDialog @saved="onSaved" /><button class="outline-button" @click="load">{{ t('Refresh', '刷新') }}</button></div>
     </header>
     <p v-if="loading" role="status">{{ t('Loading…', '正在加载…') }}</p>
     <p v-if="loadError" role="alert">{{ loadError }}</p>
     <p v-if="actionError" role="alert">{{ actionError }}</p>
     <p v-if="notice" role="status">{{ notice }}</p>
-    <section v-if="learning" class="memory-learning-status" aria-live="polite">
-      <div><h2>{{ t('Memory learning', '记忆学习') }}</h2>
-        <p v-if="!learning.enabled" class="muted">{{ t('Personalized memory is off.', '定制记忆已关闭。') }}</p>
-        <p v-else class="muted">{{ t(`${learning.processed} turns analyzed · ${learning.pending} pending · ${learning.suggestions} to review`, `已分析 ${learning.processed} 轮 · 待处理 ${learning.pending} 轮 · 待确认 ${learning.suggestions} 项`) }}</p>
-        <p v-if="learning.statistics" class="muted">{{ t('Reinforcement deduplication', '强化去重率') }} {{ learning.statistics.reinforcement_dedup_rate == null ? '—' : (learning.statistics.reinforcement_dedup_rate * 100).toFixed(1) + '%' }} · {{ t('Conflicts', '冲突版本') }} {{ learning.statistics.events.conflict ?? 0 }} · {{ t('Capacity blocks', '容量阻塞') }} {{ learning.statistics.events.capacity_blocked ?? 0 }}</p>
-        <p v-if="learning.mode === 'off' && learning.enabled" class="muted">{{ t('Background learning is paused in settings.', '已在设置中暂停后台学习。') }}</p>
-        <p v-if="learning.failed" role="alert">{{ learning.dead ? t(`${learning.dead} turns reached the retry limit. Reanalyze to try again.`, `${learning.dead} 轮已达到重试上限，可重新分析。`) : t('Some turns could not be analyzed and will retry.', '部分轮次分析失败，系统会重试。') }} <code v-if="learning.last_error">{{ learning.last_error }}</code></p>
-        <p v-else-if="learning.enabled && !learning.pending && !learning.suggestions && !profile?.version" class="muted">{{ emptyLearningDescription }}</p>
-      </div>
-      <button class="quiet-button" :disabled="busy || loading || !learning.enabled || learning.pending > 0" @click="reprocess">{{ t('Reanalyze conversations', '重新分析已有对话') }}</button>
-    </section>
+    <MemoryLearningStatus @reload="reloadAll" />
 
-    <section v-if="suggestions.length || learning?.mode === 'review'">
+    <section>
       <h2>{{ t('Suggestions to review', '待审核建议') }}</h2>
       <p v-if="!suggestions.length && !loading" class="muted">{{ t('No suggestions waiting for review.', '暂无待审核建议。') }}</p>
       <article v-for="item in suggestions" :key="item.id" class="memory-review-item">
@@ -275,25 +248,6 @@ async function showVersion(version: number) {
       </details>
     </section>
 
-    <section>
-      <div class="memory-section-heading"><h2>{{ t('Saved memories', '已保存记忆') }}</h2><select v-model="memoryStatus" :aria-label="t('Memory status', '记忆状态')" @change="load"><option value="active">{{ t('Active', '有效记忆') }}</option><option value="archived">{{ t('Archived', '已归档记忆') }}</option><option value="superseded">{{ t('Superseded', '已被更正') }}</option><option value="invalidated">{{ t('Invalidated', '已失效') }}</option></select></div>
-      <p v-if="!memories.length && !loading" class="muted">{{ t('No saved memories yet.', '暂无已保存记忆。') }}</p>
-      <div v-for="item in memories" :key="item.id" class="saved-memory-row">
-        <button class="simple-row" @click="emit('memory', item.id)">{{ item.title }}
-          <small>{{ item.type ? memoryTypeName(item.type, t) + ' · ' : '' }}{{ memoryScope(item.scope, t) }}</small><small v-if="item.effective_frequency != null">{{ t('Confirmed sessions', '有效确认会话') }} {{ item.effective_frequency }} · {{ t('Frequency strength', '频次强度') }} {{ (item.strength ?? 0).toFixed(2) }}<span v-if="item.protected"> · {{ t('Protected', '受保护') }}</span></small>
-        </button>
-        <button v-if="memoryStatus === 'archived'" class="quiet-button" :disabled="busy" @click="restoring = item">{{ t('Restore', '恢复') }}</button>
-        <button class="quiet-button" :disabled="busy" @click="deleting = item">{{ t('Delete', '删除') }}</button>
-      </div>
-      <div v-if="restoring" class="memory-review-item" role="group" :aria-label="t('Restore memory', '恢复记忆')">
-        <p>{{ restoring.title }} — {{ t('Restore this memory? If it is a profile attribute, its value replaces the current value in the same scope.', '恢复这条记忆？如果它属于画像属性，将替换同一范围内当前的属性值。') }}</p>
-        <div><button class="quiet-button" :disabled="busy" @click="restoring = undefined">{{ t('Cancel', '取消') }}</button><button class="accent-button" :disabled="busy" @click="change(async () => { if (restoring) await workRequest('/memories/' + encodeURIComponent(restoring.id), 'PATCH', { status: 'active' }) })">{{ t('Confirm restore', '确认恢复') }}</button></div>
-      </div>
-      <div v-if="deleting" role="group" :aria-label="t('Confirm deletion', '确认删除')">
-        <p>{{ t('Permanently delete this memory?', '永久删除这条记忆？') }} {{ deleting.title }}</p>
-        <button class="quiet-button" :disabled="busy" @click="deleting = undefined">{{ t('Cancel', '取消') }}</button>
-        <button class="accent-button" :disabled="busy" @click="change(async () => { if (deleting) await workRequest('/memories/' + encodeURIComponent(deleting.id), 'DELETE') })">{{ t('Delete', '删除') }}</button>
-      </div>
-    </section>
+    <MemoryList ref="list" @memory="id => emit('memory', id)" />
   </main>
 </template>

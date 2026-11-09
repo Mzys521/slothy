@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import shutil
 import tempfile
 from itertools import islice
 from pathlib import Path
@@ -216,6 +217,61 @@ class WorkspaceFiles:
             ok=True,
             summary=f"Found {len(matches)} fixed-string matches.",
             data={"matches": matches, "truncated": truncated},
+        ).model_dump()
+
+    async def delete(self, path: str, recursive: bool = False):
+        """
+        Delete one workspace file or directory after approval. / 审批后删除工作区文件或目录。
+
+        The path is resolved again at execution time, so an approval cannot be reused for a
+        different target. Symlinks, workspace roots, private paths and non-empty directories
+        without ``recursive`` are rejected, and a recursive delete scans for links first.
+
+        Args:
+            path: Relative target path inside the workspace. / 工作区内相对目标路径。
+            recursive: Allow deleting a non-empty directory. / 是否允许递归删除非空目录。
+
+        Returns:
+            Serialized ToolResult with the removed path and kind. / 含删除路径与类型的 ToolResult。
+
+        Raises:
+            ToolOperationError: If the target is missing, linked, the root, private or not
+                empty without recursive approval. / 目标缺失、为链接、根目录、私有路径，或未批准
+                递归而目录非空时抛出。
+        """
+        target = self.resolve(path)
+        if target == self.root:
+            raise ToolOperationError("DENIED", "The workspace root cannot be deleted.")
+        if not target.exists():
+            raise ToolOperationError("NOT_FOUND", "The target does not exist.")
+        if target.is_symlink():
+            raise ToolOperationError("DENIED", "Linked paths cannot be deleted.")
+        kind = "directory" if target.is_dir() else "file"
+        if kind == "directory":
+            children = list(target.iterdir())
+            if children and not recursive:
+                raise ToolOperationError(
+                    "DENIED",
+                    "Directory is not empty.",
+                    hint="Pass recursive=true only after reviewing the full deletion scope.",
+                )
+            for child in target.rglob("*"):
+                if child.is_symlink():
+                    raise ToolOperationError(
+                        "DENIED",
+                        "Directory contains a linked path; move it out before deleting.",
+                    )
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return ToolResult(
+            ok=True,
+            summary=f"Deleted one workspace {kind}.",
+            data={
+                "path": target.relative_to(self.root).as_posix(),
+                "kind": kind,
+                "recursive": recursive,
+            },
         ).model_dump()
 
     async def write(self, action: str, path: str, content="", overwrite=False):

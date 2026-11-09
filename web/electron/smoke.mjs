@@ -78,7 +78,7 @@ export async function createSmokeBackend({ firstRun = false, handle } = {}) {
  * @param options.firstRun - Simulate a fresh installation with the onboarding overlay. / 模拟带引导浮层的全新安装。
  * @returns Resolves when every assertion passed. / 全部断言通过后完成。
  */
-export async function runSmoke({ devServer, backend: testBackend, firstRun = false, verify, screenshot } = {}) {
+export async function runSmoke({ devServer, backend: testBackend, firstRun = false, verify, screenshot, viewport } = {}) {
   const { backend, origin } = testBackend || await createSmokeBackend({ firstRun })
   const userData = await mkdtemp(path.join(tmpdir(), 'slothy-electron-'))
   const env = {
@@ -164,6 +164,15 @@ export async function runSmoke({ devServer, backend: testBackend, firstRun = fal
       return response.result.value
     }
     const apiBase = ''
+    if (viewport) {
+      const id = ++sequence
+      await new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject })
+        socket.send(JSON.stringify({ id, method: 'Emulation.setDeviceMetricsOverride', params: {
+          width: viewport.width, height: viewport.height, deviceScaleFactor: 1, mobile: false,
+        } }))
+      })
+    }
     let result
     for (let attempt = 0; attempt < 5; attempt++) {
       try {

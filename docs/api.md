@@ -31,6 +31,13 @@ the port is assigned at startup.
 | PUT | `/settings/providers/{id}` | update a provider |
 | DELETE | `/settings/providers/{id}` | delete a provider |
 | POST | `/settings/providers/discover` | query `{base_url}/models` for the given credentials |
+| POST | `/settings/providers/test-models` | test selected models with tiny real requests; partial results |
+| GET | `/settings/decision` | selected decision model and available model IDs |
+| PUT | `/settings/decision` | select/clear the decision model and rebuild runners |
+| GET | `/settings/search` | DeepSeek Search credential status (no secret) |
+| PUT | `/settings/search` | save an independent Search key |
+| DELETE | `/settings/search` | remove the independent Search key |
+| POST | `/settings/search/test` | run one real Search request |
 | GET | `/settings` | global personalization switch |
 | PATCH | `/settings` | set the global personalization switch |
 | GET | `/settings/memory` | memory planner configuration (14 fields, revision) |
@@ -259,10 +266,23 @@ Errors retain `{code,message,request_id}`: 404 `CONNECTOR_NOT_FOUND`, 409 `CONNE
 ## Unified tool contract
 
 `GET /runtime` adds `tool_groups` (read/write/execute/network) and `deprecated_tools`.
-Default desktop tools: 9 in Work, 7 in Chat; `read_skill_file` is conditional, and
-`web_fetch` is optional. Hidden aliases never appear in the visible tool lists.
+Default desktop tools: 10 in Work, 8 in Chat; `read_skill_file` is conditional,
+`deepseek_search` appears only after a Search key resolves, and `web_fetch` is optional.
+Hidden aliases never appear in the visible tool lists.
+`workspace_delete` is reviewed in both Chat and Work: paths are workspace-confined,
+links and roots are rejected, and recursive targets are revalidated at execution time.
 Connector records additionally expose `risk`, `platforms`, `available` and per-tool
 `capabilities`; credential/configuration fields remain private.
+
+### DeepSeek Search
+
+`GET /settings/search` reports `{configured,source,independent}` without returning the
+key. `PUT /settings/search` saves an independent DPAPI-protected key, `DELETE` removes
+only that key, and `POST /settings/search/test` performs one live Search request.
+The optional `deepseek_search` tool calls `POST https://api.deepseek.com/v1/tools/search`
+with `query`, `count`, `ori_question`, `need_content`; results expose title, URL, snippet,
+summary, content, site name/icon, publication date, authority and rerank score. Without
+a key the tool is not registered; the DeepSeek model key is used as a fallback.
 
 Tool messages use this envelope:
 
@@ -277,6 +297,10 @@ Failures set `ok=false` and carry `error: {code,message,retryable,hint?}`. Codes
 Artifact metadata contains `id,name,bytes,rel_path,sha256,url`; only real returned
 artifacts are reported. `GET /threads/{thread_id}/artifacts/{artifact_id}` downloads
 an owned, journaled artifact after path/size/hash validation (404 when unavailable).
+
+`ChatResult`, done SSE frames and archived `ThreadMessage` rows expose `reasoning`.
+It is display-only reasoning text and is never read back into prompt/history
+message content. Streaming sends `reasoning` events separately from `delta`.
 
 Each approval call optionally includes `risk` and `review_hint`. The approval ID,
 explicit boolean decision and batch semantics are unchanged. Invalid/unavailable

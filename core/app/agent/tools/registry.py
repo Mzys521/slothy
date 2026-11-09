@@ -359,7 +359,7 @@ def calculate_financial(
         raise ToolException(str(exc)) from exc
 
 
-def create_builtin_tools(settings: ToolSettings | None = None) -> list[BaseTool]:
+def create_builtin_tools(settings: ToolSettings | None = None, *, search=None) -> list[BaseTool]:
     """
     Create reusable tool lists for application graph injection. /
     创建供应用注入图的复用工具列表。
@@ -374,4 +374,4 @@ def create_builtin_tools(settings: ToolSettings | None = None) -> list[BaseTool]
     """
     from app.agent.tools.builtins import builtin_tools
 
-    return builtin_tools(settings if settings is not None else ToolSettings())
+    return builtin_tools(settings if settings is not None else ToolSettings(), search=search)

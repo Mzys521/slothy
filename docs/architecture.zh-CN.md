@@ -67,7 +67,7 @@ Electron 主进程                        Electron 渲染进程（Vue 3）
 ## 4. 智能体图
 
 ```
-START → prepare_run → load_profile → retrieve_memories
+START → prepare_run → decide → load_profile → retrieve_memories
       → build_personalized_context → agent ─┬─ 无工具调用 → finalize_response → END
                                             └─ 有工具调用 ──▶ tools ──▶ agent
                                                              │
@@ -77,6 +77,8 @@ START → prepare_run → load_profile → retrieve_memories
 ```
 
 - **prepare_run**：校验新请求、清空本轮派生字段、按完整用户轮次限制工作历史。
+- **decide**：可选地向独立决策模型请求受护栏约束的计划（路由/工具/上下文/恢复）；
+  off、shadow、enforce 三档见 §4.1。
 - **load_profile / retrieve_memories / build_personalized_context**：只读端口，分别读取画像
   快照、按作用域检索记忆、在预算内构建参考文本；可恢复的失败转成 warnings，而不是伪造回答。
 - **agent**：通过提示词规划器组装请求（见 §6），带工具调用模型。
@@ -92,6 +94,15 @@ START → prepare_run → load_profile → retrieve_memories
 - 存储线程键为 `[user_id, thread_id]`，业务 ID 保留在 state 中。
 - Runner 按线程串行执行；推进前会补写上一轮缺失的归档。
 - 审批策略（`ask` | `every`）决定哪些调用暂停；`ask` 下安全工具与只读命令不暂停。
+
+### 4.1 决策模型驱动的决策层
+
+`prepare_run` 与 `load_profile` 之间新增一个 `decide` 节点。决策模型在设置 → API 中从已配置
+模型目录选择；密钥与地址复用所属 Provider，选择本身不含凭据。模型返回结构化计划：路由
+（identity/model/tool）、工具子集、上下文预算与恢复提示。确定性护栏按模型目录、实时工具注册表、
+审批要求和预算收敛计划；模型提议永远不能放宽审批或加入未知工具。未选择决策模型时由聊天模型
+自主决策；已配置模型超时、非法 JSON 或预算不足时，控制权交回聊天模型。仅后端运行仍可使用
+`DECISION_MODE` / `DASHSCOPE__*` 环境变量。计划与原因码写入图状态和指标，不进入 L1/L2 提示词。
 
 ## 5. 记忆与用户画像 V3
 
@@ -119,6 +130,14 @@ START → prepare_run → load_profile → retrieve_memories
   网络错误及每日预算预留沿用可观测的后台生命周期。
 
 ## 6. 提示词分层与缓存
+
+2026-11-09 更新参照 DSH 区分静态提示分节与动态运行快照：静态内容按 order/name 组装；
+Skill、显式引用和附件在独立检查点字段保存请求表面，不混入真实消息、归档、轮次或记忆学习。
+内容相同时复用位置，变化时在当前历史后追加；压缩移除锚点后重投最新快照。每次调用重验来源，
+撤销和作用域变化会移除旧正文；默认最多 8 快照和 32768 字节，超大单个快照只用于当次请求。
+长期记忆服务、画像及个性化检索的注入和撤销逻辑保持原行为。DeepSeek 仅回传工具往返需要的
+assistant 推理，最终回答推理留在显示和归档。上下文统计不再重复计数系统提示或误认尾部引用。
+默认提示版本 `2026-11-09.context-v1`；离线前缀比例表示复用条件，实际缓存命中仍以厂商 usage 为准。
 
 请求按“变化频率”组织为三层：
 
@@ -166,6 +185,8 @@ Skill 引用读取在两模式免审，导入执行连接器限定 Work。审批
 | `calculate` / `calculate_financial` | 进程内 | float / Decimal 字符串计算 |
 | `workspace_read` | 进程内 | 有界 UTF-8 分页、目录与固定字符串搜索；排除私密和链接路径 |
 | `workspace_write` | 进程内 | 审批后创建目录/写文件；默认不覆盖 |
+| `workspace_delete` | 进程内 | 审批后的 Chat/Work 文件/目录删除；拒绝符号链接、根目录与私有路径；执行时复验递归目标 |
+| `deepseek_search` | HTTPS | 官方 DeepSeek Search API；解析到搜索/模型密钥后才注册；结构化来源与超时/限流/鉴权错误 |
 | `export_document` | 标准库 / python-docx | 审批后模板导出 md/txt/csv/json/docx，不执行模型代码 |
 | `run_python` | 独立 Python 进程 | 审批、调用清单、独立目录、原有审计和产物限制 |
 | `get_datetime` | 进程内 | 当前时间和带偏移量的 IANA 时区换算，随包携带 tzdata |

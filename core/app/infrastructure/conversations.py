@@ -177,6 +177,7 @@ class SQLiteConversationStore:
                 ("explicit_references", "TEXT NOT NULL DEFAULT '[]'"),
                 ("memory_trace", "TEXT NOT NULL DEFAULT '{}'"),
                 ("profile_version", "INTEGER"),
+                ("reasoning", "TEXT NOT NULL DEFAULT ''"),
                 ("learning_attempts", "INTEGER NOT NULL DEFAULT 0"),
                 ("learning_error", "TEXT"),
                 ("learning_generation", "INTEGER NOT NULL DEFAULT 0"),
@@ -487,11 +488,11 @@ class SQLiteConversationStore:
         )
         async with self._connection.execute(
             """INSERT INTO conversation_turns (
-                   user_id, thread_id, run_id, user_input, response,
+                   user_id, thread_id, run_id, user_input, response, reasoning,
                    attachment_ids, activity, metrics, used_memory_ids, profile_version,
                    explicit_references, memory_trace, recorded_at
                )
-               SELECT user_id, ?, run_id, user_input, response,
+               SELECT user_id, ?, run_id, user_input, response, reasoning,
                       attachment_ids, activity, metrics, used_memory_ids,
                       profile_version, explicit_references, memory_trace, recorded_at
                FROM conversation_turns WHERE user_id=? AND thread_id=? ORDER BY id""",
@@ -743,11 +744,11 @@ class SQLiteConversationStore:
         async with self._connection.execute(
             """
             INSERT INTO conversation_turns (
-                user_id, thread_id, run_id, user_input, response,
+                user_id, thread_id, run_id, user_input, response, reasoning,
                 learning_state, learning_project_id, attachment_ids, activity, metrics,
                 used_memory_ids, profile_version, explicit_references, memory_trace, recorded_at
             )
-            VALUES (?, ?, ?, ?, ?, CASE WHEN ?=1 AND coalesce((
+            VALUES (?, ?, ?, ?, ?, ?, CASE WHEN ?=1 AND coalesce((
                 SELECT personalization_enabled FROM conversation_preferences WHERE user_id=?
             ),1)=1 THEN 1 ELSE 0 END, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             ON CONFLICT (user_id, thread_id, run_id) DO NOTHING
@@ -758,6 +759,7 @@ class SQLiteConversationStore:
                 run_id,
                 turn.user_input,
                 turn.response,
+                turn.reasoning,
                 int(turn.learn_memory),
                 user_id,
                 turn.project_id,
@@ -1060,7 +1062,7 @@ class SQLiteConversationStore:
             raise ValueError("Invalid conversation history page")
         async with self._connection.execute(
             f"""
-            SELECT id, run_id, user_input, response, attachment_ids, activity, metrics,
+            SELECT id, run_id, user_input, response, reasoning, attachment_ids, activity, metrics,
                    used_memory_ids, profile_version, explicit_references, memory_trace
             FROM conversation_turns
             WHERE user_id=? AND thread_id=? AND id>?
@@ -1077,6 +1079,7 @@ class SQLiteConversationStore:
                         run_id,
                         user_input,
                         response,
+                        reasoning=reasoning,
                         attachment_ids=tuple(json.loads(files)),
                         activity=tuple(
                             RunActivity.model_validate(item) for item in json.loads(trace)
@@ -1093,6 +1096,7 @@ class SQLiteConversationStore:
                     run_id,
                     user_input,
                     response,
+                    reasoning,
                     files,
                     trace,
                     metrics,

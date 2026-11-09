@@ -68,7 +68,7 @@ def prompt_plan(**overrides):
 def test_tail_preserves_the_entire_current_tool_round_and_history():
     plan = prompt_plan()
     assert [item.content for item in plan.messages[:4]] == [
-        "trusted\nprompt_version=2026-11-07.memory-v3",
+        "trusted\nprompt_version=2026-11-09.context-v1",
         "old user",
         "old answer",
         "fresh",

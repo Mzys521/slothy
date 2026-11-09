@@ -4,6 +4,7 @@ import asyncio
 from copy import deepcopy
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.language_models import LanguageModelInput
 from langchain_core.messages import (
@@ -17,7 +18,8 @@ from langchain_core.runnables import Runnable, RunnableConfig
 from app.agent.graph.services import AgentServices, ContextBuildResult, HistorySummaryResult
 from app.agent.graph.state import AgentState
 from app.agent.prompting.history import clip, extractive_summary
-from app.agent.prompting.plan import compose, reference
+from app.agent.prompting.plan import compose, digest, reference
+from app.agent.prompting.runtime_context import project_runtime_context
 from app.agent.prompting.telemetry import cache_write_tokens
 from app.config import AgentSettings, PromptSettings
 from app.memory.context import memory_trace
@@ -43,6 +45,7 @@ class AgentNodes:
         prompt_settings: PromptSettings | None = None,
         toolset_hash: str = "",
         cache_protocol: str = "openai",
+        tools: tuple = (),
     ) -> None:
         """Store the dependencies shared by every node call. / 保存所有节点调用共享的依赖。
 
@@ -64,6 +67,7 @@ class AgentNodes:
         self.services = services
         self.settings = settings
         self.model = model
+        self.tools = tools
         self.system_prompt = system_prompt
         self.tools_enabled = tools_enabled
         self.prompt_settings = prompt_settings or PromptSettings()
@@ -125,6 +129,10 @@ class AgentNodes:
             "error": None,
             "warnings": [],
             "history_compression_pending": len(turns) > self.prompt_settings.history_soft_limit,
+            "decision": None,
+            "decision_reasons": [],
+            "decision_source": None,
+            "decision_enforced": False,
         }
         if self.legacy_history and len(turns) > self.settings.history_max_turns:
             start = turns[-self.settings.history_max_turns]
@@ -514,7 +522,11 @@ class AgentNodes:
             refreshed.update(await self.build_personalized_context(state))
             reference_update.update(refreshed)
             state = {**state, **refreshed}
-        if self.services.identity_reader and identity_intent(state["user_input"]):
+        decision = state.get("decision") or {}
+        identity_route = identity_intent(state["user_input"])
+        if state.get("decision_enforced"):
+            identity_route = identity_route and decision.get("route") == "identity"
+        if self.services.identity_reader and identity_route:
             try:
                 async with asyncio.timeout(self.settings.context_read_timeout_seconds):
                     answer = await self.services.identity_reader(
@@ -563,6 +575,7 @@ class AgentNodes:
         reference_update["memory_trace"] = trace
         reference_update["response_source"] = "model"
         messages: list[AnyMessage] = []
+        context_sources: dict[str, list[str]] = {}
         if state.get("references"):
             if self.services.reference_reader is None:
                 raise ValueError("Reference reader is unavailable")
@@ -583,10 +596,14 @@ class AgentNodes:
                     },
                 )
             )
+            context_sources["explicit_reference"] = [
+                str(item["reference_id"]) for item in metadata if item["included"]
+            ]
         if self.services.skill_reader:
             skills = self.services.skill_reader()
             if skills:
                 messages.append(reference("skill_reference", {"skills": skills}))
+                context_sources["skill_reference"] = [digest(item) for item in skills]
         if state.get("attachment_ids"):
             if self.services.attachment_reader is None:
                 raise ValueError("Attachment reader is unavailable")
@@ -594,6 +611,29 @@ class AgentNodes:
                 state["user_id"], state["thread_id"], state["attachment_ids"]
             )
             messages.append(reference("attachment_reference", attachment_references(attachments)))
+            context_sources["attachment_reference"] = [str(item["id"]) for item in attachments]
+        context_by_anchor = None
+        runtime_metadata = {}
+        if self.prompt_settings.layout == "layered" and self.prompt_settings.layered_l3:
+            projection = project_runtime_context(
+                messages=list(state["messages"]),
+                references=messages,
+                sources=context_sources,
+                previous=state.get("runtime_context_events") or [],
+                scope={
+                    "user": state["user_id"], "thread": state["thread_id"],
+                    "project": state.get("project_id"),
+                    "budget": decision.get("context_plan", {}).get("reference_budget"),
+                },
+                max_bytes=self.prompt_settings.runtime_context_max_bytes,
+                max_snapshots=self.prompt_settings.runtime_context_max_snapshots,
+            )
+            reference_update["runtime_context_events"] = projection.events
+            context_by_anchor = projection.by_anchor
+            runtime_metadata = projection.metadata
+            messages = []
+        else:
+            reference_update["runtime_context_events"] = []
         if state["personalization_enabled"] and state.get("personalization_context"):
             # Keep reference data separate from system instructions and stored messages. /
             # 中文：参考数据独立于系统指令，并且不写回工作消息或检查点历史。
@@ -622,12 +662,50 @@ class AgentNodes:
             snapshot=state.get("profile_snapshot"),
             summary=state.get("history_summary"),
             toolset_hash=self.toolset_hash,
+            context_by_anchor=context_by_anchor,
         )
+        plan.metadata.update(runtime_metadata)
         started = perf_counter()
-        response = await self.model.ainvoke(
-            plan.for_provider(self.cache_protocol, self.prompt_settings.cache_breakpoints),
-            config=config,
+        call_id = uuid4().hex
+        step_id = f"{state['run_id']}:step:{call_id[:8]}"
+        selection = state.get("model_selection") or {}
+        provider = str(selection.get("id", "")).split("/", 1)[0] or "unknown"
+        tool_names = [tool.name for tool in self.tools]
+        from app.observability.journal import context_breakdown
+
+        context = context_breakdown(
+            self.system_prompt,
+            plan.messages,
+            state.get("personalization_context", ""),
+            tool_names,
         )
+        try:
+            response = await self.model.ainvoke(
+                plan.for_provider(self.cache_protocol, self.prompt_settings.cache_breakpoints),
+                config=config,
+            )
+        except Exception as error:
+            if self.services.runtime_journal is not None:
+                await self.services.runtime_journal.model_call(
+                    session_id=state["thread_id"],
+                    run_id=state["run_id"],
+                    step_id=step_id,
+                    model_call_id=call_id,
+                    provider=provider,
+                    model=str(selection.get("id") or getattr(self.model, "model_name", "")),
+                    parameters={
+                        "temperature": getattr(self.model, "temperature", None),
+                        "max_tokens": getattr(self.model, "max_tokens", None),
+                    },
+                    context=context,
+                    tools={"count": len(tool_names), "names": tool_names,
+                           "schema_tokens": context["tool_schema"]},
+                    usage=None,
+                    duration_ms=round((perf_counter() - started) * 1000),
+                    status="failed",
+                    error=error,
+                )
+            raise
         elapsed = perf_counter() - started
         if not isinstance(response, AIMessage) or response.invalid_tool_calls:
             raise ValueError("Model returned an invalid assistant response")
@@ -639,6 +717,28 @@ class AgentNodes:
             raise ValueError("Model did not produce a final text answer")
         update: dict[str, Any] = {**reference_update, "messages": [response]}
         usage = response.usage_metadata
+        if self.services.runtime_journal is not None:
+            await self.services.runtime_journal.model_call(
+                session_id=state["thread_id"],
+                run_id=state["run_id"],
+                step_id=step_id,
+                model_call_id=call_id,
+                provider=provider,
+                model=str(selection.get("id") or getattr(self.model, "model_name", "")),
+                parameters={
+                    "temperature": getattr(self.model, "temperature", None),
+                    "max_tokens": getattr(self.model, "max_tokens", None),
+                },
+                context=context,
+                tools={"count": len(tool_names), "names": tool_names,
+                       "schema_tokens": context["tool_schema"]},
+                usage=usage,
+                duration_ms=round(elapsed * 1000),
+                status="success",
+                response_status=str(response.response_metadata.get("finish_reason", ""))
+                or None,
+                compaction={"summary_applied": bool(state.get("history_summary"))},
+            )
         if self.services.prompt_observer:
             selection = state.get("model_selection") or {}
             namespace = f"{selection.get('id')}:{selection.get('effort')}:{self.toolset_hash}"

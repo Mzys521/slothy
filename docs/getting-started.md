@@ -54,7 +54,10 @@ You can configure a provider two ways — pick one:
    OpenAI, Anthropic, Kimi, Qwen) or a custom OpenAI/Anthropic-compatible
    connection, paste the key and save — the app opens the workspace. You can
    change providers later under **Settings → API**. Keys are stored with Windows
-   DPAPI in `providers.json` inside the data directory.
+   DPAPI in `providers.json` inside the data directory. An optional independent
+   **DeepSeek Search API key** can be saved/tested/deleted there; otherwise the DeepSeek
+   model key is reused, and without either key `deepseek_search` is not exposed. High-risk
+   tool calls pause for the runtime approval dialog, not a normal chat confirmation.
 2. **In `.env`** for backend-only runs and the CLI examples:
 
 ```ini
@@ -78,6 +81,12 @@ DEEPSEEK_MODEL=deepseek-chat
 
 `LLM_MODEL`, `LLM_API_KEY` and `LLM_BASE_URL` are optional generic overrides. The
 model name must be set explicitly; Slothy never silently switches models.
+
+Optional decision model: choose a configured model under **Settings → API → Decision
+model**. It uses that provider's key and base URL. With no selection the chat model
+decides autonomously; if the decision model is unavailable, invalid or over budget,
+control returns to the chat model. Plans never bypass tool approval or enter
+prompt-cache text. Backend-only runs may still configure `DASHSCOPE__*` / `DECISION_*`.
 
 ## 3. Install the desktop dependencies
 
@@ -122,7 +131,9 @@ context, artifacts and help); file upload now lives in the same plus menu. Type 
 to reference a workspace folder or file, an owned conversation, or an enabled plugin:
 the server revalidates ownership and scope, then injects bounded low-trust L3 data.
 `/compact` and `/export` require confirmation, and plugin tool calls keep the normal
-approval policy.
+approval policy. Files can also be dropped onto the conversation: TXT, Markdown, PDF,
+DOCX, JSON, CSV and similar documents are validated (8 files, 2 MiB each) and kept as
+pending attachments; PDF text is extracted locally before sending.
 
 ## 5. Data locations
 

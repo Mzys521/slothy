@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, File as FileIcon, History, LoaderCircle, Pan
 import { activeSession, activeWorkspace, clearSession, newChat, runningRequests as requestControllers, runningSessions, runningTurnIds, selectSession, sessions, sessionWorkspace, syncThreadMessages, workspaces, type ChatMode, type Session, type Turn, type WorkOptions } from './chat'
 import { readLocal, settings, t, writeLocal } from './preferences'
 import MarkdownText from './MarkdownText.vue'
+import ReasoningTrace from './ReasoningTrace.vue'
 import CopyMessage from './CopyMessage.vue'
 import SessionHistory from './SessionHistory.vue'
 import AgentContextPanel from './AgentContextPanel.vue'
@@ -71,6 +72,7 @@ const composer = ref<HTMLTextAreaElement>()
 const fileInput = ref<HTMLInputElement>()
 const workBusy = ref(false)
 const liveReplies = ref<Record<string, string>>({})
+const liveReasoning = ref<Record<string, string>>({})
 const workError = ref('')
 const selectedReferences = ref<ReferenceItem[]>([])
 const referenceTextConfirm = ref(false)
@@ -259,6 +261,8 @@ function applyWorkReply(target: Session, turn: Turn, result: ToolReview | WorkRe
   } else {
     target.pendingReview = null
     turn.serverReply = result.response
+    turn.reasoning = result.reasoning ?? liveReasoning.value[turn.id] ?? turn.reasoning
+    delete liveReasoning.value[turn.id]
     turn.profileVersion = result.profile_version
     if (turn.memory && target.apiThreadId) void loadMemoryReceipts(target.apiThreadId, turn, result.run_id)
   }
@@ -284,6 +288,8 @@ function runStream(path: string, body: object, turn: Turn, signal?: AbortSignal,
       toolCount = count
       turn.activity = update.items
       turn.metrics = update.metrics
+    } else if (update.event === 'reasoning') {
+      liveReasoning.value[turn.id] = (liveReasoning.value[turn.id] ?? '') + update.text
     } else {
       liveReplies.value[turn.id] = (liveReplies.value[turn.id] ?? '') + update.text
     }
@@ -366,6 +372,7 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
     if (target.apiThreadId) await refreshReview(target)
   } finally {
     delete liveReplies.value[turn.id]
+    delete liveReasoning.value[turn.id]
     runningSessions.delete(target.id)
     delete runningTurnIds[target.id]
     requestControllers.delete(target.id)
@@ -404,6 +411,7 @@ async function resolveReview(approved: boolean) {
     await refreshReview(target)
   } finally {
     delete liveReplies.value[turn.id]
+    delete liveReasoning.value[turn.id]
     runningSessions.delete(target.id)
     delete runningTurnIds[target.id]
     requestControllers.delete(target.id)
@@ -536,8 +544,8 @@ function dismissHistory() {
   historyTrigger.value?.focus()
 }
 /**
- * Validate and append files chosen by the attachment picker.
- * 校验并追加附件选择器选中的文件。
+ * Validate and append files chosen by the attachment picker or a drop gesture.
+ * 校验并追加附件选择器或拖拽手势选中的文件。
  *
  * @param event - Change event from the hidden file input. / 隐藏文件输入框的 change 事件。
  */
@@ -545,6 +553,26 @@ function addFiles(event: Event) {
   const input = event.target as HTMLInputElement
   const selected = Array.from(input.files ?? [])
   input.value = ''
+  addFileList(selected)
+}
+
+const dragActive = ref(false)
+let dragDepth = 0
+const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.yaml', '.yml',
+  '.xml', '.log', '.py', '.js', '.ts', '.html', '.css', '.sql', '.toml', '.ini',
+  '.docx', '.pdf',
+])
+
+/**
+ * Validates count, size and extension, then appends supported files.
+ *
+ * 校验数量、大小与扩展名，然后追加受支持的文件；不支持的项不会静默进入附件列表。
+ *
+ * @param selected - Files from the picker or a drag-and-drop gesture. / 选择器或拖拽得到的文件。
+ */
+function addFileList(selected: File[]) {
+  if (!selected.length) return
   if (files.value.length + selected.length > 8) {
     workError.value = t('Attach at most eight files.', '每次最多添加 8 个文件。')
     return
@@ -553,8 +581,48 @@ function addFiles(event: Event) {
     workError.value = t('Each file must be no larger than 2 MiB.', '单个文件不能超过 2 MiB。')
     return
   }
+  const unsupported = selected.find(file => {
+    const dot = file.name.lastIndexOf('.')
+    return dot < 0 || !SUPPORTED_UPLOAD_EXTENSIONS.has(file.name.slice(dot).toLowerCase())
+  })
+  if (unsupported) {
+    workError.value = t(
+      `Unsupported file type: ${unsupported.name}. Attach TXT, Markdown, PDF, DOCX, JSON, CSV or similar documents.`,
+      `不支持的文件类型：${unsupported.name}。请添加 TXT、Markdown、PDF、DOCX、JSON、CSV 等文档。`,
+    )
+    return
+  }
   workError.value = ''
   files.value.push(...selected)
+}
+
+/** Shows the drop overlay while a file drag is inside the conversation. / 拖拽进入对话区域时显示覆盖提示。 */
+function onDragEnter(event: DragEvent) {
+  if (!event.dataTransfer?.types.includes('Files')) return
+  event.preventDefault()
+  dragDepth += 1
+  dragActive.value = true
+}
+
+/** Keeps the browser drop target active and shows a copy cursor. / 保持浏览器放置目标并显示复制光标。 */
+function onDragOver(event: DragEvent) {
+  if (!event.dataTransfer?.types.includes('Files')) return
+  event.preventDefault()
+  event.dataTransfer.dropEffect = 'copy'
+}
+
+/** Hides the overlay when the pointer leaves the conversation region. / 指针离开对话区域时隐藏覆盖层。 */
+function onDragLeave() {
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) dragActive.value = false
+}
+
+/** Accepts dropped files and appends them to the pending attachment list. / 接收拖入文件并加入待发送附件。 */
+function onDrop(event: DragEvent) {
+  event.preventDefault()
+  dragDepth = 0
+  dragActive.value = false
+  addFileList(Array.from(event.dataTransfer?.files ?? []))
 }
 /**
  * Send on Enter while keeping Shift+Enter and IME composition for new lines.
@@ -696,6 +764,7 @@ async function retryCurrent(message: string) {
       last.serverRunId = previousRun
     } finally {
       delete liveReplies.value[last.id]; delete liveReplies.value[restored.id]
+    delete liveReasoning.value[last.id]; delete liveReasoning.value[restored.id]
       workBusy.value = false; runningSessions.delete(target.id); requestControllers.delete(target.id)
       delete runningTurnIds[target.id]
     }
@@ -737,7 +806,11 @@ function onComposerKey(event: KeyboardEvent) {
 </script>
 
 <template>
-  <main class="chat-page" :class="{ 'chat-welcome': empty, 'work-mode': mode === 'work' }">
+  <main class="chat-page" :class="{ 'chat-welcome': empty, 'work-mode': mode === 'work' }"
+  @dragenter.prevent="onDragEnter" @dragover.prevent="onDragOver" @dragleave.prevent="onDragLeave" @drop.prevent="onDrop">
+  <div v-if="dragActive" class="drop-overlay" aria-hidden="true">
+    <div>{{ t('Drop files to attach', '松开以添加附件') }}</div>
+  </div>
     <section v-if="session" class="conversation" :aria-label="mode === 'work' ? t('Work', '工作') : t('Chat', '聊天')">
       <header class="chat-header">
         <div class="chat-modes" role="group" :aria-label="t('Conversation mode', '对话模式')">
@@ -775,6 +848,10 @@ function onComposerKey(event: KeyboardEvent) {
             <img :src="brandAsset('mark.png')" class="assistant-icon" alt="">
             <div class="assistant-content">
               <header><strong>slothy</strong><time>{{ turn.time }}</time></header>
+              <ReasoningTrace
+                :text="turn.reasoning || liveReasoning[turn.id] || ''"
+                :streaming="workRunning(turn) && !turn.serverReply && !liveReplies[turn.id]"
+              />
               <template v-if="turn.activity?.length || turn.toolDecisions?.length || workRunning(turn) || waitingForReview(turn)">
               <button class="activity-trigger" :aria-expanded="showActivity(turn)" :aria-disabled="workRunning(turn) || waitingForReview(turn)" @click="!workRunning(turn) && !waitingForReview(turn) && toggle(activityOpen, turn.id)">
                 <component :is="showActivity(turn) ? ChevronDown : ChevronRight" />
@@ -894,4 +971,6 @@ function onComposerKey(event: KeyboardEvent) {
 .composer-command-notice { max-height: 260px; overflow: auto; }
 .composer-command-notice ul { padding-left: 18px; line-height: 1.8; }
 .composer-command-card strong { font-weight: 500; }
+.drop-overlay { position: absolute; inset: 12px; z-index: 30; display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: var(--radius-surface); background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--ink); font-size: var(--type-section); pointer-events: none; }
+.drop-overlay > div { padding: 10px 18px; border-radius: 999px; background: var(--accent-ink); color: var(--surface); }
 </style>

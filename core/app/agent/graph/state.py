@@ -94,6 +94,9 @@ class AgentState(TypedDict, total=False):
     # 中文：跨新一轮调用持久保留；工厂函数不得重置这些字段。
     history_summary: dict[str, JsonValue]
     history_compression_pending: bool
+    # Operational prompt surface only; never a user turn or long-term memory.
+    # 中文：仅运行提示表面，不是用户轮次，也不参与长期记忆。
+    runtime_context_events: list[dict]
     profile_snapshot: dict[str, JsonValue] | None
     tool_contract_version: int
     tool_review_started_at: float
@@ -102,6 +105,12 @@ class AgentState(TypedDict, total=False):
     references: list[dict]
     resolved_references: list[dict]
     used_reference_ids: list[str]
+    # Decision-model plan for this run; None when the layer is disabled.
+    # 中文：本轮决策模型计划；决策层关闭时为 None。
+    decision: dict[str, JsonValue] | None
+    decision_reasons: list[str]
+    decision_source: str | None
+    decision_enforced: bool
 
 
 def create_initial_state(

@@ -767,3 +767,36 @@ code, kbd, pre, samp { font-family: var(--mono); }
 [data-memory-type="skill"] { --memory-color: light-dark(#856016, #d9a337); }
 .memory-trace small { display: block; overflow-wrap: anywhere; }
 .memory-trace ul { padding-inline-start: 16px; }
+
+.search-settings { display: grid; gap: 8px; margin: 18px 0 28px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius-surface); background: var(--canvas); }
+.search-settings h3 { margin: 0; font-size: var(--type-body); }
+.search-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.search-settings .api-status { display: flex; align-items: center; gap: 8px; margin: 0; }
+
+.provider-model-picker { display: grid; gap: 10px; margin-bottom: 18px; }
+.provider-model-picker input[type="search"] { padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--canvas); color: var(--ink); font: inherit; }
+.model-picker-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.model-options { display: grid; gap: 2px; max-height: 260px; overflow: auto; margin: 0; padding: 0; list-style: none; border: 1px solid var(--line); border-radius: var(--radius); }
+.model-options li { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 8px; padding: 6px 8px; }
+.model-options li:nth-child(even) { background: var(--canvas); }
+.model-options label { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.model-options label span { display: grid; min-width: 0; }
+.model-options small { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-options em { color: var(--muted); font-size: 11px; font-style: normal; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-options .model-test-failed { color: #c23d40; }
+
+/* Keep model-selection checkboxes and the composer model trigger vertically centered. */
+.model-options input[type="checkbox"],
+.onboarding-models input[type="checkbox"] {
+  align-self: center;
+  margin: 0;
+  vertical-align: middle;
+  flex: none;
+}
+.model-options label { line-height: 1.4; }
+.model-trigger { align-self: center; min-height: 28px; }
+
+/* Invisible resize affordance: no button, no selection outline. / 无按钮、无选中边框的隐式拖拽边。 */
+.context-monitor { position: relative; }
+.panel-resize-handle { position: absolute; z-index: 6; inset-block: 0; inset-inline-start: -4px; width: 8px; cursor: col-resize; }
+.panel-resize-handle:hover, .panel-resize-handle:active { background: color-mix(in srgb, var(--accent) 14%, transparent); }

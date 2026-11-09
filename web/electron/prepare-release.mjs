@@ -1,7 +1,9 @@
 /**
- * Prepares release metadata: derives the user-facing version from package.json and resets the release output folder.
+ * Prepares release metadata: derives the user-facing version from package.json and resets
+ * the current version's release output folder while keeping earlier versions.
  *
- * 准备发布元数据：从 package.json 推导界面上展示的版本号，并重置发布输出目录。
+ * 准备发布元数据：从 package.json 推导界面上展示的版本号，并只重置当前版本的发布输出目录，
+ * 保留更早版本的产物。
  */
 
 import { rm, mkdir, readFile, writeFile } from 'node:fs/promises'
@@ -17,7 +19,7 @@ await mkdir(path.join(web, 'build'), { recursive: true })
 // Keep the user-facing installer/Windows Apps label separate from SemVer package metadata.
 // 让安装器 / Windows 应用列表展示的版本与 SemVer 包元数据保持分离。
 await writeFile(path.join(web, 'build/release-version.nsh'), `; Generated from package.json; not a runtime resource.\n!undef VERSION\n!define VERSION "${displayVersion}"\n`)
-const output = path.resolve(web, 'release/slothy')
+const output = path.resolve(web, 'release/slothy', displayVersion)
 if (!output.startsWith(web + path.sep)) throw new Error('Unsafe release directory.')
 // Only generated output is removed. Development and installed user profiles are untouched.
 // 只删除生成产物，开发环境与已安装用户数据不受影响。

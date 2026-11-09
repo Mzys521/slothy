@@ -33,6 +33,34 @@ TEXT_EXTENSIONS = {
     ".ini",
 }
 WORD = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+MAX_PDF_PAGES = 80
+MAX_PDF_CHARS = 200_000
+
+
+def _read_pdf(contents: bytes) -> str:
+    """Extract bounded text from a PDF with pypdf. / 使用 pypdf 提取有界 PDF 文本。
+
+    Args:
+        contents: Raw PDF bytes, already bounded by the upload limit. / 已限制大小的 PDF 字节。
+
+    Returns:
+        Extracted text. / 提取的文本。
+
+    Raises:
+        ValueError: When the PDF is encrypted, malformed or has no text.
+            / PDF 加密、损坏或无文本时抛出。
+    """
+    from pypdf import PdfReader
+
+    reader = PdfReader(BytesIO(contents))
+    if reader.is_encrypted:
+        raise ValueError("Encrypted PDF files are unsupported.")
+    parts = []
+    for page in reader.pages[:MAX_PDF_PAGES]:
+        parts.append(page.extract_text() or "")
+        if sum(len(part) for part in parts) >= MAX_PDF_CHARS:
+            break
+    return "\n".join(parts)[:MAX_PDF_CHARS]
 
 
 def read_attachment(filename: str, contents: bytes) -> str:
@@ -54,10 +82,12 @@ def read_attachment(filename: str, contents: bytes) -> str:
             类型不支持、不安全或不是可读 UTF-8/DOCX 文本时抛出。
     """
     extension = PurePath(filename).suffix.lower()
-    if extension not in TEXT_EXTENSIONS and extension != ".docx":
-        raise ValueError("Unsupported file type. Upload UTF-8 text or a DOCX document.")
+    if extension not in TEXT_EXTENSIONS and extension not in {".docx", ".pdf"}:
+        raise ValueError("Unsupported file type. Upload UTF-8 text, a DOCX or a PDF document.")
     try:
-        if extension == ".docx":
+        if extension == ".pdf":
+            text = _read_pdf(contents)
+        elif extension == ".docx":
             with ZipFile(BytesIO(contents)) as archive:
                 document = archive.getinfo("word/document.xml")
                 if document.file_size > MAX_UPLOAD_BYTES:

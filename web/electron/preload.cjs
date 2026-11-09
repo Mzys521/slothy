@@ -22,6 +22,9 @@ if (process.isMainFrame) {
     close: () => ipcRenderer.invoke('desktop:close'),
     selectDirectory: () => ipcRenderer.invoke('desktop:select-directory'),
     writeClipboard: text => ipcRenderer.invoke('desktop:write-clipboard', text),
+    purgeLocalData: confirmation => ipcRenderer.invoke('desktop:purge-local-data', confirmation),
+    openLogs: () => ipcRenderer.invoke('desktop:open-logs'),
+    restartApp: () => ipcRenderer.invoke('desktop:restart-app'),
     // Subscribes to maximize state; the returned function detaches the listener.
     // 订阅最大化状态；返回的函数用于解绑监听。
     onMaximized: listener => {

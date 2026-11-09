@@ -29,6 +29,7 @@ export interface Turn {
   reasoningEffort?: string
   work?: WorkOptions
   serverReply?: string
+  reasoning?: string
   serverRunId?: string
   usedMemoryIds?: string[]
   memoryTrace?: MemoryTrace
@@ -400,6 +401,7 @@ export type ServerMessage = {
   run_id: string
   message: string
   response: string
+  reasoning?: string
   attachments: { id?: string; filename: string }[]
   activity?: RunActivity[]
   metrics?: RunMetrics | null
@@ -441,7 +443,7 @@ export async function syncThreadMessages(session: Session) {
         // Server memory metadata restores the memory flag after a reload.
         // 服务端记忆元数据用于在重载后恢复「使用记忆」标记。
         memory: turn?.memory ?? (message.profile_version != null || message.used_memory_ids?.length ? true : undefined),
-        serverRunId: message.run_id, serverReply: message.response, activity: message.activity, metrics: message.metrics,
+        serverRunId: message.run_id, serverReply: message.response, reasoning: message.reasoning ?? turn?.reasoning, activity: message.activity, metrics: message.metrics,
         usedMemoryIds: message.used_memory_ids ?? turn?.usedMemoryIds,
         memoryTrace: message.memory_trace, responseSource: message.response_source,
         references: message.references ?? turn?.references,

@@ -114,6 +114,7 @@ export interface ToolReview {
 export interface WorkReply {
   run_id: string
   response: string
+  reasoning?: string
   message?: string | null
   used_memory_ids?: string[]
   profile_version?: number | null
@@ -246,6 +247,7 @@ export async function workRequest<T>(path: string, method = 'GET', body?: object
 type StreamUpdate =
   | { event: 'activity'; run_id: string; items: RunActivity[]; metrics?: RunMetrics | null }
   | { event: 'delta'; text: string }
+  | { event: 'reasoning'; text: string }
 
 /**
  * POSTs a request and consumes the server-sent event stream until a terminal frame.
@@ -292,7 +294,7 @@ export async function streamWorkRequest(
           const payload = JSON.parse(data)
           if (event === 'error') throw new ApiError(payload.message, response.status, payload.code)
           if (event === 'done' || event === 'approval_required') return payload
-          if (event === 'delta' || event === 'activity') update({ ...payload, event })
+          if (event === 'delta' || event === 'activity' || event === 'reasoning') update({ ...payload, event })
         }
         boundary = /\r?\n\r?\n/.exec(buffer)
       }

@@ -179,3 +179,4 @@ class AgentServices:
     identity_reader: Callable | None = None
     reference_metadata_reader: Callable | None = None
     memory_status_reader: Callable | None = None
+    runtime_journal: object | None = None

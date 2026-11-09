@@ -190,6 +190,8 @@ def render_tool_instructions(instructions: Mapping[str, str]) -> str:
             "Tools available in this conversation: " + ", ".join(names) + ".",
             "Use the relevant tool when the user requests an operation it supports. "
             "Describe only the actual available capabilities and results.",
+            "Never ask the user to approve a risky tool in prose: call the tool and let the "
+            "runtime pause for approval. After a denial, do not retry, replace or bypass it.",
             *(instructions[name] for name in names if instructions[name]),
         ]
     )

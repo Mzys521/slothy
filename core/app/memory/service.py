@@ -16,6 +16,22 @@ from app.memory.semantics import (
 from app.personalization.evolution import SENSITIVE, MemoryEvolution, profile_key
 
 
+def _profile_value(raw: str):
+    """Read one stored value without letting one bad row break profile projection.
+    / 读取单条存储值；单行损坏不应破坏整个画像投影。
+
+    Args:
+        raw: Serialized ``value_json`` column. / 序列化的 ``value_json`` 列。
+
+    Returns:
+        Parsed JSON value, or the raw string when parsing fails. / 解析后的值；失败时返回原字符串。
+    """
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+
+
 class MemoryService(MemoryEvolution):
     """Reuse the durable learner/review/evidence lifecycle, replace fact writes/projections.
     / 复用队列、审核与证据生命周期，统一事实写入与投影。"""
@@ -431,7 +447,7 @@ class MemoryService(MemoryEvolution):
             {
                 "key": m["memory_key"],
                 "dimension": m["dimension"],
-                "value": json.loads(m["value_json"]),
+                "value": _profile_value(m["value_json"]),
                 "scope": m["scope"],
                 "scope_ref": m["scope_ref"],
                 "memory_id": m["id"],
@@ -461,7 +477,7 @@ class MemoryService(MemoryEvolution):
                 user,
                 version,
                 summary,
-                json.dumps(attributes, ensure_ascii=False, sort_keys=True),
+                json.dumps(attributes, ensure_ascii=False, sort_keys=True, default=str),
                 removed,
             ),
         )

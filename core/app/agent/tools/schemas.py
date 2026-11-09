@@ -72,6 +72,29 @@ class PythonDocumentArgs(BaseModel):
     )
 
 
+class SearchArgs(BaseModel):
+    """DeepSeek web-search request arguments. / DeepSeek 网页搜索参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=128)
+    count: int = Field(default=5, ge=1, le=10)
+    ori_question: str | None = Field(default=None, min_length=1, max_length=128)
+    need_content: bool = True
+
+
+class WorkspaceDeleteArgs(BaseModel):
+    """Delete one workspace file or directory after approval. / 审批后删除工作区文件或目录。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=4096)
+    recursive: bool = Field(
+        default=False,
+        description="Allow deleting a non-empty directory; high risk. / 允许删除非空目录；高风险。",
+    )
+
+
 class WorkspaceReadArgs(BaseModel):
     """
     List, paged-read or literal-search arguments for workspace files. /

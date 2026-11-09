@@ -2,8 +2,9 @@
 import { computed, ref, useId, watch } from 'vue'
 import { AtSign, Braces, PanelRightClose } from 'lucide-vue-next'
 import { activeWorkspace, runningSessions, workspaceName, workspaceDirectory, type Session } from './chat'
-import { settings, t } from './preferences'
+import { settings, t, readLocal, writeLocal } from './preferences'
 import { memoryTypeName, workRequest, type MemoryReceipt } from './workApi'
+import WorkDetails from './WorkDetails.vue'
 
 const props = defineProps<{ session?: Session; memoryId?: string }>()
 const emit = defineEmits<{ close: []; evidence: [thread: string, run: string] }>()
@@ -11,6 +12,7 @@ const tabs = [
   { id: 'memory', en: 'Related memories', zh: '关联记忆' },
   { id: 'environment', en: 'Environment', zh: '环境上下文' },
   { id: 'tools', en: 'Loaded tools', zh: '已装载工具' },
+  { id: 'work', en: 'Work details', zh: '工作详情' },
 ] as const
 type Tab = typeof tabs[number]['id']
 
@@ -35,6 +37,26 @@ interface Runtime {
 }
 
 const prefix = useId()
+const panelWidth = ref(Number(readLocal('adaptive.contextPanelWidth', 320)))
+
+/** Drag the invisible left edge to resize the context monitor. / 拖动不可见左边缘调整面板宽度。 */
+function startResize(event: PointerEvent) {
+  event.preventDefault()
+  const startX = event.clientX
+  const startWidth = panelWidth.value
+  const target = event.currentTarget as HTMLElement
+  target.setPointerCapture(event.pointerId)
+  const move = (moveEvent: PointerEvent) => {
+    panelWidth.value = Math.min(560, Math.max(260, startWidth + startX - moveEvent.clientX))
+  }
+  const up = () => {
+    target.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+    writeLocal('adaptive.contextPanelWidth', panelWidth.value)
+  }
+  target.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+}
 const selectedTab = ref<Tab>('memory')
 const tabList = ref<HTMLElement>()
 const openMemory = ref<string>()
@@ -143,7 +165,8 @@ function moveTab(event: KeyboardEvent) {
 </script>
 
 <template>
-  <aside class="context-monitor" :aria-label="t('Context monitor', '上下文监控')">
+  <aside class="context-monitor" :style="{ flexBasis: panelWidth + 'px' }" :aria-label="t('Context monitor', '上下文监控')">
+    <div class="panel-resize-handle" aria-hidden="true" @pointerdown="startResize"></div>
     <header class="monitor-header">
       <h2>{{ t('Context monitor', '上下文监控') }}</h2>
       <button type="button" class="chat-icon" :aria-label="t('Close context monitor', '关闭上下文监控')" @click="emit('close')"><PanelRightClose /></button>
@@ -152,6 +175,10 @@ function moveTab(event: KeyboardEvent) {
       <button v-for="tab in tabs" :id="prefix + '-' + tab.id" :key="tab.id" type="button" role="tab"
         :aria-selected="selectedTab === tab.id" :aria-controls="prefix + '-panel-' + tab.id" :tabindex="selectedTab === tab.id ? 0 : -1"
         @click="selectedTab = tab.id">{{ t(tab.en, tab.zh) }}</button>
+    </div>
+
+    <div v-show="selectedTab === 'work'" :id="prefix + '-panel-work'" class="monitor-content" role="tabpanel" tabindex="0" :aria-labelledby="prefix + '-work'">
+      <WorkDetails :thread="session?.apiThreadId" />
     </div>
 
     <div v-show="selectedTab === 'memory'" :id="prefix + '-panel-memory'" class="monitor-content" role="tabpanel" tabindex="0" :aria-labelledby="prefix + '-memory'">

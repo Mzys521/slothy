@@ -65,6 +65,17 @@ function pickCustomAccent(event: Event) {
         </div>
       </section>
       <section v-if="section === 'appearance'" class="setting">
+        <div><h2 id="font-size-label">{{ t('Font size', '字体大小') }}</h2><p>{{ t('Scale interface text without changing the layout.', '整体缩放界面文字大小，不改变布局。') }}</p></div>
+        <div class="setting-control">
+          <select v-model.number="settings.fontScale" aria-labelledby="font-size-label">
+            <option :value="0.9">{{ t('Small', '小') }}</option>
+            <option :value="1">{{ t('Default', '默认') }}</option>
+            <option :value="1.15">{{ t('Large', '大') }}</option>
+            <option :value="1.3">{{ t('Extra large', '特大') }}</option>
+          </select>
+        </div>
+      </section>
+      <section v-if="section === 'appearance'" class="setting">
         <div><h2 id="palette-label">{{ t('Color palette', '配色') }}</h2><p>{{ t('Choose the accent for selected items and controls.', '选择选中项和控件的高亮色。') }}</p></div>
         <div class="setting-control">
         <div class="palette-options" role="radiogroup" aria-labelledby="palette-label">

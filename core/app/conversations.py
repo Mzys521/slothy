@@ -17,6 +17,8 @@ class ConversationTurn:
         run_id: Run identity unique within the conversation. / 会话内唯一执行标识。
         user_input: Original user text. / 原始用户文本。
         response: Final assistant text. / 最终助手文本。
+        reasoning: Display-only text, never prompt content.
+            / 仅供展示的推理文本，不进入提示词。
         learn_memory: Whether this turn may feed memory learning. / 本轮是否参与记忆学习。
         project_id: Project scope recorded for the turn. / 本轮记录的项目作用域。
         attachment_ids: Uploaded file IDs referenced by the turn. / 本轮引用的上传文件 ID。
@@ -31,6 +33,7 @@ class ConversationTurn:
     run_id: str
     user_input: str
     response: str
+    reasoning: str = ""
     learn_memory: bool = False
     project_id: str | None = None
     attachment_ids: tuple[str, ...] = ()

@@ -10,6 +10,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
+from app.agent.decision.engine import DecisionEngine
 from app.agent.graph.edges import route_after_agent
 from app.agent.graph.nodes import AgentNodes
 from app.agent.graph.review import guarded_tools, review_tools
@@ -20,7 +21,7 @@ from app.agent.prompts.system import BASE_SYSTEM_PROMPT
 from app.agent.tools.gateway import ToolGateway
 from app.agent.tools.registry import ToolRegistry
 from app.agent.tools.results import tool_error_content
-from app.config import AgentSettings, PromptSettings
+from app.config import AgentSettings, DecisionSettings, PromptSettings
 
 
 def build_agent_graph(
@@ -34,6 +35,7 @@ def build_agent_graph(
     prompt_settings: PromptSettings | None = None,
     tool_registry: ToolRegistry | None = None,
     mode: str | None = None,
+    decision_settings: DecisionSettings | None = None,
 ) -> CompiledStateGraph:
     """Build the asynchronous online agent graph. / 创建可异步调用的在线 Agent 图。
 
@@ -88,11 +90,35 @@ def build_agent_graph(
         runnable,
         system_prompt,
         tools_enabled=bool(selected_tools) or require_tool_review,
+        tools=tuple(selected_tools),
         prompt_settings=prompt_settings,
         toolset_hash=digest([convert_to_openai_tool(tool) for tool in selected_tools]),
         cache_protocol=getattr(services.model_provider, "prompt_cache_protocol", "openai"),
     )
     builder = StateGraph(AgentState)
+    decision_engine = DecisionEngine(
+        decision_settings or DecisionSettings(), registry, resolved
+    )
+
+    async def decide(state):
+        """Ask the decision model for one guarded plan, or skip when disabled.
+        请求决策模型生成一个受护栏约束的计划；关闭时跳过。
+
+        Args:
+            state: Working state after prepare_run. / prepare_run 之后的工作状态。
+
+        Returns:
+            Partial update with the persisted decision fields. / 含持久化决策字段的部分更新。
+        """
+        plan = await decision_engine.decide(state, mode or "chat")
+        if plan is None:
+            return {}
+        return {
+            "decision": plan.model_dump(),
+            "decision_reasons": list(plan.reasons),
+            "decision_source": plan.source,
+            "decision_enforced": plan.enforced,
+        }
 
     async def prepare_run(state):
         """Reset per-run fields and publish the tool contract snapshot.
@@ -117,13 +143,15 @@ def build_agent_graph(
         }
 
     builder.add_node("prepare_run", prepare_run)
+    builder.add_node("decide", decide)
     builder.add_node("load_profile", nodes.load_profile)
     builder.add_node("retrieve_memories", nodes.retrieve_memories)
     builder.add_node("build_personalized_context", nodes.build_personalized_context)
     builder.add_node("agent", nodes.agent)
     builder.add_node("finalize_response", nodes.finalize_response)
     builder.add_edge(START, "prepare_run")
-    builder.add_edge("prepare_run", "load_profile")
+    builder.add_edge("prepare_run", "decide")
+    builder.add_edge("decide", "load_profile")
     builder.add_edge("load_profile", "retrieve_memories")
     builder.add_edge("retrieve_memories", "build_personalized_context")
     builder.add_edge("build_personalized_context", "agent")

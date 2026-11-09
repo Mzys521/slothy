@@ -9,7 +9,78 @@ the four-part Windows version followed by a prerelease suffix.
 > 0.1.0 – 0.3.0). This line continues with the current desktop application and
 > keeps that history for reference.
 
-## [Unreleased]
+## [0.1.4.1-exp.1] — 2026-11-09
+
+Development exploration prerelease. Not production-stable; use with backups.
+
+### Changed
+
+- DSH-style ordered static prompt sections and checkpointed operational snapshots:
+  unchanged context reuses its position; changes append; compaction restores it.
+  Source revocation, scope isolation, bounded retention and approval revalidation remain enforced.
+  Long-term-memory services and personalization storage remain unchanged.
+- DeepSeek no longer replays reasoning from final answers into later prompts;
+  tool-call reasoning required by the protocol remains available.
+- Corrected context accounting for system, real user turns and named references.
+- Isolated provider-catalog model-picker styles so the composer model/effort control
+  aligns with Send in Chat, Work, multiline, attachment and narrow-window layouts.
+- Default prompt version: `2026-11-09.context-v1`.
+
+### Added
+
+- Decision-model configuration in Settings → API: choose any configured model to drive
+  routing/tools/context; clearing the selection returns to chat-model self-driving, and
+  decision-model failures now explicitly hand control back to the chat model.
+- Provider model discovery is now opt-in: fetched catalogs are shown with search,
+  multi-select, select-all/clear and Added/Verified states; discovery never overwrites
+  user-configured models.
+- Added-model validation calls each selected model with a tiny real request (64-token cap,
+  three-way concurrency), supports partial success and keeps failed models in the catalog
+  with their error and duration.
+- Runtime observability: rotating application/error logs and per-session JSONL model-call
+  snapshots under `data/logs/`, with prompt/context token categories, provider usage,
+  cache hit ratio, tools, parameters, status, duration and credential redaction.
+- Work Details tab in the right session panel with session/turn/model-call hierarchy,
+  horizontal context bars, usage/capacity information and persisted history reload.
+- About Slothy → View logs opens the application-managed log directory via a fixed IPC path.
+- DeepSeek Search: a `deepseek_search` tool calls the official `POST /v1/tools/search`
+  API with `query`, `count`, `ori_question` and `need_content`, normalizes sources and
+  publishes a Settings → API key editor with save/test/delete, DPAPI storage, model-key
+  fallback and dynamic tool registration. Missing keys disable the tool without affecting chat.
+- Reviewed high-risk tools now explicitly instruct the model to call the tool instead of
+  asking for natural-language confirmation; the runtime approval dialog pauses the run,
+  and denials return `USER_DENIED` results recorded as rejected without retries.
+- Reasoning visualization: vendor `reasoning_content` streams as a separate collapsible
+  “思考过程 / Reasoning” block above the answer, auto-collapses when reasoning completes,
+  persists with archived turns, and never enters prompt/history message content.
+- MiMo native web search: supported MiMo v2.6 models receive the provider `web_search` tool; `LLM_WEB_SEARCH`
+  (`auto`/`native`/`off`) applies only to supported MiMo models and falls back silently; DeepSeek uses the independent Search API tool above.
+- `workspace_delete`: reviewed Chat/Work file/directory deletion with path
+  normalization, symlink/root/private-path rejection, recursive confirmation and a
+  high-risk approval hint. Deletion revalidates the target at execution time.
+- Drag-and-drop attachments in chat, with an overlay, multi-file validation, pending
+  list handling and PDF text extraction (pypdf) alongside TXT/Markdown/DOCX/JSON/CSV.
+- About page: “Clear all local data” with an explicit `确认删除` confirmation gate,
+  backend shutdown, managed-data purge, browser-storage cleanup, residual reporting
+  and a restart action.
+- Model-driven decision layer (S2): one `decide` node between `prepare_run` and
+  `load_profile`, a dedicated OpenAI-compatible decision model configured by
+  `DASHSCOPE__*` / `DECISION_*`, deterministic guards that clamp route/tools/context
+  and rules fallback. The decision model is selected in Settings → API; with no selection the chat model decides autonomously, and a failed decision call hands control back to the chat model. The plan is persisted in graph state and metrics.
+
+### Fixed
+- MiMo accounts without the Web Search plugin now transparently retry without the
+  native search tool, so ordinary chat no longer fails with `webSearchEnabled is false`.
+- A failed model run that leaves an unfinished checkpoint no longer blocks the
+  conversation with `Resume or clear the previous run first`; the next message
+  rebuilds a fresh run from archived turns.
+- Memory learning no longer wedges its durable queue when profile projection fails:
+  projection is bounded by a timeout, invalid stored values cannot break the whole
+  projection, and failed projection is logged while the analyzed turns still settle
+  so the next batch can retry.
+- The memory page no longer re-renders its whole frame on every learning poll:
+  learning status and the saved-memory list moved into child components with their
+  own state; the page header is rendered once and only dynamic regions update.
 
 ## [0.1.4.1-beta] — 2026-11-07
 

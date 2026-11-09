@@ -76,6 +76,46 @@ checkout reproduces the same version locally.
   recursion.
 - **Human-in-the-loop tools** — risky tool calls pause the graph through an
   `interrupt()`; approve or reject, then resume with `Command(resume=…)`.
+- **Reasoning trace** — when the provider returns reasoning text it streams in a
+  separate collapsible block above the answer, auto-collapses once reasoning finishes,
+  and is archived with the turn; it is display-only and never injected into prompts or
+  message content.
+- **Decision model in API settings** — pick any configured provider/model to drive routing,
+  tool selection and context planning; leave it off for chat-model self-driving, with
+  automatic handoff to the chat model if a decision call fails.
+- **Opt-in model catalog** — provider discovery only lists models; nothing is imported
+  automatically. Users search, multi-select, and run a tiny real API test per model before
+  adding; failures stay selectable with their reason, and existing configured models are
+  never overwritten by a refresh.
+- **Observability** — rotating application logs and per-session JSONL model-call records
+  capture prompt/context composition, tool schemas, provider usage, cache hits, duration,
+  status and redacted parameters. The right-side Work Details tab renders horizontal context bars
+  and call hierarchy; About Slothy opens the managed log directory.
+- **DeepSeek web search** — the `deepseek_search` tool calls DeepSeek's official
+  `POST /v1/tools/search` API (title, URL, summaries, content, source, publication time).
+  Configure an independent Search key in Settings → API; otherwise the DeepSeek model
+  key is reused. With neither key the tool is not registered, so ordinary chat is unaffected.
+- **Native MiMo web search** — supported MiMo v2.6 models receive the provider's own
+  `web_search` tool by default; if the account plugin is disabled the request transparently
+  retries without search.
+- **Reviewed high-risk tools** — risky calls pause immediately for the runtime approval
+  dialog; the model never asks for confirmation in prose. Denials are returned as
+  `USER_DENIED` tool results, recorded as rejected in audit/activity, and cannot be
+  retried or bypassed in the same run.
+- **Drag-and-drop attachments** — drop TXT, Markdown, PDF, DOCX, JSON, CSV and similar
+  documents onto the conversation; validation reports count/size/type errors without
+  breaking the turn, and PDF text is extracted with a bounded parser.
+- **Reviewed deletion** — `workspace_delete` is a Chat/Work high-risk tool: paths are
+  normalized and confined to the workspace, symlinks/roots/private paths are rejected,
+  recursive deletion requires explicit approval, and the target is revalidated at
+  execution time.
+- **Clear local data** — About → Local data removes conversations, memory, profiles,
+  indexes, databases, checkpoints, caches, logs and local configuration after an exact
+  `确认删除` confirmation; failures and residue are reported instead of a false success.
+- **Model-driven decisions** — an optional dedicated decision model proposes the
+  route, tool subset and context budget; deterministic guards clamp it, `off` /
+  `shadow` / `enforce` control rollout, and rules are the fallback. The plan never
+  bypasses approval and stays out of the prompt cache.
 - **Composer commands and references** — `/` and the plus button share a menu for
   20 commands and file upload; `@` selects workspace files/folders, conversations
   and plugins. Compression/export require confirmation, references remain bounded
@@ -110,8 +150,9 @@ checkout reproduces the same version locally.
   turns for provider prefix caching.
 - **Built-in tools** — calculation, paged workspace reads and literal search,
   reviewed file writes, template export (md/txt/csv/json/docx), timezone lookup,
-  reviewed Python execution and uploaded-file reads. Work has 9 tools; Chat has
-  7. Results, artifacts, risks and per-tool measurements use one contract;
+  reviewed Python execution and uploaded-file reads. Work has 10 tools; Chat has 8
+  (the optional DeepSeek search tool is added only after a Search key is resolved).
+  Results, artifacts, risks and per-tool measurements use one contract;
   journaled writes can be recovered without repeating completed effects.
 - **Optional HTTPS retrieval** — disabled by default; requires an explicit domain
   allowlist and rejects non-public addresses and unsafe redirects.
@@ -246,3 +287,4 @@ MIT — see [LICENSE](LICENSE). © 2026 Slothy contributors.
     <span style="color:#95611F">Brown is identity</span>
   </sub>
 </p>
+

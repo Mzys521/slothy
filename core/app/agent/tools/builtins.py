@@ -10,7 +10,9 @@ from app.agent.tools.schemas import (
     FinancialCalculationArgs,
     FloatCalculationArgs,
     PythonDocumentArgs,
+    SearchArgs,
     WebFetchArgs,
+    WorkspaceDeleteArgs,
     WorkspaceReadArgs,
     WorkspaceWriteArgs,
 )
@@ -23,7 +25,7 @@ from app.tools.python_document import PythonDocumentExecutor
 from app.tools.workspace import WorkspaceFiles
 
 
-def builtin_tools(settings: ToolSettings) -> list[DescribedTool]:
+def builtin_tools(settings: ToolSettings, search=None) -> list[DescribedTool]:
     """
     Build the desktop built-in tools and their deprecated aliases. /
     构建桌面内置工具及其弃用别名。
@@ -141,6 +143,41 @@ def builtin_tools(settings: ToolSettings) -> list[DescribedTool]:
         instruction="Use workspace_write for mkdir/write_file after approval. Paths stay inside "
         "the workspace; overwrite defaults to false. Create a missing parent directory first.",
     )
+    register(
+        "workspace_delete",
+        "删除工作区文件或目录；高风险，始终需要审批。 / Delete workspace files or directories.",
+        WorkspaceDeleteArgs,
+        workspace.delete,
+        asynchronous=True,
+        risk=Risk.WRITE,
+        mode={"chat", "work"},
+        result_kind="envelope",
+        enabled=settings.workspace_files_enabled,
+        instruction=(
+            "Use workspace_delete immediately when the user explicitly asks to remove a "
+            "file or directory. Never ask for confirmation in prose and never claim a "
+            "deletion before the tool returns: the runtime pauses this run and shows the "
+            "approval dialog. recursive=true is required for non-empty directories. If the "
+            "user denies approval, report USER_DENIED and stop; never retry, split, rename "
+            "or otherwise bypass the denied authorization."
+        ),
+    )
+    if search is not None:
+        register(
+            "deepseek_search",
+            "使用 DeepSeek 官方 Search API 搜索实时网页。 / Search the live web via DeepSeek.",
+            SearchArgs,
+            search.run,
+            asynchronous=True,
+            risk=Risk.READ,
+            mode={"chat", "work"},
+            result_kind="structured",
+            instruction=(
+                "Use deepseek_search for current news, prices, releases or other real-time "
+                "facts. Cite the returned source URLs as Markdown links. Never invent results; "
+                "if the tool errors or returns no results, say so instead of claiming live data."
+            ),
+        )
     register(
         "export_document",
         "从结构化章节、段落、列表和表格导出 md/txt/csv/json/docx。 / Template export.",

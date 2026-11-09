@@ -13,6 +13,9 @@ declare global {
       close(): Promise<void>
       selectDirectory(): Promise<string | null>
       writeClipboard(text: string): Promise<void>
+      purgeLocalData(confirmation: string): Promise<{ ok: boolean; removed: string[]; failed: { path: string; error: string }[]; remaining: string[] }>
+      openLogs(): Promise<void>
+      restartApp(): Promise<void>
       onMaximized(listener: (value: boolean) => void): () => void
     }>
   }

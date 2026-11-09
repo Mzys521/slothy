@@ -50,7 +50,9 @@ Copy-Item .env.example ..\.env
 1. **在应用内配置（推荐）**：首次启动且尚未配置服务商时，会出现居中的引导层。选择内置模板
    （DeepSeek、MiMo、OpenAI、Anthropic、Kimi、Qwen）或自定义 OpenAI/Anthropic 兼容连接，
    填入密钥并保存，应用会直接进入工作区。之后可在 **设置 → API** 中修改。密钥用 Windows DPAPI
-   加密后保存在数据目录的 `providers.json`。
+   加密后保存在数据目录的 `providers.json`。可在此另存/测试/删除独立的 **DeepSeek Search
+   API Key**；未配置时复用 DeepSeek 模型密钥，两者都没有时不暴露 `deepseek_search`。
+   高风险工具调用会暂停并弹出审批，不会用普通聊天消息替代确认。
 2. **在 `.env` 中配置**：适合后端 CLI 与示例：
 
 ```ini
@@ -74,6 +76,11 @@ DEEPSEEK_MODEL=deepseek-chat
 
 `LLM_MODEL`、`LLM_API_KEY`、`LLM_BASE_URL` 是可选通用覆盖项。模型名必须显式提供，Slothy
 不会自动切换模型。
+
+可选决策模型：在 **设置 → API → 决策模型** 中选择已配置模型，密钥与地址复用所属 Provider。
+未选择时由聊天模型自主决策；决策模型不可用、输出非法或超预算时，控制权交回聊天模型。
+决策计划不会绕过工具审批，也不会进入提示词缓存文本。仅后端运行仍可使用 `DASHSCOPE__*` /
+`DECISION_*` 环境变量。
 
 ## 3. 安装桌面端依赖
 
@@ -111,7 +118,8 @@ npm run dev
 在输入框输入 `/` 打开 20 个分组可搜索的命令（会话、模型、上下文、产物与帮助）；文件上传已并入
 同一个加号菜单。输入 `@` 可引用工作区文件夹或文件、当前用户拥有的会话，或已启用的插件；服务端
 会重新校验归属与作用域，再注入有界低信任 L3 数据。`/compact` 与 `/export` 需要确认，插件工具
-调用仍遵循既有审批策略。
+调用仍遵循既有审批策略。也可以把文件直接拖入对话：TXT、Markdown、PDF、DOCX、JSON、CSV 等
+文档会先校验（最多 8 个、单个 2 MiB）并进入待发送附件；PDF 文本在发送前本地提取。
 
 ## 5. 数据位置
 

@@ -131,6 +131,25 @@ async def test_non_keyword_expression_is_judged_by_llm_and_automatically_project
         assert (await system.store.get_profile("u"))["version"] == 1
 
 
+async def test_profile_projection_failure_does_not_wedge_the_learning_queue(
+    tmp_path, monkeypatch
+):
+    """A broken profile projection must settle the turn instead of retrying forever.
+    / 画像投影失败时轮次仍需结算，不能一直卡在待处理队列。"""
+    async with domain(tmp_path) as system:
+        job = await enqueue(system)
+
+        async def fail_rebuild(*_args, **_kwargs):
+            raise RuntimeError("profile projection failed")
+
+        monkeypatch.setattr(system.evolution, "rebuild", fail_rebuild)
+        await system.evolution.process(job)
+        status = await system.conversations.learning_status("u")
+        assert status["pending"] == 0
+        assert status["processed"] == 1
+        assert status["dead"] == 0
+
+
 @pytest.mark.parametrize(
     "mode,expected,pending", [("auto", 1, 0), ("review", 0, 1), ("shadow", 0, 0), ("off", 0, 0)]
 )

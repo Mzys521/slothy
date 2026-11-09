@@ -7,7 +7,7 @@ Slothy documentation is bilingual: every public guide exists in English and
 
 | Document | English | 中文 | What it covers |
 |---|---|---|---|
-| Architecture | [architecture.md](architecture.md) | [architecture.zh-CN.md](architecture.zh-CN.md) | processes, layers, agent graph, memory pipeline, prompt layering, storage, security |
+| Architecture | [architecture.md](architecture.md) | [architecture.zh-CN.md](architecture.zh-CN.md) | processes, layers, agent graph, decision layer, memory pipeline, prompt layering, storage, security |
 | Getting started | [getting-started.md](getting-started.md) | [getting-started.zh-CN.md](getting-started.zh-CN.md) | install, configure a provider, run, test, package, troubleshoot |
 | API reference | [api.md](api.md) | [api.zh-CN.md](api.zh-CN.md) | all `/api/v1` routes, SSE events, approval flow, examples |
 | Brand guidelines | [brand.md](brand.md) | [brand.md#中文](brand.md#中文) | name, slogan, colors, logo usage, voice, UI principles |

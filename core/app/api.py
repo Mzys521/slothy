@@ -22,13 +22,14 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     JsonValue,
+    SecretStr,
     StrictBool,
     StringConstraints,
     model_validator,
@@ -37,21 +38,25 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.accounts import AccountActivity, summarize_activity, validate_avatar
 from app.agent.activity import RunActivity, run_activity
+from app.agent.decision.settings_store import DecisionConfigStore
 from app.agent.graph import AgentServices, build_agent_graph, build_graph_config
 from app.agent.graph.review import ApprovalPolicy, pending_review
 from app.agent.graph.services import HistorySummaryResult
 from app.agent.metrics import RunMetrics, run_metrics
 from app.agent.prompting.history import extractive_summary
 from app.agent.prompting.plan import canonical
+from app.agent.prompting.sections import PromptSection, assemble_sections
 from app.agent.prompting.telemetry import PromptTelemetry
 from app.agent.prompts.system import BASE_SYSTEM_PROMPT
 from app.agent.providers import ModelProvider
+from app.agent.reasoning import reasoning_text
 from app.agent.tools import ToolRegistry, create_builtin_tools
 from app.agent.tools.attachments import create_attachment_tools
 from app.composer_api import install_composer_routes
 from app.config import (
     AgentSettings,
     CheckpointSettings,
+    DecisionSettings,
     MemorySettings,
     PromptSettings,
     ReferenceSettings,
@@ -75,6 +80,7 @@ from app.memory.learning import Concept, MemoryLearner
 from app.memory.semantics import canonical_key
 from app.memory.service import MemoryService as MemoryEvolution
 from app.memory.store import MemoryStore as WorkspaceStore
+from app.observability import RuntimeJournal, configure_application_logging
 from app.personalization.evolution import SENSITIVE
 from app.personalization.settings import (
     MemoryConfiguration,
@@ -100,6 +106,7 @@ from app.tools.read_attachment import (
     MAX_UPLOAD_BYTES,
     read_attachment,
 )
+from app.tools.search import DeepSeekSearch
 
 logger = logging.getLogger(__name__)
 LOCAL_USER = "local-user"
@@ -311,6 +318,7 @@ class ThreadMessage(BaseModel):
     run_id: str
     message: str
     response: str
+    reasoning: str = ""
     attachments: list["Attachment"] = Field(default_factory=list)
     activity: list[RunActivity] = Field(default_factory=list)
     metrics: RunMetrics | None = None
@@ -408,6 +416,7 @@ class ChatResult(BaseModel):
     run_id: str
     thread_id: str
     response: str
+    reasoning: str = ""
     message: str | None = None
     profile_version: int | None = None
     used_memory_ids: list[str]
@@ -885,6 +894,103 @@ async def runtime(request: Request) -> dict:
     }
 
 
+class SearchKeyInput(BaseModel):
+    """Optional Search API key for save/test requests. / 保存或测试搜索密钥的请求体。"""
+
+    api_key: SecretStr | None = None
+
+
+@router.get("/settings/search")
+async def get_search_settings(request: Request):
+    """Return Search status without exposing the key.
+    / 返回不含密钥的搜索配置状态。"""
+    providers = request.app.state.providers
+    return {
+        "configured": bool(providers.search_key()),
+        "source": providers.search_source(),
+        "independent": providers.SEARCH_ID in providers.records,
+    }
+
+
+@router.put("/settings/search")
+async def save_search_settings(request: Request, body: SearchKeyInput):
+    """Save an independent DeepSeek Search API key. / 保存独立搜索密钥。"""
+    if body.api_key is None or not body.api_key.get_secret_value().strip():
+        raise problem(422, "SEARCH_KEY_INVALID", "Enter a Search API key.")
+    providers = request.app.state.providers
+    async with providers.lock:
+        providers.save_search_key(body.api_key.get_secret_value())
+        request.app.state.reload_models()
+    return {"configured": True, "source": "independent", "independent": True}
+
+
+@router.delete("/settings/search", status_code=204)
+async def delete_search_settings(request: Request):
+    """Delete only the independent Search key and refresh tool availability. / 删除独立搜索密钥。"""
+    providers = request.app.state.providers
+    async with providers.lock:
+        providers.clear_search_key()
+        request.app.state.reload_models()
+    return Response(status_code=204)
+
+
+@router.post("/settings/search/test")
+async def test_search_settings(request: Request, body: SearchKeyInput):
+    """Call Search once with the supplied or resolved key. / 使用指定或已解析密钥测试搜索。"""
+    providers = request.app.state.providers
+    key = (
+        body.api_key.get_secret_value().strip()
+        if body.api_key is not None
+        else providers.search_key()
+    )
+    if not key:
+        return {"ok": False, "error": {"code": "SEARCH_NOT_CONFIGURED", "message": "No key."}}
+    try:
+        result = await DeepSeekSearch(lambda: key).run("DeepSeek", count=1)
+    except ToolOperationError as error:
+        return {
+            "ok": False,
+            "error": {
+                "code": error.result.error.code,
+                "message": error.result.error.message,
+            },
+        }
+    return {"ok": True, "count": len(result["data"]["results"])}
+
+
+class DecisionInput(BaseModel):
+    """Selected decision model, or null for LLM self-driven mode. / 决策模型选择。"""
+
+    model: str | None = None
+
+
+@router.get("/settings/decision")
+async def get_decision_settings(request: Request):
+    """Return decision-model selection and availability. / 返回决策模型与可用性。"""
+    store = request.app.state.decision_store
+    selected = store.model()
+    return {
+        "model": selected,
+        "available": bool(selected and selected in request.app.state.model_items),
+        "models": sorted(request.app.state.model_items),
+    }
+
+
+@router.put("/settings/decision")
+async def save_decision_settings(request: Request, body: DecisionInput):
+    """Persist a decision model and rebuild runners; null falls back to the LLM. / 保存决策模型。"""
+    selected = body.model.strip() if isinstance(body.model, str) and body.model.strip() else None
+    if selected is not None and selected not in request.app.state.model_items:
+        raise problem(404, "DECISION_MODEL_NOT_FOUND", "Select a configured model.")
+    request.app.state.decision_store.save(selected)
+    request.app.state.reload_models()
+    return {
+        "model": selected,
+        "available": bool(selected),
+        "models": sorted(request.app.state.model_items),
+    }
+
+
 @router.get("/settings/providers", response_model=ProviderList)
 async def get_providers(request: Request):
     """List configured model providers and setup state. / 列出已配置的模型提供商与初始化状态。
@@ -984,6 +1090,18 @@ async def delete_provider(request: Request, provider_id: Identifier):
         providers.delete(provider_id)
         request.app.state.reload_models()
     return Response(status_code=204)
+
+
+@router.post("/settings/providers/test-models")
+async def test_provider_models(request: Request, body: ProviderInput):
+    """Validate selected models with one tiny real request each. / 用真实小请求逐个验证模型。"""
+    model_ids = [model.id for model in body.models]
+    if not model_ids:
+        raise problem(422, "MODELS_REQUIRED", "Select at least one model to test.")
+    try:
+        return {"items": await request.app.state.providers.test_models(body, model_ids)}
+    except ValueError as error:
+        raise problem(422, "PROVIDER_INVALID", str(error)) from error
 
 
 @router.post("/settings/providers/discover", response_model=DiscoveredModels)
@@ -2075,6 +2193,17 @@ async def archive_thread(request: Request, thread_id: Identifier, body: ThreadPa
         return await require_thread(request, thread_id)
 
 
+@router.get("/threads/{thread_id}/work-details")
+async def work_details(
+    request: Request,
+    thread_id: Identifier,
+    limit: Annotated[int, Query(ge=1, le=2000)] = 500,
+) -> dict:
+    """Return persisted model-call JSONL records for one session. / 返回会话的模型调用记录。"""
+    await require_thread(request, thread_id)
+    return {"items": await request.app.state.runtime_journal.read(thread_id, limit=limit)}
+
+
 @router.get("/threads/{thread_id}/messages", response_model=MessageList)
 async def messages(
     request: Request,
@@ -2110,6 +2239,7 @@ async def messages(
                     "run_id": turn.run_id,
                     "message": turn.user_input,
                     "response": turn.response,
+                    "reasoning": turn.reasoning,
                     "attachments": attachments,
                     "activity": turn.activity,
                     "metrics": turn.metrics,
@@ -2431,6 +2561,7 @@ def chat_result(state: dict) -> ChatResult:
         run_id=state["run_id"],
         thread_id=state["thread_id"],
         response=state["response"],
+        reasoning=reasoning_text(state.get("messages", [])),
         message=state.get("user_input"),
         profile_version=profile.get("version"),
         used_memory_ids=state.get("used_memory_ids", []),
@@ -2574,6 +2705,25 @@ async def run_chat(
             raise problem(409, "REVIEW_REQUIRED", "An explicit review decision is required.")
         # A new message starts a run; a decision resumes one. / 新消息启动运行，审批决定恢复运行。
         pending = bool(snapshot.next)
+        history = None
+        if pending and message is not None and review is None:
+            # A failed model call can leave a pending checkpoint with no review. Recover by
+            # rebuilding a fresh run from archived turns instead of blocking the session.
+            # 模型失败可能留下无审批的挂起检查点；用归档轮次重建新运行，避免会话卡死。
+            checkpointer = getattr(runner.graph, "checkpointer", None)
+            if checkpointer is not None and hasattr(checkpointer, "adelete_thread"):
+                rows = await store(request).list_turns(
+                    user_id=LOCAL_USER, thread_id=thread_id, limit=20, newest_first=True
+                )
+                history = []
+                for _, turn in reversed(rows):
+                    if turn.user_input:
+                        history.append(HumanMessage(content=turn.user_input))
+                    if turn.response:
+                        history.append(AIMessage(content=turn.response))
+                await checkpointer.adelete_thread(config["configurable"]["thread_id"])
+                snapshot = await runner.graph.aget_state(config)
+                pending = False
         if pending != (message is None):
             if pending:
                 raise problem(409, "RUN_PENDING", "Resume or clear the previous run first.")
@@ -2595,6 +2745,7 @@ async def run_chat(
                     decision=decision,
                     attachment_ids=attachment_ids,
                     references=references,
+                    history=history,
                     model_selection=model_selection,
                     stream_mode=(
                         ["values", "updates", "messages", "custom"] if stream else ["values"]
@@ -2624,6 +2775,13 @@ async def run_chat(
                             and chunk.text
                         ):
                             yield ("delta", {"text": chunk.text})
+                        if (
+                            isinstance(chunk, AIMessageChunk)
+                            and metadata.get("langgraph_node") == "agent"
+                        ):
+                            reasoning = reasoning_text([chunk])
+                            if reasoning:
+                                yield ("reasoning", {"text": reasoning})
                     if stream and state is not None and kind != "messages":
                         activity = run_activity(state, stage=stage, tool_progress=tool_progress)
                         if activity != previous_activity:
@@ -2906,6 +3064,10 @@ def create_app(
             create_builtin_tools if model_provider is None and work_tools is None else None
         )
         providers = ProviderStore(checkpoint.sqlite_path.with_name("providers.json"))
+        if tool_factory is None and work_tools is None and model_provider is None:
+            def factory(settings):
+                search = DeepSeekSearch(providers.search_key) if providers.search_key() else None
+                return create_builtin_tools(settings, search=search)
         # Model to (item, connection); rebuilt on reload. / 模型到（条目、连接），重载时重建。
         catalog = {}
         async with (
@@ -2929,6 +3091,11 @@ def create_app(
             app.state.profile_snapshots = ProfileSnapshots(workspace_store)
             app.state.memory_reader = CachedMemoryReader(workspace_store, prompt_settings)
             app.state.prompt_telemetry = PromptTelemetry()
+            app.state.decision_store = DecisionConfigStore(
+                checkpoint.sqlite_path.with_name("decision.json")
+            )
+            configure_application_logging(checkpoint.sqlite_path.parent / "logs" / "application")
+            app.state.runtime_journal = RuntimeJournal(checkpoint.sqlite_path.parent / "logs")
             evolution = MemoryEvolution(learning_store, conversations)
             app.state.memory_evolution = evolution
             app.state.checkpointer = checkpointer
@@ -2972,14 +3139,25 @@ def create_app(
                 scoped_settings = tool_settings
                 descriptor_settings = tool_settings if work_tools is None else None
                 scoped_tools = work_tools_for_runner
-                if factory is not None and directory:
+                if factory is not None and work_tools is None:
+                    root = Path(directory) if directory else tool_settings.workspace_path
+                    scoped_settings = tool_settings.model_copy(
+                        update={
+                            "workspace_path": root,
+                            "artifacts_path": None,
+                        }
+                    )
+                    scoped_tools = (
+                        *factory(scoped_settings),
+                        *create_attachment_tools(conversations),
+                    )
+                    descriptor_settings = scoped_settings
+                elif factory is not None and directory:
                     root = Path(directory)
                     scoped_settings = tool_settings.model_copy(
                         update={
                             "workspace_path": root,
-                            "artifacts_path": None
-                            if root == tool_settings.workspace_path
-                            else root / ".slothy" / "artifacts",
+                            "artifacts_path": None,
                         }
                     )
                     scoped_tools = (
@@ -3006,9 +3184,7 @@ def create_app(
                 return registry.settings or tool_settings.model_copy(
                     update={
                         "workspace_path": root,
-                        "artifacts_path": None
-                        if root == tool_settings.workspace_path
-                        else root / ".slothy" / "artifacts",
+                        "artifacts_path": None,
                     }
                 )
 
@@ -3079,6 +3255,33 @@ def create_app(
                 app.state.prompt_telemetry.observe_summary(result.usage_metadata)
                 return HistorySummaryResult(result.text, result.usage_metadata)
 
+            def resolved_decision_settings() -> DecisionSettings:
+                """Resolve the user-selected decision model into connection settings.
+                / 将用户选择的决策模型解析为连接配置；不可用时关闭并由 LLM 自驱动。"""
+                selected = app.state.decision_store.model()
+                entry = catalog.get(selected) if selected else None
+                if entry is None:
+                    return DecisionSettings(_env_file=None, mode="off")
+                _, connection = entry
+                try:
+                    if isinstance(connection, ProviderConnection):
+                        return DecisionSettings(
+                            _env_file=None,
+                            mode="enforce",
+                            model=connection.model,
+                            api_key=connection.key.get_secret_value(),
+                            base_url=str(connection.settings.base_url),
+                        )
+                    return DecisionSettings(
+                        _env_file=None,
+                        mode="enforce",
+                        model=connection.model,
+                        api_key=connection.api_key.get_secret_value(),
+                        base_url=connection.resolved_base_url,
+                    )
+                except (AttributeError, ValueError):
+                    return DecisionSettings(_env_file=None, mode="off")
+
             @cache
             def runner_for(
                 mode: Mode, model_id: str | None, effort: str | None, directory: str | None = None
@@ -3124,6 +3327,7 @@ def create_app(
                     profile_snapshot_reader=app.state.profile_snapshots,
                     history_summarizer=partial(summarize_history, summary_provider=provider),
                     prompt_observer=app.state.prompt_telemetry.observe,
+                    runtime_journal=app.state.runtime_journal,
                     skill_reader=connectors.skill_references,
                     reference_reader=app.state.references.resolve,
                     identity_reader=IdentityAnswers(workspace_store, conversations),
@@ -3140,7 +3344,11 @@ def create_app(
                     tool_registry=registry,
                     mode=mode,
                     require_tool_review=True,
-                    system_prompt=BASE_SYSTEM_PROMPT + registry.instructions(mode),
+                    decision_settings=resolved_decision_settings(),
+                    system_prompt=assemble_sections([
+                        PromptSection("persona", 100, BASE_SYSTEM_PROMPT),
+                        PromptSection("tools", 200, registry.instructions(mode)),
+                    ]),
                 )
                 return AgentRunner(graph, agent_settings, conversation_writer=conversations)
 

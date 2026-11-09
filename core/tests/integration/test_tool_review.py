@@ -132,6 +132,7 @@ def test_agent_can_read_previously_uploaded_file(tmp_path, mode):
             "calculate",
             "calculate_financial",
             "workspace_read",
+            "workspace_delete",
             "export_document",
             "get_datetime",
             "list_uploaded_files",
@@ -178,8 +179,11 @@ def test_agent_can_read_previously_uploaded_file(tmp_path, mode):
         assert read["name"] == "read_uploaded_file"
         assert json.loads(read["arguments"]) == {"file_id": upload["id"], "offset": 60_000}
         assert "Only the scoped reader may return this." in read["result"]
-        assert "Private" not in reply.text
+        assert all("Private" not in frame["text"] for frame in events(reply, "delta"))
+        assert done["reasoning"] == "Private"
         (saved,) = client.get(f"{base}/threads/{thread}/messages").json()["items"]
+        assert saved["reasoning"] == "Private"
+        assert "Private" not in saved["response"]
         assert saved["activity"] == done["activity"]
         config = build_graph_config(
             {"user_id": "local-user", "thread_id": thread}, app.state.agent_settings
@@ -337,3 +341,55 @@ def test_every_policy_also_pauses_read_only_calls(tmp_path):
         )
         assert response.status_code == 202, response.text
         assert response.json()["calls"][0]["name"] == "calculate"
+def test_denied_delete_is_not_executed_and_run_continues(tmp_path):
+    """A denied high-risk call never executes and the same run resumes.
+    / 拒绝后工具不执行并继续运行。"""
+    workspace = tmp_path / "artifacts"
+    workspace.mkdir()
+    target = workspace / "keep.txt"
+    target.write_text("keep", encoding="utf-8")
+    model = ToolModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_delete",
+                        "args": {"path": "keep.txt"},
+                        "id": "delete-call",
+                    }
+                ],
+            ),
+            AIMessage(content="The deletion was denied; nothing was removed."),
+        ]
+    )
+    app = create_app(
+        checkpoint_settings=CheckpointSettings(sqlite_path=tmp_path / "deny.sqlite"),
+        model_provider=SimpleNamespace(get_chat_model=lambda: model),
+        work_tools=create_builtin_tools(ToolSettings(workspace_path=workspace)),
+    )
+    with TestClient(app) as client:
+        review = client.post(
+            "/api/v1/chat",
+            json={
+                "message": "delete keep.txt",
+                "approval_policy": "every",
+                "mode": "work",
+            },
+        )
+        assert review.status_code == 202, review.text
+        thread = f"/api/v1/threads/{review.json()['thread_id']}"
+        result = client.post(
+            thread + "/approval/" + review.json()["approval_id"],
+            json={"approved": False},
+        )
+        assert result.status_code == 200, result.text
+        payload = result.json()
+        assert target.exists(), "denied delete must not touch the filesystem"
+        assert "denied" in payload["response"].lower()
+        rejected = [
+            entry
+            for entry in payload["activity"]
+            if entry.get("name") == "workspace_delete"
+        ]
+        assert rejected and rejected[0]["status"] == "rejected"

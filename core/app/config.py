@@ -107,6 +107,11 @@ class LLMSettings(_ProjectSettings):
     # 中文：服务扩展请求字段，例如 thinking；不用于覆盖消息或运行步数。
     # English: Vendor request extensions, such as thinking; never messages or graph step limits.
     extra_body: dict[str, JsonValue] = Field(default_factory=dict)
+    # 中文：模型内置联网搜索策略：auto（支持则默认启用）/ native（仅支持时启用）/
+    # off（禁用）；不支持的模型自动忽略，绝不发送不兼容参数。
+    # English: Native web-search policy: auto (enable when supported) / native (only when
+    # supported) / off; unsupported models are ignored and never receive incompatible fields.
+    web_search: Literal["auto", "native", "off"] = "auto"
 
     @classmethod
     def settings_customise_sources(
@@ -295,6 +300,52 @@ class AgentSettings(_ProjectSettings):
     )
 
 
+class DecisionSettings(_ProjectSettings):
+    """Model-driven decision layer settings. / 决策模型驱动的决策层配置。
+
+    The decision model uses an OpenAI-compatible endpoint. Endpoint/model/key may be given
+    as ``DECISION_*`` or as the existing ``DASHSCOPE__*`` variables so the same local
+    configuration can back the decision model. ``mode=off`` disables model calls and keeps
+    the pre-decision behavior exactly.
+    / 决策模型使用 OpenAI 兼容端点，端点/模型/密钥可用 ``DECISION_*`` 或现有
+    ``DASHSCOPE__*`` 变量；``mode=off`` 关闭模型调用并保持引入决策层前的行为。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="DECISION_")
+
+    # 中文：off 关闭决策模型（默认），shadow 只计算并记录，enforce 按计划执行路由。
+    # English: off disables the model (default), shadow records only, enforce applies the route.
+    mode: Literal["off", "shadow", "enforce"] = "off"
+    # 中文：决策模型 ID；空值时回退规则，不会隐式使用主聊天模型。
+    # English: Decision model id; empty means rules fallback, never the main chat model.
+    model: str | None = Field(
+        default=None,
+        max_length=256,
+        validation_alias=AliasChoices("DECISION_MODEL", "DASHSCOPE__MODEL"),
+    )
+    # 中文：决策模型密钥；只用于该端点，不参与聊天模型供应商选择。
+    # English: Decision endpoint secret; never used for the chat provider selection.
+    api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DECISION_API_KEY", "DASHSCOPE__API_KEY"),
+    )
+    # 中文：决策模型 OpenAI 兼容根地址（含 /v1，不含 /chat/completions）。
+    # English: OpenAI-compatible base URL including /v1, without /chat/completions.
+    base_url: AnyHttpUrl | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DECISION_BASE_URL", "DASHSCOPE__MODEL_URL"),
+    )
+    # 中文：单次决策调用超时秒数；超时后回退规则决策。
+    # English: Per-decision timeout in seconds; timeout falls back to rules.
+    timeout_seconds: float = Field(default=2.0, gt=0, le=30, allow_inf_nan=False)
+    # 中文：决策模型输出 token 上限，保持计划 JSON 简短。
+    # English: Decision output token cap, keeping the plan JSON compact.
+    max_tokens: int = Field(default=1024, ge=128, le=8192)
+    # 中文：引用上下文预算上限；模型输出超过时由护栏收敛。
+    # English: Reference-context budget ceiling; guards clamp larger proposals.
+    max_reference_budget: int = Field(default=12000, ge=0, le=100000)
+
+
 class MemorySettings(_ProjectSettings, MemoryConfiguration):
     """Planner defaults overridden by persisted settings-API config. / 规划器默认值。"""
 
@@ -334,9 +385,13 @@ class PromptSettings(_ProjectSettings):
     """Prompt layout and local cache limits, independent of models. / 提示词布局与缓存限制。"""
 
     model_config = SettingsConfigDict(env_prefix="PROMPT_", extra="ignore", populate_by_name=True)
-    version: str = Field(default="2026-11-07.memory-v3", min_length=1, max_length=80)
+    version: str = Field(default="2026-11-09.context-v1", min_length=1, max_length=80)
     layout: Literal["layered", "legacy"] = "layered"
     layered_l3: bool = True
+    # Operational snapshots are checkpoint-only and separate from memory budgets.
+    # 中文：运行快照只存检查点并限制容量，不改变长期记忆预算。
+    runtime_context_max_bytes: int = Field(default=32768, ge=512, le=1000000)
+    runtime_context_max_snapshots: int = Field(default=8, ge=1, le=64)
     cache_breakpoints: Literal["anthropic:auto", "auto", "off"] = "anthropic:auto"
     history_soft_limit: int = Field(
         default=20,
