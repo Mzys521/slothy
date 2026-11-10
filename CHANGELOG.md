@@ -13,7 +13,21 @@ the four-part Windows version followed by a prerelease suffix.
 
 Development exploration prerelease. Not production-stable; use with backups.
 
+### Major
+
+- **Context system architecture rebuilt / 上下文系统架构重建**: deterministic named
+  static prompt sections plus a separately checkpointed runtime request surface.
+  Unchanged context keeps its position, changes append after history, and compaction
+  reprojects removed snapshots. Source revocation and scope changes remove old
+  reference bodies before dispatch; the request surface is bounded (8 snapshots /
+  32768 bytes) and never enters conversation archives, turn counts or memory learning.
+  Prompt accounting counts the real current user/system once, and the default prompt
+  version is `2026-11-09.context-v1`.
+
 ### Fixed
+- Reply HTML/SVG previews hide native scrollbars while keeping wheel/touch scrolling;
+  no scrollbar gutter is reserved, so previews no longer show visible progress-like bars.
+
 
 - **P0 — multi-session isolation**: shared busy, command and live-output state could block
   another conversation or lose its visible output after navigation. Requests and cleanup

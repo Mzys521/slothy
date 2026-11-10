@@ -80,7 +80,11 @@ export function replyPreview(source: string, label: string, kind: 'svg' | 'html'
   style.textContent = `:root{color-scheme:${initialTheme.dark ? 'dark' : 'light'};--preview-bg:${initialTheme.background};--preview-surface:${initialTheme.surface};--preview-text:${initialTheme.text};--preview-muted:${initialTheme.muted};--preview-accent:${initialTheme.accent};--preview-font:${initialTheme.font}}body{margin:0!important;background:var(--preview-bg);color:var(--preview-text);font-family:var(--preview-font)}*{box-sizing:border-box}img,video,canvas{max-width:100%}a{color:var(--preview-accent)}`
   style.textContent += autoSize
     ? 'html{height:auto!important;overflow:hidden}body{min-height:0!important;height:auto!important;display:flow-root;overflow:visible}body>svg{display:block;width:100%!important;height:auto!important;max-height:none!important}'
-    : 'html{height:100%!important;overflow:auto!important;scrollbar-gutter:stable}body{min-height:100%;display:flow-root}'
+    : 'html{height:100%!important;overflow:auto!important}body{min-height:100%;display:flow-root}'
+  // Scrollbars are an implicit affordance: keep scrolling functional but never paint
+  // native scrollbars or reserve their gutter inside a reply preview.
+  // 滚动条作为隐式交互保留滚动能力，但预览内不绘制原生滚动条，也不预留滚动条槽位。
+  style.textContent += 'html,body,body *{scrollbar-width:none!important;-ms-overflow-style:none!important}html::-webkit-scrollbar,body::-webkit-scrollbar,body *::-webkit-scrollbar{display:none!important;width:0!important;height:0!important}'
   style.textContent += 'body,body *{font-family:var(--preview-font)!important}body :is(pre,code,kbd,samp),body :is(pre,code,kbd,samp) *{font-family:ui-monospace,SFMono-Regular,Consolas,monospace!important}'
   const variables = parsed.createElement('style')
   variables.textContent = style.textContent.slice(0, style.textContent.indexOf('}') + 1)
@@ -147,7 +151,7 @@ export function replyPreview(source: string, label: string, kind: 'svg' | 'html'
   // 两层都不具备同源权限、顶层导航或弹窗能力。
   const policy = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; frame-src about:; connect-src 'none'; base-uri 'none'; form-action 'none'"
   const wrapper = '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer"><meta http-equiv="Content-Security-Policy" content="' + policy + '">' +
-    '<style>html,body{margin:0;width:100%;height:100%;overflow:hidden}iframe{display:block;position:absolute;left:0;top:0;width:100%;height:' + (autoSize ? '600px' : '100%') + ';border:0;transform-origin:0 0}</style>' +
+    '<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;scrollbar-width:none;-ms-overflow-style:none}html::-webkit-scrollbar,body::-webkit-scrollbar{display:none;width:0;height:0}iframe{display:block;position:absolute;left:0;top:0;width:100%;height:' + (autoSize ? '600px' : '100%') + ';border:0;transform-origin:0 0}</style>' +
     '<iframe sandbox="allow-scripts" title="' + escape(label) + '" srcdoc="' + escape(inner) + '"></iframe>' +
     '<script>(()=>{const id=' + literal(id) + `, autoSize=${autoSize}, frame=document.querySelector('iframe');let theme,logicalWidth=0;
     function fit(){if(!logicalWidth)return;const scale=Math.min(1,innerWidth/logicalWidth);frame.style.width=(scale<1?logicalWidth:innerWidth)+'px';frame.style.transform='scale('+scale+')';}
