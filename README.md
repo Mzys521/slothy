@@ -7,7 +7,7 @@
 <p align="center"><em>Small Steps Toward A Better Future · 小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.1--beta-60DD06" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.2--beta-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.1-beta"><strong>Download Slothy 0.1.4.1 Beta for Windows x64</strong></a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.2-beta"><strong>Download Slothy 0.1.4.2 Beta for Windows x64</strong></a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -41,7 +41,7 @@ reviewable. Fully manual review is also available. Each request retrieves releva
 memory. Tool calls that change your machine are reviewed by you, not trusted
 blindly.
 
-## Memory V3 — 0.1.4.1-beta
+## Memory V3 — 0.1.4.2-beta
 
 The background model extracts typed concepts and evidence-backed relations. Python
 and beginner are separate concepts; proficiency belongs to Python, not to the user
@@ -55,7 +55,7 @@ This development release resets all three business databases **once on first V3
 startup**, without migrating/relearning old conversations. Provider keys, connector
 configuration files, UI preferences and workspace files remain. Old browser session
 caches are cleared when the data epoch changes. No TTL or time decay is applied.
-The published GitHub release now carries this `0.1.4.1-beta` build; building this
+The published GitHub release now carries this `0.1.4.2-beta` build; building this
 checkout reproduces the same version locally.
 
 ## Why Slothy

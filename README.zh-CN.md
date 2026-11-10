@@ -7,7 +7,7 @@
 <p align="center"><em>小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.1--beta-60DD06" />
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.2--beta-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -23,7 +23,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.1-beta"><strong>下载 Slothy 0.1.4.1 Beta（Windows x64）</strong></a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.2-beta"><strong>下载 Slothy 0.1.4.2 Beta（Windows x64）</strong></a> ·
   <a href="CHANGELOG.md">更新日志</a>
 </p>
 
@@ -38,7 +38,7 @@
 与当前请求相关的记忆。会改动你机器的工具调用会先暂停、
 由你审批后再恢复同一次运行。
 
-## 长期记忆 V3 — 0.1.4.1-beta
+## 长期记忆 V3 — 0.1.4.2-beta
 
 后台模型提炼语义概念与有证据的关系。Python 与新手是两个概念，“新手”绑定 Python，
 不会成为用户整体标签。概念和事实各自按会话去重强化，强度为 `f/(f+4)`；本地 SQLite
@@ -47,7 +47,7 @@ FTS5、别名与一跳关联检索无需 embedding 服务。手动编辑和自�
 
 本开发版首次启动 V3 **仅一次重置三份业务数据库**，不迁移或重新学习旧消息。模型密钥、
 连接器配置文件、界面偏好及工作区实际文件保留；数据纪元变化会清理旧浏览器会话缓存。
-不采用 TTL 或时间衰减。上方 GitHub 发布即本 `0.1.4.1-beta` 构建；本源码构建会生成
+不采用 TTL 或时间衰减。上方 GitHub 发布即本 `0.1.4.2-beta` 构建；本源码构建会生成
 相同版本的安装包。
 
 ## 为什么是 Slothy
