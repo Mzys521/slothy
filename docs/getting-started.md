@@ -132,8 +132,9 @@ to reference a workspace folder or file, an owned conversation, or an enabled pl
 the server revalidates ownership and scope, then injects bounded low-trust L3 data.
 `/compact` and `/export` require confirmation, and plugin tool calls keep the normal
 approval policy. Files can also be dropped onto the conversation: TXT, Markdown, PDF,
-DOCX, JSON, CSV and similar documents are validated (8 files, 2 MiB each) and kept as
-pending attachments; PDF text is extracted locally before sending.
+DOCX, JSON, CSV and similar documents are validated (8 files, 32 MiB each) and kept as
+pending attachments; PDF text is extracted locally before sending. Large files are
+received first, then the model gets a bounded preview and can page through the rest.
 
 ## 5. Data locations
 

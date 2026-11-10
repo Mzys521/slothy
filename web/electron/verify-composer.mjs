@@ -169,7 +169,7 @@ await runSmoke({ backend: fixture, screenshot: path.join(output, 'commands-dark.
   await enterCommand('stop')
   await until(() => document.querySelector('[role="alert"]')?.textContent.includes('已停止'), 'Stop did not cancel the request')
   await enterCommand('retry Edited request')
-  await until(() => document.body.textContent.includes('Resume the original request first.'), 'Edited retry did not preserve the pending original run')
+  await until(() => document.body.textContent.includes('编辑后的内容不能替换检查点'), 'Edited retry did not preserve the pending original run')
   await enterCommand('retry')
   await until(() => document.body.textContent.includes('RESUMED_REPLY'), 'Retry did not resume the interrupted run')
   const resumed = Array.from(document.querySelectorAll('article')).find(item => item.textContent.includes('RESUMED_REPLY'))

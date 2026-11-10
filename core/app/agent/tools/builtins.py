@@ -149,9 +149,10 @@ def builtin_tools(settings: ToolSettings, search=None) -> list[DescribedTool]:
         WorkspaceDeleteArgs,
         workspace.delete,
         asynchronous=True,
-        risk=Risk.WRITE,
+        risk=Risk.DELETE,
         mode={"chat", "work"},
         result_kind="envelope",
+        journaled=True,
         enabled=settings.workspace_files_enabled,
         instruction=(
             "Use workspace_delete immediately when the user explicitly asks to remove a "

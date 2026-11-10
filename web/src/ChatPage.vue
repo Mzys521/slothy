@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ChevronDown, ChevronRight, File as FileIcon, History, LoaderCircle, PanelRight, Plus, Send, ShieldCheck, Square, SquarePlus, Trash2, X } from 'lucide-vue-next'
+import { ChevronDown, ChevronRight, CircleAlert, File as FileIcon, History, LoaderCircle, PanelRight, Plus, Send, ShieldCheck, Square, SquarePlus, Trash2, X } from 'lucide-vue-next'
 import { activeSession, activeWorkspace, clearSession, newChat, runningRequests as requestControllers, runningSessions, runningTurnIds, selectSession, sessions, sessionWorkspace, syncThreadMessages, workspaces, type ChatMode, type Session, type Turn, type WorkOptions } from './chat'
 import { readLocal, settings, t, writeLocal } from './preferences'
 import MarkdownText from './MarkdownText.vue'
@@ -15,7 +15,7 @@ import ConversationRail from './ConversationRail.vue'
 import ConversationStats from './ConversationStats.vue'
 import UserAvatar from './UserAvatar.vue'
 import { brandAsset } from './brand'
-import { downloadArtifact, riskLabel } from './toolResults'
+import { callRisk, downloadArtifact, irreversibleCall, riskLabel } from './toolResults'
 import ComposerPalette from './composer/ComposerPalette.vue'
 import ReferenceChip from './composer/ReferenceChip.vue'
 import { useComposerPalette } from './composer/useComposerPalette'
@@ -88,6 +88,13 @@ const paletteTitle = computed(() => palette.trigger.value?.kind === 'add' ? t('A
     : palette.trigger.value?.kind === 'argument' ? '/' + palette.trigger.value.command : t('Commands', '命令'))
 watch(command.confirmation, value => { if (value) void nextTick(() => confirmationArea.value?.querySelector<HTMLButtonElement>('button')?.focus()) })
 const pendingReview = computed(() => session.value?.pendingReview)
+const irreversibleReview = computed(() => pendingReview.value?.calls.some(irreversibleCall) ?? false)
+const reviewPanel = ref<HTMLElement>()
+// A high-risk review is non-modal; start keyboard focus on Reject, never on approval.
+// 高危审查沿用非模态面板，键盘焦点从拒绝开始，不默认选中批准。
+watch(() => pendingReview.value?.approval_id, id => {
+  if (id && irreversibleReview.value) void nextTick(() => reviewPanel.value?.querySelector<HTMLButtonElement>('button')?.focus())
+}, { immediate: true })
 const panelOpen = ref(Boolean(props.memoryId))
 watch(() => props.memoryId, id => { panelOpen.value = Boolean(id) })
 /** Close the context panel and notify the parent when it was opened from memory detail. / 关闭上下文面板，并在从记忆详情打开时通知父组件。 */
@@ -179,6 +186,10 @@ function submit(allowUnresolved?: unknown) {
   if (command.busy.value) return
   if (allowUnresolved !== true && unresolvedMentions(draft.value).length) { referenceTextConfirm.value = true; return }
   if (archived.value || workBusy.value || runningSessions.has(activeSession.value) || pendingReview.value || !canSend.value) return
+  if (session.value?.pendingRun) {
+    showWorkError(new Error(t('Continue the saved run before sending a new message.', '请先从检查点继续当前任务，再发送新消息。')))
+    return
+  }
   const text = draft.value.trim()
   const uploads = [...files.value]
   const attachments = uploads.map(file => file.name)
@@ -266,6 +277,8 @@ function applyWorkReply(target: Session, turn: Turn, result: ToolReview | WorkRe
     target.pendingReview = result
   } else {
     target.pendingReview = null
+    target.pendingRun = null
+    turn.checkpointId = undefined
     turn.serverReply = result.response
     turn.reasoning = result.reasoning ?? liveReasoning.value[turn.id] ?? turn.reasoning
     delete liveReasoning.value[turn.id]
@@ -338,6 +351,7 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
   const controller = beginSessionRequest(target.id, turn.id)
   workError.value = ''
   const startedAt = performance.now()
+  let failed = false
   try {
     if (!target.apiThreadId) {
       const input = { mode: agentMode, title: target.title }
@@ -365,6 +379,7 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
     turn.activityMs = performance.now() - startedAt
     applyWorkReply(target, turn, result)
   } catch (cause) {
+    failed = true
     turn.serverError = controller.signal.aborted ? t('Run stopped. Use /retry to resume.', '已停止运行，可使用 /retry 恢复。') : cause instanceof Error ? cause.message : t('Could not get a reply.', '无法获取回复。')
     if (!disposed && target.id === activeSession.value && !draft.value && !files.value.length) {
       draft.value = turn.prompt
@@ -374,6 +389,7 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
     if (target.apiThreadId) await refreshReview(target)
   } finally {
     finishSessionRequest(target.id, controller)
+    if (failed && target.apiThreadId) await syncThreadMessages(target).catch(() => {})
   }
 }
 /**
@@ -565,8 +581,8 @@ function addFileList(selected: File[]) {
     workError.value = t('Attach at most eight files.', '每次最多添加 8 个文件。')
     return
   }
-  if (selected.some(file => file.size > 2 * 1024 * 1024)) {
-    workError.value = t('Each file must be no larger than 2 MiB.', '单个文件不能超过 2 MiB。')
+  if (selected.some(file => file.size > 32 * 1024 * 1024)) {
+    workError.value = t('Each file must be no larger than 32 MiB.', '单个文件不能超过 32 MiB。')
     return
   }
   const unsupported = selected.find(file => {
@@ -709,18 +725,31 @@ function stopCurrent() {
 
 async function retryCurrent(message: string) {
   const target = session.value
-  const last = target?.turns.at(-1)
-  if (!target || !last || target.pendingReview) throw new Error(t('No message to retry, or approval is pending.', '没有可重试消息，或当前仍有待审批操作。'))
+  const original = target?.turns.at(-1)
+  if (!target || target.pendingReview || runningSessions.has(target.id)) throw new Error(t('No message to retry, or approval is pending.', '没有可重试消息，或当前仍有待审批操作。'))
+  const draftAtStart = draft.value
+  if (target.apiThreadId) await syncThreadMessages(target)
+  const last = target.turns.find(turn => turn.serverRunId === target.pendingRun?.run_id) ?? target.turns.at(-1) ?? original
+  if (!last) throw new Error(t('No saved request to resume.', '没有可恢复的已保存请求。'))
+  const clearRestoredDraft = draftAtStart === last.prompt || parseCommand(draftAtStart)?.name === 'retry'
+  if (target.pendingRun?.status === 'awaiting_approval') {
+    await refreshReview(target)
+    throw new Error(t('Review the pending tool actions before continuing.', '请先审查待处理的工具操作。'))
+  }
+  const unfinished = Boolean(target.pendingRun || last.checkpointId || last.serverError || original?.serverError)
+  if (unfinished && message) throw new Error(t('Resume the original request first. Edited text cannot replace a checkpoint.', '请先从检查点继续原请求，编辑后的内容不能替换检查点。'))
   const retryOptions = { memory: settings.personalizedMemory, model: model.value, reasoningEffort: reasoningEffort.value,
     ...(target.mode === 'work' ? { work: { ...work.value } } : {}) }
-  if (last.serverError && target.apiThreadId && !message) {
+  if (unfinished && target.apiThreadId && !message) {
     const controller = beginSessionRequest(target.id, last.id)
     const previousError = last.serverError
     const previousRun = last.serverRunId
     let restored = last
     last.serverError = undefined
     try {
-      const result = await runStream(target.id, threadPath(target.apiThreadId) + '/resume', { stream: true }, last, controller.signal, run => {
+      const checkpoint = target.pendingRun?.checkpoint_id ?? last.checkpointId
+      const path = threadPath(target.apiThreadId) + '/resume?stream=true' + (checkpoint ? '&checkpoint_id=' + encodeURIComponent(checkpoint) : '')
+      const result = await runStream(target.id, path, {}, last, controller.signal, run => {
         restored = target.turns.find(item => item.serverRunId === run) ?? last
         runningTurnIds[target.id] = restored.id
         restored.serverError = undefined
@@ -737,7 +766,7 @@ async function retryCurrent(message: string) {
       }
       restored.serverError = undefined
       applyWorkReply(target, restored, result)
-      if (!disposed && target.id === activeSession.value) resetDraft()
+      if (clearRestoredDraft && !disposed && target.id === activeSession.value && draft.value === draftAtStart) resetDraft()
       // The archive supplies the authoritative prompt, attachment names and references.
       // 归档提供权威原文、附件名称与引用，不能用修改后的草稿冒充原始请求。
       if (finishSessionRequest(target.id, controller)) {
@@ -747,9 +776,15 @@ async function retryCurrent(message: string) {
       return
     } catch (error) {
       if (restored !== last) { last.serverError = previousError; last.serverRunId = previousRun }
-      if (!(error instanceof ApiError && error.code === 'NO_PENDING_RUN')) { restored.serverError = error instanceof Error ? error.message : t('Retry failed.', '重试失败。'); throw error }
-      last.serverError = previousError
-      last.serverRunId = previousRun
+      restored.serverError = error instanceof Error ? error.message : t('Retry failed.', '重试失败。')
+      finishSessionRequest(target.id, controller)
+      await refreshReview(target)
+      await syncThreadMessages(target).catch(() => {})
+      if (target.turns.some(turn => turn.serverRunId === previousRun && turn.serverReply)) return
+      if (error instanceof ApiError && error.code === 'NO_PENDING_RUN') {
+        throw new Error(t('No recoverable checkpoint exists. Edit and send the request explicitly.', '没有可恢复的检查点，请编辑后明确重新发送请求。'))
+      }
+      throw error
     } finally {
       if (finishSessionRequest(target.id, controller)) {
         delete liveReplies.value[last.id]; delete liveReasoning.value[last.id]
@@ -856,6 +891,7 @@ function onComposerKey(event: KeyboardEvent) {
               </div>
               </template>
               <p v-if="turn.serverError" class="muted" role="alert">{{ turn.serverError }}</p>
+              <button v-if="turn.checkpointId && !workRunning(turn) && !pendingReview && turn.serverRunId === session?.pendingRun?.run_id" type="button" class="outline-button checkpoint-resume" :disabled="archived || workBusy || command.busy.value" @click="command.run('retry')">{{ t('Continue from checkpoint', '从检查点继续') }}</button>
               <MarkdownText v-else-if="turn.serverReply" class="answer" :text="turn.serverReply" previews />
               <MarkdownText v-else-if="liveReplies[turn.id]" class="answer" :text="liveReplies[turn.id] ?? ''" />
               <footer v-if="turn.serverReply && !turn.serverError" class="answer-footer">
@@ -871,20 +907,22 @@ function onComposerKey(event: KeyboardEvent) {
             </div>
           </div>
         </article>
-        <section v-if="pendingReview && !archived" class="tool-review" aria-labelledby="tool-review-title">
-          <h2 id="tool-review-title"><ShieldCheck />{{ t('Review tool actions', '审查工具操作') }}</h2>
-          <p>{{ t('These actions are paused. Approving runs every action listed below.', '这些操作已暂停。批准后会执行下列所有操作。') }}</p>
+        <section v-if="pendingReview && !archived" ref="reviewPanel" class="tool-review" :class="{ 'tool-review-danger': irreversibleReview }"
+          :role="irreversibleReview ? 'alertdialog' : 'region'" :aria-modal="irreversibleReview ? 'false' : undefined" aria-labelledby="tool-review-title" :aria-describedby="irreversibleReview ? 'tool-review-description tool-review-warning' : 'tool-review-description'">
+          <h2 id="tool-review-title"><component :is="irreversibleReview ? CircleAlert : ShieldCheck" aria-hidden="true" />{{ irreversibleReview ? t('High-risk action review', '高危操作审查') : t('Review tool actions', '审查工具操作') }}</h2>
+          <p id="tool-review-description">{{ t('These actions are paused. Approving runs every action listed below.', '这些操作已暂停。批准后会执行下列所有操作。') }}</p>
+          <p v-if="irreversibleReview" id="tool-review-warning" class="tool-review-warning">{{ t('This batch includes irreversible actions. Check the targets and arguments: deleted or replaced content may not be recoverable.', '此批操作包含不可逆操作。请核对目标与参数，删除或覆盖的内容可能无法恢复。') }}</p>
           <ul>
             <li v-for="(call, index) in pendingReview.calls" :key="index">
               <strong>{{ call.name }}</strong>
-              <span v-if="call.risk"> · {{ riskLabel(call.risk, t) }}</span>
+              <span v-if="callRisk(call)" class="tool-review-risk" :class="{ 'tool-risk-danger': irreversibleCall(call) }"> · {{ riskLabel(callRisk(call), t) }}<strong v-if="irreversibleCall(call)"> · {{ t('High risk · Irreversible', '高危 · 不可逆') }}</strong></span>
               <p v-if="call.review_hint">{{ call.review_hint }}</p>
               <details><summary>{{ t('View arguments', '查看参数') }}</summary><pre>{{ JSON.stringify(call.arguments, null, 2) }}</pre></details>
             </li>
           </ul>
           <div class="tool-review-actions">
             <button type="button" class="outline-button" :disabled="workBusy" @click="resolveReview(false)">{{ t('Reject', '拒绝') }}</button>
-            <button type="button" class="accent-button" :disabled="workBusy" @click="resolveReview(true)">{{ t('Approve and run', '批准并执行') }}</button>
+            <button type="button" class="accent-button tool-review-approve" :disabled="workBusy" @click="resolveReview(true)">{{ irreversibleReview ? t('Approve high-risk actions', '批准高危操作') : t('Approve and run', '批准并执行') }}</button>
           </div>
         </section>
       </div>

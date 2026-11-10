@@ -9,6 +9,33 @@ the four-part Windows version followed by a prerelease suffix.
 > 0.1.0 – 0.3.0). This line continues with the current desktop application and
 > keeps that history for reference.
 
+## [0.1.4.2-beta] — 2026-11-10
+
+Beta release. This is the first merged release from the `explore` line; back up local data before upgrading.
+
+### Added
+
+- Large attachments: up to 32 MiB per file and 128 MiB per conversation. Files are
+  received first; model context uses a 60,000-character bounded preview and
+  `read_uploaded_file` reads 8,000-character pages directly from SQLite.
+
+### Fixed
+
+- Interrupted runs now continue from LangGraph's saved SQLite checkpoint instead of
+  deleting state and rebuilding from chat history. Recovery preserves the original
+  run, model, attachments and completed tool tasks, including after application restart.
+  Streaming resume uses the correct query parameter; lost completion acknowledgements
+  reconcile the saved result without silently resending the request.
+- Tool deletion has a distinct Delete label across reviews and activity history.
+  Irreversible actions (including deletion and overwriting existing content) use a red
+  high-risk review panel, explicit irreversible badges and a red approval button.
+  Older pending deletion reviews receive the same warning; ordinary writes keep their style.
+
+### Documentation
+
+- Added bilingual release notes in `docs/releases/0.1.4.2-beta.md` (English first, Chinese after).
+- Updated attachment, recovery, approval and version guidance in the bilingual guides.
+
 ## [0.1.4.1-exp.2] — 2026-11-09
 
 Development exploration prerelease. Not production-stable; use with backups.

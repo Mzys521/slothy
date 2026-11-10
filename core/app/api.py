@@ -22,7 +22,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessageChunk, HumanMessage, SystemMessage
 from langchain_core.tools import BaseTool
 from pydantic import (
     BaseModel,
@@ -100,6 +100,7 @@ from app.providers import (
 )
 from app.references import ReferenceInput, ReferenceResolver
 from app.services import AgentRunner
+from app.services.recovery import checkpoint_state
 from app.tools.artifacts import ArtifactStore
 from app.tools.contracts import ToolOperationError
 from app.tools.read_attachment import (
@@ -357,6 +358,22 @@ class MessageList(BaseModel):
 
     items: list[ThreadMessage]
     next_cursor: int | None
+    pending_run: "PendingRun | None" = None
+
+
+class PendingRun(BaseModel):
+    """Read-only projection of an unfinished native checkpoint. / 未完成原生检查点的只读投影。"""
+
+    run_id: str
+    checkpoint_id: str
+    message: str
+    status: Literal["interrupted", "failed", "awaiting_approval"]
+    attachments: list[Attachment] = Field(default_factory=list)
+    references: list[dict] = Field(default_factory=list)
+    model_selection: dict = Field(default_factory=dict)
+    personalization_enabled: bool = False
+    activity: list[RunActivity] = Field(default_factory=list)
+    metrics: RunMetrics | None = None
 
 
 class ModelList(BaseModel):
@@ -390,6 +407,7 @@ class ReviewCall(BaseModel):
     name: str
     arguments: dict[str, JsonValue]
     risk: str | None = None
+    irreversible: bool = False
     review_hint: str | None = None
 
 
@@ -2223,7 +2241,25 @@ async def messages(
         A page of turns and the next cursor. / 一页轮次及下一页游标。
     """
     async with lock_for(request, thread_id):
-        await require_thread(request, thread_id)
+        thread = await require_thread(request, thread_id)
+        runner = (
+            request.app.state.work_runner if thread["mode"] == "work" else request.app.state.runner
+        )
+        snapshot, values = None, {}
+        if runner is not None:
+            config = build_graph_config(
+                {"user_id": LOCAL_USER, "thread_id": thread_id}, request.app.state.agent_settings
+            )
+            snapshot, values = await checkpoint_state(runner.graph, config)
+            if values and (
+                values.get("user_id") != LOCAL_USER or values.get("thread_id") != thread_id
+            ):
+                raise problem(
+                    409,
+                    "CHECKPOINT_IDENTITY",
+                    "The checkpoint does not belong to this conversation.",
+                )
+            await runner.archive_completed(snapshot)
         turns = await store(request).list_turns(
             user_id=LOCAL_USER, thread_id=thread_id, after_id=after_id, limit=limit + 1
         )
@@ -2256,7 +2292,38 @@ async def messages(
                     ],
                 }
             )
-    return {"items": items, "next_cursor": items[-1]["id"] if len(turns) > limit else None}
+        pending_run = None
+        if snapshot is not None:
+            if snapshot.next and values.get("run_id"):
+                review = pending_review(snapshot)
+                metrics = run_metrics(values)
+                pending_run = {
+                    "run_id": values["run_id"],
+                    "checkpoint_id": snapshot.config["configurable"]["checkpoint_id"],
+                    "message": values["user_input"],
+                    "status": "awaiting_approval"
+                    if review
+                    else "failed"
+                    if any(task.error for task in snapshot.tasks)
+                    else "interrupted",
+                    "attachments": await store(request).read_attachment_previews(
+                        LOCAL_USER, thread_id, values.get("attachment_ids", []), 0
+                    ),
+                    "references": await request.app.state.references.history_metadata(
+                        LOCAL_USER,
+                        thread_id,
+                        values.get("resolved_references") or values.get("references", []),
+                    ),
+                    "model_selection": values.get("model_selection", {}),
+                    "personalization_enabled": values.get("personalization_enabled", False),
+                    "activity": run_activity(values, waiting_for_approval=review is not None),
+                    "metrics": metrics,
+                }
+    return {
+        "items": items,
+        "next_cursor": items[-1]["id"] if len(turns) > limit else None,
+        "pending_run": pending_run,
+    }
 
 
 @router.post(
@@ -2298,7 +2365,7 @@ async def upload_attachment(
     data = bytearray()
     async for chunk in request.stream():
         if len(data) + len(chunk) > MAX_UPLOAD_BYTES:
-            raise problem(413, "ATTACHMENT_TOO_LARGE", "Files must be no larger than 2 MiB.")
+            raise problem(413, "ATTACHMENT_TOO_LARGE", "Files must be no larger than 32 MiB.")
         data.extend(chunk)
     try:
         content = await asyncio.to_thread(read_attachment, filename, bytes(data))
@@ -2311,7 +2378,7 @@ async def upload_attachment(
             LOCAL_USER, thread_id, file_id, filename, len(data), content
         )
         if not stored:
-            raise problem(413, "ATTACHMENT_QUOTA", "Conversation uploads exceed 24 MiB.")
+            raise problem(413, "ATTACHMENT_QUOTA", "Conversation uploads exceed 128 MiB.")
     return {"id": file_id, "filename": filename, "byte_size": len(data)}
 
 
@@ -2612,6 +2679,7 @@ async def run_chat(
     attachment_ids: list[str] | None = None,
     references: list[dict] | None = None,
     model_selection: dict | None = None,
+    expected_checkpoint_id: str | None = None,
 ) -> ChatResult | StreamingResponse | JSONResponse:
     """Execute or resume a run and optionally stream events. / 执行或恢复运行，可选流式返回事件。
 
@@ -2634,6 +2702,8 @@ async def run_chat(
             待附加的附件 ID；恢复时为 None。
         model_selection: Model id, effort and context window; None when resuming. /
             模型 ID、思考强度与上下文窗口；恢复时为 None。
+        expected_checkpoint_id: Optional latest-checkpoint concurrency guard, not a replay ID.
+            / 最新检查点的可选并发校验值，不用于历史回放。
 
     Returns:
         ChatResult, a StreamingResponse, or a 202 JSONResponse awaiting approval. /
@@ -2674,10 +2744,16 @@ async def run_chat(
         config = build_graph_config(
             {"user_id": LOCAL_USER, "thread_id": thread_id}, request.app.state.agent_settings
         )
-        snapshot = await runner.graph.aget_state(config)
-        selection = (
-            model_selection if message is not None else snapshot.values.get("model_selection")
-        )
+        snapshot, saved = await checkpoint_state(runner.graph, config)
+        if (
+            expected_checkpoint_id is not None
+            and (snapshot.config or {}).get("configurable", {}).get("checkpoint_id")
+            != expected_checkpoint_id
+        ):
+            raise problem(
+                409, "CHECKPOINT_STALE", "The saved run changed. Refresh before resuming."
+            )
+        selection = model_selection if message is not None else saved.get("model_selection")
         await require_workspace(request, workspace_id or "personal")
         record = await store(request).get_workspace(LOCAL_USER, workspace_id or "personal")
         try:
@@ -2704,26 +2780,7 @@ async def run_chat(
             raise problem(409, "REVIEW_REQUIRED", "An explicit review decision is required.")
         # A new message starts a run; a decision resumes one. / 新消息启动运行，审批决定恢复运行。
         pending = bool(snapshot.next)
-        history = None
-        if pending and message is not None and review is None:
-            # A failed model call can leave a pending checkpoint with no review. Recover by
-            # rebuilding a fresh run from archived turns instead of blocking the session.
-            # 模型失败可能留下无审批的挂起检查点；用归档轮次重建新运行，避免会话卡死。
-            checkpointer = getattr(runner.graph, "checkpointer", None)
-            if checkpointer is not None and hasattr(checkpointer, "adelete_thread"):
-                rows = await store(request).list_turns(
-                    user_id=LOCAL_USER, thread_id=thread_id, limit=20, newest_first=True
-                )
-                history = []
-                for _, turn in reversed(rows):
-                    if turn.user_input:
-                        history.append(HumanMessage(content=turn.user_input))
-                    if turn.response:
-                        history.append(AIMessage(content=turn.response))
-                await checkpointer.adelete_thread(config["configurable"]["thread_id"])
-                snapshot = await runner.graph.aget_state(config)
-                pending = False
-        if pending != (message is None):
+        if pending != (message is None) and not (message is None and saved.get("response")):
             if pending:
                 raise problem(409, "RUN_PENDING", "Resume or clear the previous run first.")
             raise problem(409, "NO_PENDING_RUN", "This session has no unfinished run.")
@@ -2744,7 +2801,6 @@ async def run_chat(
                     decision=decision,
                     attachment_ids=attachment_ids,
                     references=references,
-                    history=history,
                     model_selection=model_selection,
                     stream_mode=(
                         ["values", "updates", "messages", "custom"] if stream else ["values"]
@@ -2934,20 +2990,29 @@ async def chat(request: Request, body: ChatInput) -> ChatResult | StreamingRespo
 
 
 @router.post("/threads/{thread_id}/resume", response_model=ChatResult, responses=CHAT_RESPONSES)
-async def resume(request: Request, thread_id: Identifier, stream: bool = False):
+async def resume(
+    request: Request,
+    thread_id: Identifier,
+    stream: bool = False,
+    checkpoint_id: Identifier | None = None,
+):
     """Resume the pending run of a session. / 恢复会话中待处理的运行。
 
     Args:
         request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
         thread_id: Target session identifier. / 目标会话标识。
         stream: Whether to return a streaming response. / 是否返回流式响应。
+        checkpoint_id: Optional expected latest checkpoint; rejects stale callers.
+            / 可选的最新检查点预期值，用于拒绝过期恢复。
 
     Returns:
         ChatResult, a StreamingResponse, or a 202 JSONResponse awaiting approval. /
             ChatResult、流式响应，或等待审批的 202 JSON 响应。
     """
 
-    return await run_chat(request, thread_id, None, None, stream)
+    return await run_chat(
+        request, thread_id, None, None, stream, expected_checkpoint_id=checkpoint_id
+    )
 
 
 @router.get("/threads/{thread_id}/approval", response_model=ToolReview | None)
@@ -3064,9 +3129,11 @@ def create_app(
         )
         providers = ProviderStore(checkpoint.sqlite_path.with_name("providers.json"))
         if tool_factory is None and work_tools is None and model_provider is None:
+
             def factory(settings):
                 search = DeepSeekSearch(providers.search_key) if providers.search_key() else None
                 return create_builtin_tools(settings, search=search)
+
         # Model to (item, connection); rebuilt on reload. / 模型到（条目、连接），重载时重建。
         catalog = {}
         async with (
@@ -3344,10 +3411,12 @@ def create_app(
                     mode=mode,
                     require_tool_review=True,
                     decision_settings=resolved_decision_settings(),
-                    system_prompt=assemble_sections([
-                        PromptSection("persona", 100, BASE_SYSTEM_PROMPT),
-                        PromptSection("tools", 200, registry.instructions(mode)),
-                    ]),
+                    system_prompt=assemble_sections(
+                        [
+                            PromptSection("persona", 100, BASE_SYSTEM_PROMPT),
+                            PromptSection("tools", 200, registry.instructions(mode)),
+                        ]
+                    ),
                 )
                 return AgentRunner(graph, agent_settings, conversation_writer=conversations)
 

@@ -290,8 +290,8 @@ async def test_resume_requires_pending_run_and_duplicate_completed_id_is_rejecte
             await runner.ainvoke(user_id="u", thread_id="t")
         await runner.ainvoke(user_id="u", thread_id="t", message="question", run_id="run-1")
         await runner.ainvoke(user_id="u", thread_id="t", message="next question", run_id="run-2")
-        with pytest.raises(ValueError, match="No unfinished run"):
-            await runner.ainvoke(user_id="u", thread_id="t")
+        completed = await runner.ainvoke(user_id="u", thread_id="t")
+        assert completed["run_id"] == "run-2" and completed["response"] == "done"
         with pytest.raises(ValueError, match="already completed"):
             await runner.ainvoke(user_id="u", thread_id="t", message="question", run_id=" run-1 ")
         snapshot = await graph.aget_state(

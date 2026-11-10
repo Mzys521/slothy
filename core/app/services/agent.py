@@ -5,7 +5,6 @@ from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 from anyio import CancelScope
-from langchain_core.messages import BaseMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
 
@@ -17,6 +16,7 @@ from app.agent.reasoning import reasoning_text
 from app.concurrency import SessionLocks
 from app.config import AgentSettings
 from app.conversations import ConversationTurn, ConversationWriter
+from app.services.recovery import checkpoint_state
 
 
 class AgentRunner:
@@ -55,7 +55,7 @@ class AgentRunner:
         self.conversation_writer = conversation_writer
         self._locks = SessionLocks()
 
-    async def _archive_completed(self, snapshot: StateSnapshot) -> None:
+    async def archive_completed(self, snapshot: StateSnapshot) -> None:
         """Archive a completed turn from saved state. / 归档已完成的轮次。
 
         Args:
@@ -138,7 +138,6 @@ class AgentRunner:
         approval_policy: ApprovalPolicy | None = None,
         attachment_ids: list[str] | None = None,
         references: list[dict] | None = None,
-        history: list[BaseMessage] | None = None,
         model_selection: dict | None = None,
         decision: tuple[str, bool] | None = None,
         stream_mode: Literal["values", "updates", "messages", "custom"]
@@ -173,15 +172,12 @@ class AgentRunner:
         key = config["configurable"]["thread_id"]
         lock = self._locks.for_session(key)
         async with lock:
-            snapshot = await self.graph.aget_state(config)
-            if snapshot.values and (
-                snapshot.values.get("user_id") != user_id
-                or snapshot.values.get("thread_id") != thread_id
-            ):
+            snapshot, saved = await checkpoint_state(self.graph, config)
+            if saved and (saved.get("user_id") != user_id or saved.get("thread_id") != thread_id):
                 raise ValueError("Checkpoint identity does not match this request")
             # 中文：先补写上一轮，避免快照完成后因退出或写入失败留下归档缺口。
             # English: Repair a missing archive entry before a newer run advances the checkpoint.
-            await self._archive_completed(snapshot)
+            await self.archive_completed(snapshot)
             if message is None:
                 if (
                     run_id is not None
@@ -195,9 +191,9 @@ class AgentRunner:
                     raise ValueError(
                         "Resume preserves saved inputs; do not supply request overrides"
                     )
-                if not snapshot.values or not snapshot.next:
+                if not saved or (not snapshot.next and not saved.get("response")):
                     raise ValueError("No unfinished run exists for this user/thread")
-                config = build_graph_config(snapshot.values, self.settings)
+                config = build_graph_config(saved, self.settings)
                 review = pending_review(snapshot)
                 if review is None and decision is None and not snapshot.interrupts:
                     state = None
@@ -243,11 +239,6 @@ class AgentRunner:
                 )
                 state["approval_policy"] = approval_policy or "ask"
                 state["model_selection"] = model_selection or {}
-                if history:
-                    # Recovery after a failed checkpoint run: keep the archived conversation
-                    # context without reusing the failed graph state.
-                    # 失败运行恢复：用归档历史继续对话，不复用失败的图状态。
-                    state["messages"] = [*history, *state["messages"]]
                 config = build_graph_config(state, self.settings)
             # 中文：等当前步快照落盘后再前进，避免响应完成后快照仍留在异步写队列中。
             # English: Commit each step before advancing rather than leave writes queued at return.
@@ -274,4 +265,4 @@ class AgentRunner:
                 with CancelScope(shield=True):
                     await events.aclose()
             if self.conversation_writer is not None:
-                await self._archive_completed(await self.graph.aget_state(config))
+                await self.archive_completed(await self.graph.aget_state(config))

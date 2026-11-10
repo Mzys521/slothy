@@ -279,12 +279,12 @@ class ToolRegistry:
             mode: Chat or work mode request. / 请求的 chat 或 work 模式。
 
         Returns:
-            Mapping from read, write, execute and network to tool names. /
-            只读、写入、执行与网络到工具名称的映射。
+            Mapping from read, write, delete, execute and network to tool names. /
+            只读、写入、删除、执行与网络到工具名称的映射。
         """
         return {
             risk: [item.name for item in self.descriptors(mode) if item.risk == risk]
-            for risk in ("read", "write", "execute", "network")
+            for risk in ("read", "write", "delete", "execute", "network")
         }
 
     def deprecated_names(self) -> list[str]:

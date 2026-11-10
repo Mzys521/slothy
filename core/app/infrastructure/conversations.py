@@ -1149,7 +1149,7 @@ class SQLiteConversationStore:
                  SELECT coalesce(sum(byte_size), 0) FROM conversation_files
                  WHERE user_id=? AND thread_id=?
                ) + ? <= ?""",
-            (file_id, user, thread, filename, size, content, user, thread, size, 24 * 1024 * 1024),
+            (file_id, user, thread, filename, size, content, user, thread, size, 128 * 1024 * 1024),
         ) as cursor:
             return cursor.rowcount == 1
 
@@ -1185,6 +1185,81 @@ class SQLiteConversationStore:
             (user, thread, identity),
         ) as cursor:
             return await cursor.fetchone() is not None
+
+    async def read_attachment_page(
+        self, user: str, thread: str, file_id: str, offset: int, limit: int
+    ) -> dict:
+        """Read one bounded page of extracted attachment text from SQLite.
+
+        / 从 SQLite 分页读取附件文本，避免把大文件整段加载到内存。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread owning the file. / 文件所属线程。
+            file_id: Attachment id. / 附件 ID。
+            offset: Zero-based character offset. / 从零开始的字符偏移。
+            limit: Maximum characters to return. / 本页最大字符数。
+
+        Returns:
+            Filename, page text, total character count and next offset.
+            / 文件名、本页文本、总字符数与下一页偏移。
+        """
+        async with self._connection.execute(
+            """SELECT filename, length(content), substr(content, ?, ?)
+               FROM conversation_files WHERE user_id=? AND thread_id=? AND id=?""",
+            (offset + 1, limit, user, thread, file_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise LookupError("Attachment is unavailable in this conversation.")
+        filename, total, text = row
+        end = offset + len(text)
+        return {
+            "filename": filename,
+            "text": text,
+            "total_chars": total,
+            "next_offset": end if end < total else None,
+        }
+
+    async def read_attachment_previews(
+        self, user: str, thread: str, ids: list[str], limit: int
+    ) -> list[dict]:
+        """Read bounded attachment previews without loading complete large files.
+
+        / 读取有界附件预览，不加载完整大文件。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread owning the files. / 文件所属线程。
+            ids: Requested attachment ids in order. / 请求的附件 ID。
+            limit: Maximum preview characters per file. / 每个文件的最大预览字符数。
+
+        Returns:
+            Attachment record mappings with content and total_chars.
+            / 含预览文本与总字符数的附件映射。
+        """
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        async with self._connection.execute(
+            f"""SELECT id, filename, byte_size, length(content), substr(content, 1, ?)
+                FROM conversation_files
+                WHERE user_id=? AND thread_id=? AND id IN ({placeholders})""",
+            (limit, user, thread, *ids),
+        ) as cursor:
+            records = {
+                row[0]: {
+                    "id": row[0],
+                    "filename": row[1],
+                    "byte_size": row[2],
+                    "total_chars": row[3],
+                    "content": row[4],
+                }
+                async for row in cursor
+            }
+        if len(records) != len(ids):
+            raise LookupError("One or more files are unavailable in this conversation.")
+        return [records[file_id] for file_id in ids]
 
     async def read_attachments(self, user: str, thread: str, ids: list[str]) -> list[dict]:
         """Read attachment text by id for one thread.

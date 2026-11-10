@@ -173,6 +173,7 @@ def review_call(registry: ToolRegistry, call: dict) -> dict:
         hint = {
             "read": "Read-only or pure computation.",
             "write": "Writes files in the workspace.",
+            "delete": "HIGH RISK: permanently deletes content and cannot be undone.",
             "execute": "Executes code with local process policy checks.",
             "network": "Contacts an external service.",
         }[risk]
@@ -190,10 +191,15 @@ def review_call(registry: ToolRegistry, call: dict) -> dict:
             hint += f" UTF-8 bytes: {len(arguments['content'].encode())}."
         if arguments.get("overwrite"):
             hint += " Existing content may be replaced."
+        if descriptor.irreversible_for(arguments) and "HIGH RISK" not in hint:
+            hint += (
+                " HIGH RISK: this action is irreversible; previous content may not be recoverable."
+            )
     return {
         "name": call["name"],
         "arguments": arguments,
         "risk": str(descriptor.risk_for(arguments)) if descriptor else "execute",
+        "irreversible": descriptor.irreversible_for(arguments) if descriptor else False,
         "review_hint": hint,
     }
 

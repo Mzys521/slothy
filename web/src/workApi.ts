@@ -99,7 +99,7 @@ export interface ToolReview {
   approval_id: string
   thread_id: string
   run_id: string
-  calls: { name: string; arguments: Record<string, unknown>; risk?: string | null; review_hint?: string | null }[]
+  calls: { name: string; arguments: Record<string, unknown>; risk?: string | null; irreversible?: boolean; review_hint?: string | null }[]
   used_memory_ids?: string[]
   message?: string
   activity?: RunActivity[]
@@ -108,6 +108,20 @@ export interface ToolReview {
   used_reference_ids?: string[]
   memory_trace?: MemoryTrace
   response_source?: string
+}
+
+/** Saved unfinished request, projected from the server's native checkpoint. / 服务端原生检查点投影的未完成请求。 */
+export interface PendingRun {
+  run_id: string
+  checkpoint_id: string
+  message: string
+  status: 'interrupted' | 'failed' | 'awaiting_approval'
+  attachments: { id: string; filename: string; byte_size: number }[]
+  references: ReferenceItem[]
+  model_selection: { id?: string; effort?: string }
+  personalization_enabled: boolean
+  activity: RunActivity[]
+  metrics?: RunMetrics | null
 }
 
 /** Final assistant reply of a run. / 单次运行的最终助手回复。 */

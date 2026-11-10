@@ -176,6 +176,27 @@ its old conversation cache on epoch change; it never imports it into the new sto
 - If a thread has an unfinished run, new messages are rejected with
   `409 RUN_PENDING`; resume or clear it first.
 
+### Checkpoint recovery
+
+`GET /threads/{id}/messages` includes `pending_run` (or `null`), projected from the
+native checkpoint: original message/run ID, checkpoint ID, saved model selection,
+attachment metadata, references and activity. It restores unfinished turns after a
+restart without relying on browser caches. Completed checkpoint replies repair a
+missing archive entry idempotently.
+
+Use `POST /threads/{id}/resume?stream=true&checkpoint_id=<expected-id>` with an empty
+body to continue. The optional checkpoint ID is a concurrency check; a changed
+checkpoint returns `409 CHECKPOINT_STALE`. It does not select a historical replay.
+Recovery uses LangGraph's latest checkpoint and keeps the original inputs;
+approval interrupts still require the existing explicit approval endpoint.
+A completed latest checkpoint returns its saved result without a new model call.
+No saved run returns `409 NO_PENDING_RUN`.
+
+Completed tool calls inside a batch are native LangGraph tasks and are restored
+without execution on resume. An interrupted model node generates again from its
+node boundary; this is not token-level continuation. `/retry` and the **Continue
+from checkpoint** control use this path and never silently resend interrupted input.
+
 ### Response — `ChatResult`
 
 ```json
@@ -244,7 +265,9 @@ process.
   future milestone, and `user_id` is never accepted from clients as authorization.
 - SSE has no heartbeat or retry protocol; a dropped connection ends the stream,
   and the run remains resumable from its checkpoint.
-- Attachment upload limit: 2 MiB per file, 24 MiB per thread.
+- Attachment upload limit: 32 MiB per file, 128 MiB per thread. Uploads are received
+  first; prompt context uses a bounded preview and `read_uploaded_file` pages text from
+  SQLite in 8,000-character chunks.
 
 ## 9. Connectors
 
@@ -265,7 +288,10 @@ Errors retain `{code,message,request_id}`: 404 `CONNECTOR_NOT_FOUND`, 409 `CONNE
 
 ## Unified tool contract
 
-`GET /runtime` adds `tool_groups` (read/write/execute/network) and `deprecated_tools`.
+`GET /runtime` adds `tool_groups` (read/write/delete/execute/network) and `deprecated_tools`.
+Review calls include an `irreversible` flag: deletion, overwrite writes and explicitly
+declared irreversible tools receive high-risk styling. Deletion uses `risk: "delete"`;
+ordinary writes continue to use `risk: "write"`. Approval requirements remain unchanged.
 Default desktop tools: 10 in Work, 8 in Chat; `read_skill_file` is conditional,
 `deepseek_search` appears only after a Search key resolves, and `web_fetch` is optional.
 Hidden aliases never appear in the visible tool lists.

@@ -19,6 +19,7 @@ class Risk(StrEnum):
 
     READ = "read"
     WRITE = "write"
+    DELETE = "delete"
     EXECUTE = "execute"
     NETWORK = "network"
 
@@ -41,6 +42,7 @@ class ToolDescriptor(BaseModel):
     args_schema: type[BaseModel] | dict[str, Any] | None = None
     risk: Risk
     requires_approval: bool
+    irreversible: bool = False
     platforms: frozenset[Platform] = Field(default=frozenset({Platform.DESKTOP}), min_length=1)
     mode: frozenset[ToolMode] = Field(default=frozenset({"work"}), min_length=1)
     instruction: str = ""
@@ -104,6 +106,16 @@ class ToolDescriptor(BaseModel):
         if isinstance(value, str) and value in self.argument_risks:
             return self.risk_for(arguments) != Risk.READ
         return self.requires_approval
+
+    def irreversible_for(self, arguments: dict) -> bool:
+        """Identify destructive review warnings without changing execution policy.
+        / 标记删除、覆盖及显式声明的不可逆操作，不改变执行审批策略。"""
+        risk = self.risk_for(arguments)
+        return (
+            self.irreversible
+            or risk == Risk.DELETE
+            or (risk == Risk.WRITE and arguments.get("overwrite") is True)
+        )
 
     @model_validator(mode="before")
     @classmethod

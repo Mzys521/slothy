@@ -6,7 +6,7 @@
 
 import { computed, ref, watch } from 'vue'
 import { readLocal, t, writeLocal } from './preferences'
-import { ApiError, threadPath, workRequest, type MemoryTrace, type MemoryReceipt, type RunActivity, type RunMetrics, type ToolReview } from './workApi'
+import { ApiError, threadPath, workRequest, type MemoryTrace, type MemoryReceipt, type PendingRun, type RunActivity, type RunMetrics, type ToolReview } from './workApi'
 import type { ReferenceItem } from './references/types'
 import { pendingSessionActions, pendingSessionCommands, runningRequests, runningSessions, runningTurnIds, liveReplies, liveReasoning } from './sessionRuns'
 export { runningRequests, runningSessions, runningTurnIds } from './sessionRuns'
@@ -33,6 +33,7 @@ export interface Turn {
   serverReply?: string
   reasoning?: string
   serverRunId?: string
+  checkpointId?: string
   usedMemoryIds?: string[]
   memoryTrace?: MemoryTrace
   responseSource?: string
@@ -62,6 +63,7 @@ export interface Session {
   archived?: boolean
   apiThreadId?: string
   pendingReview?: ToolReview | null
+  pendingRun?: PendingRun | null
 }
 
 export const personalWorkspaceId = 'personal'
@@ -430,17 +432,20 @@ export type ServerMessage = {
 export async function syncThreadMessages(session: Session) {
   if (!session.apiThreadId || runningSessions.has(session.id)) return
   const messages: ServerMessage[] = []
+  let pending: PendingRun | null | undefined
   let cursor: number | null = 0
   while (cursor !== null) {
-    const page: { items: ServerMessage[]; next_cursor: number | null } = await workRequest(
+    const page: { items: ServerMessage[]; next_cursor: number | null; pending_run?: PendingRun | null } = await workRequest(
       threadPath(session.apiThreadId) + '/messages?after_id=' + cursor,
     )
     messages.push(...page.items)
+    if (page.pending_run !== undefined) pending = page.pending_run
     cursor = page.next_cursor
   }
   // The session may have started running while pages were loading.
   // 分页加载期间该会话可能已经进入运行状态。
   if (runningSessions.has(session.id)) return
+  if (pending !== undefined) session.pendingRun = pending
   const known = new Map(session.turns.map(turn => [turn.serverRunId, turn]))
   const runIds = new Set(messages.map(message => message.run_id))
   session.turns = [
@@ -450,7 +455,8 @@ export async function syncThreadMessages(session: Session) {
         // Server memory metadata restores the memory flag after a reload.
         // 服务端记忆元数据用于在重载后恢复「使用记忆」标记。
         memory: turn?.memory ?? (message.profile_version != null || message.used_memory_ids?.length ? true : undefined),
-        serverRunId: message.run_id, serverReply: message.response, reasoning: message.reasoning ?? turn?.reasoning, activity: message.activity, metrics: message.metrics,
+        serverRunId: message.run_id, serverReply: message.response, serverError: undefined, checkpointId: undefined,
+        reasoning: message.reasoning ?? turn?.reasoning, activity: message.activity, metrics: message.metrics,
         usedMemoryIds: message.used_memory_ids ?? turn?.usedMemoryIds,
         memoryTrace: message.memory_trace, responseSource: message.response_source,
         references: message.references ?? turn?.references,
@@ -460,9 +466,23 @@ export async function syncThreadMessages(session: Session) {
         files: message.attachments.map(file => file.filename) }
     }),
     ...session.turns.filter(turn => !runIds.has(turn.serverRunId ?? '') && (
-      turn.serverError || turn.serverRunId && turn.serverRunId === session.pendingReview?.run_id
+      turn.serverError || turn.serverRunId && (turn.serverRunId === session.pendingReview?.run_id || turn.serverRunId === pending?.run_id)
     )),
   ]
+  if (pending) {
+    let turn = session.turns.find(turn => turn.serverRunId === pending.run_id)
+      ?? session.turns.find(turn => !turn.serverRunId && !turn.serverReply && turn.prompt === pending.message)
+    if (!turn) { turn = { id: pending.run_id, prompt: pending.message, time: '', files: [] }; session.turns.push(turn) }
+    Object.assign(turn, { prompt: pending.message, serverRunId: pending.run_id, checkpointId: pending.checkpoint_id,
+      serverReply: undefined, model: pending.model_selection.id, reasoningEffort: pending.model_selection.effort,
+      memory: pending.personalization_enabled, files: pending.attachments.map(file => file.filename),
+      attachmentIds: pending.attachments.map(file => file.id), references: pending.references.map(item => ({ ...item, label: item.label ?? item.path ?? item.id })),
+      activity: pending.activity, metrics: pending.metrics,
+      serverError: pending.status === 'awaiting_approval' ? undefined : turn.serverError
+        || t('This run is unfinished. Continue from the saved checkpoint.', '该任务尚未完成，可从已保存的检查点继续。') })
+  } else if (pending === null) {
+    for (const turn of session.turns) turn.checkpointId = undefined
+  }
 }
 
 /**
@@ -500,6 +520,7 @@ export async function clearSession(id: string) {
   if (!session) return
   if (session.apiThreadId) await workRequest(threadPath(session.apiThreadId) + '/messages', 'DELETE')
   session.pendingReview = null
+  session.pendingRun = null
   session.draft = false
   session.turns = []
   session.title = ''

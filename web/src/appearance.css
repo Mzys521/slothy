@@ -66,6 +66,13 @@ select, .workspace-form input, .account-edit-dialog input { min-height: 42px; bo
 .model-popup, .history-popover, .work-popover, .sidebar-action-menu, .account-menu, .modal { border: 0; border-radius: var(--radius-surface); box-shadow: none; }
 .sidebar-action-menu, .account-menu, .history-popover { padding: 8px; }
 .tool-review { background: var(--neutral); padding: 18px; }
+.tool-review.tool-review-danger { border: 1px solid var(--danger); background: color-mix(in srgb, var(--danger) 16%, var(--surface)); }
+.tool-review-danger h2, .tool-review-danger h2 svg, .tool-review-danger .tool-review-warning, .tool-risk-danger { color: var(--danger); }
+.tool-review-warning, .tool-review-risk strong { font-weight: 600; }
+.tool-review-danger .tool-review-approve { background: var(--danger); color: light-dark(#fff, #291417); }
+.tool-review-danger .tool-review-approve:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 88%, var(--ink)); }
+.tool-review-danger :is(button, summary):focus-visible { outline-color: var(--danger); }
+.tool-review-danger pre { background: color-mix(in srgb, var(--danger) 7%, var(--surface)); }
 .simple-row { padding: 11px 12px; border-radius: var(--radius); }
 .memory-review-item textarea { min-height: 76px; padding: 12px; border-radius: var(--radius); background: var(--neutral); }
 .directory-picker, .memory-page-actions, .memory-section-heading { display: flex; align-items: center; gap: 10px; }

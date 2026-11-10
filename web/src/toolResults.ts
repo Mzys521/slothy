@@ -43,8 +43,33 @@ export async function downloadArtifact(artifact: ToolArtifact) {
 
 export function riskLabel(risk: string | null | undefined, translate: (en: string, zh: string) => string) {
   return ({ read: translate('Read', '只读'), write: translate('Write', '写入'),
+    delete: translate('Delete', '删除'),
     execute: translate('Execute', '代码执行'), network: translate('Network', '网络') })[risk ?? '']
     ?? translate('Unclassified', '未分类')
+}
+
+interface ReviewableCall {
+  name?: string | null
+  risk?: string | null
+  arguments?: Record<string, unknown> | string | null
+  irreversible?: boolean
+}
+
+/** Keep deletion distinct even in checkpoints/history created before the delete risk existed.
+ * / 兼容旧检查点与历史记录，让删除始终显示独立标签。 */
+export function callRisk(call: ReviewableCall) {
+  return call.name === 'workspace_delete' ? 'delete' : call.risk
+}
+
+/** Prefer explicit metadata; retain warnings for legacy deletion and overwrite reviews.
+ * / 优先使用明确元数据，同时兼容旧版删除与覆盖审批。 */
+export function irreversibleCall(call: ReviewableCall): boolean {
+  if (call.irreversible === true || callRisk(call) === 'delete') return true
+  let args = call.arguments
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args) } catch { return false }
+  }
+  return callRisk(call) === 'write' && args != null && typeof args === 'object' && args.overwrite === true
 }
 
 export function metricSummary(metric: ToolMetric, translate: (en: string, zh: string) => string) {

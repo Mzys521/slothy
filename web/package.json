@@ -1,8 +1,8 @@
 {
   "name": "slothy",
   "private": true,
-  "version": "0.1.4-exp.2",
-  "displayVersion": "0.1.4.1-exp.2",
+  "version": "0.1.4-beta.2",
+  "displayVersion": "0.1.4.2-beta",
   "description": "slothy — your personal adaptive agent",
   "author": "slothy",
   "type": "module",

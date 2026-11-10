@@ -12,6 +12,7 @@ Slothy documentation is bilingual: every public guide exists in English and
 | API reference | [api.md](api.md) | [api.zh-CN.md](api.zh-CN.md) | all `/api/v1` routes, SSE events, approval flow, examples |
 | Brand guidelines | [brand.md](brand.md) | [brand.md#中文](brand.md#中文) | name, slogan, colors, logo usage, voice, UI principles |
 | Changelog | [CHANGELOG.md](../CHANGELOG.md) | — | release history |
+| Release notes | [0.1.4.2-beta](releases/0.1.4.2-beta.md) | same file, 中文 after English | bilingual release details |
 
 ## Diagrams
 

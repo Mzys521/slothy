@@ -69,6 +69,13 @@ def create_attachment_tools(store: SQLiteConversationStore) -> list[BaseTool]:
             文件在当前会话不可用时抛出。
         """
         try:
+            if hasattr(store, "read_attachment_page"):
+                page = await store.read_attachment_page(user, thread, file_id, offset, 8_000)
+                return {
+                    "filename": page["filename"],
+                    "text": page["text"],
+                    "next_offset": page["next_offset"],
+                }
             item = (await store.read_attachments(user, thread, [file_id]))[0]
         except LookupError as error:
             raise ToolOperationError(

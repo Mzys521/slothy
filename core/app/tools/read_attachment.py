@@ -8,8 +8,10 @@ from pathlib import PurePath
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+MAX_THREAD_UPLOAD_BYTES = 128 * 1024 * 1024
 MAX_CONTEXT_CHARS = 60_000
+MAX_PREVIEW_CHARS = 60_000
 MAX_ATTACHMENTS = 8
 TEXT_EXTENSIONS = {
     ".txt",
@@ -130,7 +132,7 @@ def attachment_references(documents: list[dict]) -> list[dict]:
     remaining = MAX_CONTEXT_CHARS
     references = {}
     for index, item in enumerate(sorted(documents, key=lambda doc: len(doc["content"]))):
-        total = len(item["content"])
+        total = item.get("total_chars", len(item["content"]))
         end = min(total, remaining // (len(documents) - index))
         remaining -= end
         references[item["id"]] = {

@@ -157,6 +157,22 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 - 存在待审批时，非流式请求返回 **202** 与 `ToolReview`，而不是 `ChatResult`。
 - 线程存在未完成运行时，新消息返回 `409 RUN_PENDING`；需先恢复或清理。
 
+### 检查点恢复
+
+`GET /threads/{id}/messages` 增加 `pending_run`（或 `null`），从原生 checkpoint 投影原请求、
+run ID、checkpoint ID、保存的模型选择、附件元数据、引用和活动。应用重启且无浏览器缓存时
+也能找回未完成轮次；已完成检查点缺失的归档会幂等补写。
+
+使用 `POST /threads/{id}/resume?stream=true&checkpoint_id=<预期ID>`，请求体为空对象。
+checkpoint ID 可省略，仅用于并发校验；状态变化返回 `409 CHECKPOINT_STALE`，不会按旧 ID
+回放历史。恢复始终读取最新检查点并保留原始输入，人工审批仍需走已有的显式审批接口。
+最新检查点已经完成时直接返回保存的结果，不重新调用模型；没有保存的运行时返回
+`409 NO_PENDING_RUN`。
+
+工具批次内已完成调用由 LangGraph task 保存，恢复时不重复执行。被中断的模型节点从节点
+边界重新生成，不支持 token 级接续。`/retry` 和“从检查点继续”使用此路径，不会静默重发
+中断请求。
+
 ### `ChatResult`
 
 ```json
@@ -221,7 +237,7 @@ curl "http://127.0.0.1:8000/api/v1/profile/versions?limit=20"
 - API 为单用户设计（`local-user`）；多用户隔离是后续里程碑，客户端传入的 `user_id`
   永远不会被当作授权凭据。
 - SSE 没有心跳与重连协议；连接断开即结束流，运行仍可从检查点恢复。
-- 附件限制：单文件 2 MiB，单会话 24 MiB。
+- 附件限制：单文件 32 MiB，单会话 128 MiB。文件先完整接收；提示词使用有界预览，`read_uploaded_file` 从 SQLite 按 8,000 字符分页读取。
 
 ## 9. 连接器
 
@@ -242,7 +258,10 @@ Connector 字段为 `id, kind, name, description, enabled, builtin, tools, trans
 
 ## 统一工具契约
 
-`GET /runtime` 增加按 read/write/execute/network 分组的 `tool_groups` 和
+审批调用增加 `irreversible` 标记：删除、覆盖写入及明确声明不可逆的工具使用高危样式。
+删除使用 `risk: "delete"`，普通写入仍为 `risk: "write"`。原有审批要求保持不变。
+
+`GET /runtime` 增加按 read/write/delete/execute/network 分组的 `tool_groups` 和
 `deprecated_tools`。默认桌面端 Work 10 个、Chat 8 个内置工具；Skill 引用读取按启用状态提供，
 `deepseek_search` 仅在解析到搜索密钥后出现，`web_fetch` 为可选项，隐藏旧名不进入可见清单。
 `workspace_delete` 在 Chat/Work 均需审批：路径限制在工作区，拒绝链接与根目录，执行时复验

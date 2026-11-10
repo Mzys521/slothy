@@ -341,7 +341,10 @@ def test_every_policy_also_pauses_read_only_calls(tmp_path):
         )
         assert response.status_code == 202, response.text
         assert response.json()["calls"][0]["name"] == "calculate"
-def test_denied_delete_is_not_executed_and_run_continues(tmp_path):
+
+
+@pytest.mark.parametrize("mode", ["chat", "work"])
+def test_denied_delete_is_not_executed_and_run_continues(tmp_path, mode):
     """A denied high-risk call never executes and the same run resumes.
     / 拒绝后工具不执行并继续运行。"""
     workspace = tmp_path / "artifacts"
@@ -373,12 +376,16 @@ def test_denied_delete_is_not_executed_and_run_continues(tmp_path):
             "/api/v1/chat",
             json={
                 "message": "delete keep.txt",
-                "approval_policy": "every",
-                "mode": "work",
+                "approval_policy": "ask",
+                "mode": mode,
             },
         )
         assert review.status_code == 202, review.text
+        assert review.json()["calls"][0]["risk"] == "delete"
+        assert review.json()["calls"][0]["irreversible"] is True
         thread = f"/api/v1/threads/{review.json()['thread_id']}"
+        restored = client.get(thread + "/approval").json()
+        assert restored["calls"][0]["irreversible"] is True
         result = client.post(
             thread + "/approval/" + review.json()["approval_id"],
             json={"approved": False},
@@ -388,8 +395,46 @@ def test_denied_delete_is_not_executed_and_run_continues(tmp_path):
         assert target.exists(), "denied delete must not touch the filesystem"
         assert "denied" in payload["response"].lower()
         rejected = [
-            entry
-            for entry in payload["activity"]
-            if entry.get("name") == "workspace_delete"
+            entry for entry in payload["activity"] if entry.get("name") == "workspace_delete"
         ]
         assert rejected and rejected[0]["status"] == "rejected"
+        assert rejected[0]["risk"] == "delete"
+
+
+@pytest.mark.parametrize("mode", ["chat", "work"])
+def test_delete_requires_review_then_approved_result_keeps_delete_label(tmp_path, mode):
+    workspace = tmp_path / "files"
+    workspace.mkdir()
+    target = workspace / "remove.txt"
+    target.write_text("temporary test content", encoding="utf-8")
+    model = ToolModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "workspace_delete", "args": {"path": "remove.txt"}, "id": "delete"}
+                ],
+            ),
+            AIMessage(content="Deleted."),
+        ]
+    )
+    app = create_app(
+        checkpoint_settings=CheckpointSettings(sqlite_path=tmp_path / "approval.sqlite"),
+        model_provider=SimpleNamespace(get_chat_model=lambda: model),
+        work_tools=create_builtin_tools(ToolSettings(_env_file=None, workspace_path=workspace)),
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/v1/chat", json={"message": "Delete remove.txt", "mode": mode})
+        assert response.status_code == 202 and target.exists()
+        review = response.json()
+        assert review["calls"][0]["risk"] == "delete"
+        assert review["calls"][0]["irreversible"] is True
+        thread = f"/api/v1/threads/{review['thread_id']}"
+        completed = client.post(
+            thread + "/approval/" + review["approval_id"], json={"approved": True}
+        )
+        assert completed.status_code == 200 and not target.exists(), completed.text
+        entry = next(item for item in completed.json()["activity"] if item["kind"] == "tool")
+        assert entry["risk"] == "delete" and entry["status"] == "done"
+        archived = client.get(thread + "/messages").json()["items"][0]
+        assert archived["activity"] == completed.json()["activity"]

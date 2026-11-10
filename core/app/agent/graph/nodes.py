@@ -607,9 +607,15 @@ class AgentNodes:
         if state.get("attachment_ids"):
             if self.services.attachment_reader is None:
                 raise ValueError("Attachment reader is unavailable")
-            attachments = await self.services.attachment_reader.read_attachments(
-                state["user_id"], state["thread_id"], state["attachment_ids"]
-            )
+            reader = self.services.attachment_reader
+            if hasattr(reader, "read_attachment_previews"):
+                attachments = await reader.read_attachment_previews(
+                    state["user_id"], state["thread_id"], state["attachment_ids"], 60_000
+                )
+            else:
+                attachments = await reader.read_attachments(
+                    state["user_id"], state["thread_id"], state["attachment_ids"]
+                )
             messages.append(reference("attachment_reference", attachment_references(attachments)))
             context_sources["attachment_reference"] = [str(item["id"]) for item in attachments]
         context_by_anchor = None

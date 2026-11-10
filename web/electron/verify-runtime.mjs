@@ -17,6 +17,7 @@ const web = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
 const profile = await mkdtemp(path.join(web, 'build/runtime-acceptance-'))
 const resources = path.resolve(process.argv[2] || path.join(web, 'release/slothy/win-unpacked/resources'))
 let calls = 0
+let recoverCheckpoint = false
 let fileRead = false
 const sdkRequests = []
 const memoryRequests = []
@@ -49,6 +50,10 @@ const upstream = createServer(async (request, response) => {
   if (isMemory) assert.ok(!body.tools?.length, 'memory learning must not receive executable tools')
   else assert.ok(body.tools.length)
   const prompt = body.messages.filter(message => message.role === 'user' && !message.name).at(-1)?.content || ''
+  if (prompt === 'NATIVE_CHECKPOINT_RECOVERY' && !recoverCheckpoint) {
+    response.writeHead(503, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: { message: 'Temporary checkpoint acceptance failure', type: 'server_error' } }))
+    return
+  }
   if (String(prompt).startsWith('RUNTIME_PARALLEL_')) {
     parallelStarted.add(prompt)
     await parallelGate
@@ -83,6 +88,8 @@ const upstream = createServer(async (request, response) => {
     content = JSON.stringify({ concepts, facts })
   } else if (String(prompt).startsWith('RUNTIME_PARALLEL_')) {
     content = prompt + '_OK'
+  } else if (prompt === 'NATIVE_CHECKPOINT_RECOVERY') {
+    content = 'CHECKPOINT_RECOVERED'
   } else if (String(prompt).includes('CALCULATE') && !toolResults.length) {
     toolCall = { id: 'call-calculator', type: 'function', function: { name: 'calculate', arguments: JSON.stringify({ operation: 'add', a: 2, b: 3 }) } }
   } else if (String(prompt).includes('DOCUMENT') && !toolResults.length) {
@@ -348,6 +355,13 @@ try {
   assert.ok(!deletedIdentity.response.includes('林舟'))
   assert.equal(sdkRequests.length, modelCount)
 
+  const checkpointThread = await request('/threads', 'POST', {})
+  const failedCheckpoint = await fetch(backend.origin + '/api/v1/chat', { method: 'POST', headers,
+    body: JSON.stringify({ thread_id: checkpointThread.thread_id, message: 'NATIVE_CHECKPOINT_RECOVERY', personalization_enabled: false }) })
+  assert.equal(failedCheckpoint.status, 502)
+  const savedCheckpoint = (await request('/threads/' + checkpointThread.thread_id + '/messages')).pending_run
+  assert.ok(savedCheckpoint.checkpoint_id && savedCheckpoint.run_id)
+
   await stopBackend(backend)
   backend = await startBackend({ resourcesPath: resources, userData: profile, development: false })
   const persisted = await fetch(backend.origin + '/api/v1/settings/providers', { headers: { 'X-Slothy-Token': backend.token } }).then(response => response.json())
@@ -358,6 +372,15 @@ try {
   assert.equal(memoryPersisted.revision, 1)
   assert.deepEqual(memoryPersisted.configuration, memoryConfig)
   headers['X-Slothy-Token'] = backend.token
+  recoverCheckpoint = true
+  const checkpointReply = await fetch(backend.origin + `/api/v1/threads/${checkpointThread.thread_id}/resume?stream=true&checkpoint_id=${savedCheckpoint.checkpoint_id}`, { method: 'POST', headers })
+  assert.ok(checkpointReply.headers.get('content-type').startsWith('text/event-stream'))
+  const checkpointEvents = await checkpointReply.text()
+  assert.ok(checkpointEvents.includes('event: done') && checkpointEvents.includes('CHECKPOINT_RECOVERED') && checkpointEvents.includes(savedCheckpoint.run_id))
+  const checkpointArchive = await request('/threads/' + checkpointThread.thread_id + '/messages')
+  assert.equal(checkpointArchive.pending_run, null)
+  assert.equal(checkpointArchive.items.length, 1)
+  assert.equal(checkpointArchive.items[0].run_id, savedCheckpoint.run_id)
   const continued = await request('/chat', 'POST', { thread_id: cacheThread.thread_id, message: 'CACHE_AFTER_RESTART' })
   assert.equal(sdkRequests.at(-1).messages.find(message => message.name === 'profile_snapshot')?.content, prunedPrefix)
   assert.equal(continued.metrics.l1_hash, secondCacheTurn.metrics.l1_hash)
@@ -366,7 +389,7 @@ try {
   assert.equal((await request('/runtime')).data_epoch, cacheRuntime.data_epoch)
   const afterRestartName = await request('/chat', 'POST', { message: '我叫什么名字？' })
   assert.ok(!afterRestartName.response.includes('林舟'))
-  console.log('Frozen runtime acceptance passed: concurrent Chat/Work with isolated archives, SDK/tools/SSE/review/documents, composer, cache revocation, semantic concepts and independent relationship reinforcement, deterministic identity, deletion, evidence, data epoch and restart persistence.')
+  console.log('Frozen runtime acceptance passed: native checkpoint recovery across process restart, concurrent Chat/Work with isolated archives, SDK/tools/SSE/review/documents, composer, cache revocation, semantic concepts and independent relationship reinforcement, deterministic identity, deletion, evidence, data epoch and restart persistence.')
 } finally {
   releaseParallel()
   await stopBackend(backend)

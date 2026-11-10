@@ -73,3 +73,33 @@ test('a history read that finishes after a new run starts cannot replace its liv
   assert.equal(target.turns[0], turn)
   runs.finishSessionRequest(target.id, controller)
 })
+
+test('a checkpoint restores an unfinished request with no local chat cache', async () => {
+  const pending = { run_id: 'saved-run', checkpoint_id: 'saved-checkpoint', message: 'original request', status: 'interrupted',
+    model_selection: { id: 'original-model', effort: 'high' }, attachments: [{ id: 'file', filename: 'original.txt' }],
+    references: [], personalization_enabled: false, activity: [] }
+  globalThis.chatConcurrencyRequest = () => Promise.resolve({ items: [], next_cursor: null, pending_run: pending })
+  chat.sessions.value = [{ id: 'saved-session', apiThreadId: 'server', title: 'Saved', mode: 'work', turns: [] }]
+  const target = chat.sessions.value[0]
+  await chat.syncThreadMessages(target)
+  assert.equal(target.turns.length, 1)
+  const turn = target.turns[0]
+  assert.equal(turn.serverRunId, 'saved-run')
+  assert.equal(turn.checkpointId, 'saved-checkpoint')
+  assert.equal(turn.prompt, 'original request')
+  assert.equal(turn.model, 'original-model')
+  assert.deepEqual(turn.files, ['original.txt'])
+  assert.equal(turn.memory, false)
+  assert.ok(turn.serverError.includes('checkpoint'))
+})
+
+test('an archived completed run clears a lost acknowledgement error and stale checkpoint', async () => {
+  const target = chat.sessions.value[0]
+  globalThis.chatConcurrencyRequest = () => Promise.resolve({ items: [{ run_id: 'saved-run', message: 'original request', response: 'completed', attachments: [] }], next_cursor: null, pending_run: null })
+  await chat.syncThreadMessages(target)
+  assert.equal(target.turns.length, 1)
+  assert.equal(target.turns[0].serverReply, 'completed')
+  assert.equal(target.turns[0].serverError, undefined)
+  assert.equal(target.turns[0].checkpointId, undefined)
+  assert.equal(target.pendingRun, null)
+})

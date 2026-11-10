@@ -110,6 +110,15 @@ async def test_colliding_http_sessions_run_together_and_cancelling_one_keeps_oth
             assert "A-complete" not in result.text
             history = (await client.get(f"/api/v1/threads/{second}/messages")).json()["items"]
             assert len(history) == 1 and history[0]["response"] == "B-complete"
+            pending = (await client.get(f"/api/v1/threads/{first}/messages")).json()["pending_run"]
+            assert pending["message"] == "A"
+            release["A"].set()
+            resumed = await client.post(
+                f"/api/v1/threads/{first}/resume?stream=true&checkpoint_id={pending['checkpoint_id']}"
+            )
+            assert "A-complete" in resumed.text and "event: done" in resumed.text
+            archived = (await client.get(f"/api/v1/threads/{first}/messages")).json()["items"]
+            assert len(archived) == 1 and archived[0]["run_id"] == pending["run_id"]
         finally:
             release["A"].set()
             release["B"].set()

@@ -9,6 +9,7 @@ from urllib.parse import quote
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
+from langgraph.func import task
 from pydantic import BaseModel
 
 from app.agent.tools.descriptor import ToolMode
@@ -300,6 +301,13 @@ class ToolGateway:
             工具节点的协程函数。
         """
 
+        @task(name="execute_tool_call")
+        async def execute_call(call_state: dict):
+            # Inherit the task's config, not the parent node's task identity.
+            # 使用子任务配置，不能将父节点的任务身份覆盖进来。
+            result = await node.ainvoke(call_state)
+            return result["messages"]
+
         async def execute(state: dict, config: RunnableConfig):
             """
             Execute each tool call in order and merge result messages. /
@@ -320,8 +328,12 @@ class ToolGateway:
             for call in original.tool_calls:
                 pending = original.model_copy(update={"tool_calls": [call]})
                 call_state = {**working, "messages": [*working["messages"][:-1], pending]}
-                result = await node.ainvoke(call_state, config)
-                messages.extend(result["messages"])
+                completed = await execute_call(call_state)
+                messages.extend(completed)
+                # Cached task results must also appear in resumed live activity.
+                # 检查点复用的任务结果也需要重新投影到恢复后的活动轨迹。
+                for message in completed:
+                    get_stream_writer()(("tool", call["id"], message))
                 working = {**state, "messages": [*state["messages"][:-1], *messages, original]}
             return {"messages": messages, "approved_calls": [], "tool_approval_wait": {}}
 

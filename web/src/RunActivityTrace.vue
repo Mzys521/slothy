@@ -3,7 +3,7 @@ import { Check, ChevronRight, Circle, CircleAlert, LoaderCircle, ShieldCheck, X 
 import { computed, ref } from 'vue'
 import { t } from './preferences'
 import type { RunActivity, RunMetrics, ToolArtifact } from './workApi'
-import { activityResult, downloadArtifact, metricSummary, riskLabel, safeArtifactUrl } from './toolResults'
+import { activityResult, callRisk, downloadArtifact, irreversibleCall, metricSummary, riskLabel, safeArtifactUrl } from './toolResults'
 
 const props = defineProps<{ items: RunActivity[]; interrupted?: boolean; metrics?: RunMetrics | null }>()
 const results = computed(() => new Map(props.items.map(entry => [entry.id, activityResult(entry)])))
@@ -102,7 +102,7 @@ function icon(entry: RunActivity) {
         <span class="trace-tool-name">{{ label(entry) }}</span>
         <span>· {{ statusLabel(entry) }}</span>
         <span v-if="entry.approved">· {{ t('Approved', '已批准') }}</span>
-        <span v-if="entry.risk">· {{ riskLabel(entry.risk, t) }}</span>
+        <span v-if="callRisk(entry)" :class="{ 'tool-risk-danger': irreversibleCall(entry) }">· {{ riskLabel(callRisk(entry), t) }}</span>
       </summary>
       <div class="trace-details">
         <div v-if="entry.arguments != null">{{ t('Arguments', '调用参数') }}<pre>{{ entry.arguments }}</pre></div>
