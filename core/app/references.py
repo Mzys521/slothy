@@ -66,7 +66,12 @@ class ReferenceResolver:
         self.summary_for = summary_for
 
     async def history_metadata(self, user, thread, items):
-        """Refresh chip status without loading reference contents. / 仅刷新引用状态，不读取内容。"""
+        """Refresh chip status without loading reference contents. / 仅刷新引用状态，不读取内容。
+
+        The same status vocabulary is shared with the runtime revalidation and the reference
+        chips: ``ok``, ``disabled``, ``missing`` or ``unreadable``. / 与运行时重验和引用标签共用
+        同一状态词表：``ok``、``disabled``、``missing`` 或 ``unreadable``。
+        """
         result = []
         plugins = {item["id"]: item for item in self.connectors.list() if not item["builtin"]}
         for saved in items:
@@ -88,8 +93,14 @@ class ReferenceResolver:
                     target = files.resolve(item.get("path") or item["id"])
                     if not target.exists() or target.is_dir() != (item["kind"] == "folder"):
                         raise LookupError("Missing path")
-            except (ValueError, LookupError, ToolOperationError, OSError):
+            except (ToolOperationError, OSError):
+                item["status"] = "unreadable"
+            except (ValueError, LookupError):
                 item["status"] = "missing"
+            if item.get("included", True) and item["status"] in {"missing", "unreadable"}:
+                # A reference accepted earlier but no longer readable stays out of the prompt.
+                # 曾接受但已不可读的引用不再进入提示词。
+                item["included"] = False
             result.append(item)
         return result
 
@@ -158,114 +169,196 @@ class ReferenceResolver:
                     continue
         return items[:limit]
 
-    async def resolve(self, user, thread, inputs):
+    async def resolve(self, user, thread, inputs, *, strict=True, budget=None):
+        """Resolve selected references once per request. / 每个请求解析一次已选引用。
+
+        Strict mode validates the original selection and rejects any invalid item. The runtime
+        revalidation pass uses lenient mode: an accepted item that became unavailable afterwards
+        is reported with ``included: false`` and a reason code while the remaining items still
+        resolve, so the run continues with the evidence it still has. / 严格模式校验初始选择并整体
+        拒绝非法项；运行时重验使用宽松模式：已接受但随后失效的单项以 ``included: false`` 与原因
+        码返回，其余引用继续解析，运行按仍可用的证据继续。
+
+        Args:
+            user: Trusted user identifier. / 可信用户标识。
+            thread: Conversation owning the selection. / 引用所属会话。
+            inputs: Selected reference identities. / 已选择的引用标识。
+            strict: Reject the whole selection on the first invalid item. / 是否整体拒绝非法项。
+            budget: Optional per-run character budget from an enforced decision plan. The
+                effective budget never exceeds the resolver default. / 可选、来自已执行决策计划
+                的单轮字符预算；有效预算不会超过解析器默认值。
+
+        Returns:
+            Metadata in selection order and the joined bounded reference text. /
+            按选择顺序的元数据与拼接后的有界引用文本。
+        """
         selected = [ReferenceInput.model_validate(item) for item in inputs]
         if len(selected) > 8 or len({item.key for item in selected}) != len(selected):
             raise ValueError("Select at most eight distinct references")
         if not await self.store.get_thread(user, thread):
             raise LookupError("Reference conversation is unavailable")
         metadata, blocks = [], []
-        remaining = self.budget
+        remaining = self.budget if budget is None else min(self.budget, max(0, budget))
         for item in selected:
-            source_truncated = False
-            identity = item.path or item.id
-            label = identity
-            status = "ok"
-            if item.kind in {"file", "folder"}:
-                if item.source == "attachment":
-                    (attachment,) = await self.store.read_attachments(user, thread, [item.id])
-                    label = attachment["filename"]
-                    data = {
-                        "name": label,
-                        "bytes": attachment["byte_size"],
-                        "text": attachment["content"][:8000],
-                    }
-                else:
-                    files = WorkspaceFiles(await self.settings_for(user, thread))
-                    target = files.resolve(identity)
-                    if not target.exists() or target.is_dir() != (item.kind == "folder"):
-                        raise LookupError("Reference path is unavailable")
-                    label = target.name or "."
-                    if item.kind == "folder":
-                        result = await files.read("list", path=identity, depth=1)
-                        data = result["data"]
-                    else:
-                        data = {"path": identity, "bytes": target.stat().st_size}
-                        try:
-                            result = await files.read("read", path=identity, limit=8000)
-                            mime = mimetypes.guess_type(identity)[0] or "text/plain"
-                            textual = mime.startswith("text/") or mime in {
-                                "application/json",
-                                "application/xml",
-                            }
-                            if textual and "\0" not in result["data"]["text"]:
-                                data.update(result["data"])
-                                data["next_offset"] = result.get("next_offset")
-                                source_truncated = result.get("next_offset") is not None
-                            else:
-                                data["note"] = "Binary file: metadata only."
-                        except ToolOperationError as error:
-                            if error.result.error.code not in {"INVALID_ARGS", "OUTPUT_TOO_LARGE"}:
-                                raise
-                            data["note"] = "Binary or large file: metadata only."
-            elif item.kind == "session":
-                record = await self.store.get_thread(user, item.id)
-                if record is None:
-                    raise LookupError("Referenced session is unavailable")
-                label = record["title"] or item.id
-                summary = await self.summary_for(user, item.id) if self.summary_for else None
-                turns = await self.store.list_turns(
-                    user_id=user, thread_id=item.id, limit=2 if summary else 6, newest_first=True
-                )
-                data = {
-                    "title": label,
-                    "updated_at": record["updated_at"],
-                }
-                if summary:
-                    data["summary"] = summary[:1600]
-                    source_truncated = len(summary) > 1600
-                excerpt = max(80, (3000 - len(data.get("summary", ""))) // max(1, len(turns) * 2))
-                data["turns_newest_first"] = [
-                    {"user": turn.user_input[:excerpt], "assistant": turn.response[:excerpt]}
-                    for _, turn in turns
-                ]
-                source_truncated |= any(
-                    len(turn.user_input) > excerpt or len(turn.response) > excerpt
-                    for _, turn in turns
-                )
-            else:
-                record = next(
-                    (
-                        entry
-                        for entry in self.connectors.list()
-                        if entry["id"] == item.id and not entry["builtin"]
-                    ),
-                    None,
-                )
-                if record is None:
-                    raise LookupError("Referenced plugin is unavailable")
-                label = record["name"]
-                status = "ok" if record["enabled"] else "disabled"
-                data = {key: record[key] for key in ("name", "kind", "description", "enabled")}
-                data["tools"] = record["tools"][:20] if record["enabled"] else []
-                data["note"] = "Reference only; tool permissions and approval are unchanged."
-            meta = {
-                **item.model_dump(exclude_none=True),
-                "id": identity,
-                "label": label[:200],
-                "status": status,
-                "reference_id": item.key,
-            }
-            metadata.append(meta)
-            cap = {"file": 8000, "folder": 4000, "session": 4000, "plugin": 2000}[item.kind]
-            block = json.dumps({**meta, "data": data}, ensure_ascii=False, separators=(",", ":"))
-            size = min(cap, max(0, remaining - 1))
-            truncated = len(block) > size
-            if truncated:
-                block = block[: max(0, size - 14)] + " [truncated]" if size >= 14 else ""
+            try:
+                entry, block = await self.resolve_one(user, thread, item, remaining)
+            except (ValueError, LookupError, ToolOperationError, OSError) as error:
+                if strict:
+                    raise
+                entry, block = self._unavailable(item, error)
+            metadata.append(entry)
             if block:
                 blocks.append(block)
                 remaining -= len(block) + 1
-            meta["truncated"] = truncated or source_truncated
-            meta["included"] = bool(block)
         return metadata, "\n".join(blocks)
+
+    @staticmethod
+    def _unavailable(item: ReferenceInput, error: BaseException) -> tuple[dict, str]:
+        """Describe one reference that was accepted before but is now unavailable. /
+        描述一个曾接受但现已不可用的引用。
+
+        Args:
+            item: Selected reference identity. / 已选择的引用标识。
+            error: Original resolution failure. / 原始解析失败。
+
+        Returns:
+            Metadata with a stable reason code and an empty text block.
+            / 含稳定原因码的元数据与空文本。
+        """
+        identity = item.path or item.id
+        unreadable = isinstance(error, (ToolOperationError, OSError))
+        return (
+            {
+                **item.model_dump(exclude_none=True),
+                "id": identity,
+                "label": (identity or "")[:200],
+                "status": "unreadable" if unreadable else "missing",
+                "reason": "unreadable" if unreadable else "missing",
+                "reference_id": item.key,
+                "included": False,
+                "truncated": False,
+            },
+            "",
+        )
+
+    async def resolve_one(
+        self, user: str, thread: str, item: ReferenceInput, remaining: int
+    ) -> tuple[dict, str]:
+        """Resolve one reference into metadata and its bounded text block. /
+        把单个引用解析为元数据与有界文本块。
+
+        Args:
+            user: Trusted user identifier. / 可信用户标识。
+            thread: Conversation owning the selection. / 引用所属会话。
+            item: One validated reference identity. / 一个已校验的引用标识。
+            remaining: Remaining reference character budget. / 剩余引用字符预算。
+
+        Returns:
+            The reference metadata and its encoded block (empty when omitted). /
+            引用元数据与编码后的文本块（被省略时为空串）。
+
+        Raises:
+            ValueError: On an invalid selection. / 选择非法时抛出。
+            LookupError: When the referenced source no longer exists. / 引用来源不存在时抛出。
+            ToolOperationError: When the source cannot be read. / 来源不可读时抛出。
+        """
+        source_truncated = False
+        identity = item.path or item.id
+        label = identity
+        status = "ok"
+        if item.kind in {"file", "folder"}:
+            if item.source == "attachment":
+                page = await self.store.read_attachment_page(user, thread, item.id, 0, 8000)
+                label = page["filename"]
+                data = {
+                    "name": label,
+                    "bytes": page["byte_size"],
+                    "text": page["text"],
+                    "total_chars": page["total_chars"],
+                }
+                source_truncated = page["next_offset"] is not None
+            else:
+                files = WorkspaceFiles(await self.settings_for(user, thread))
+                target = files.resolve(identity)
+                if not target.exists() or target.is_dir() != (item.kind == "folder"):
+                    raise LookupError("Reference path is unavailable")
+                label = target.name or "."
+                if item.kind == "folder":
+                    result = await files.read("list", path=identity, depth=1)
+                    data = result["data"]
+                else:
+                    data = {"path": identity, "bytes": target.stat().st_size}
+                    try:
+                        result = await files.read("read", path=identity, limit=8000)
+                        mime = mimetypes.guess_type(identity)[0] or "text/plain"
+                        textual = mime.startswith("text/") or mime in {
+                            "application/json",
+                            "application/xml",
+                        }
+                        if textual and "\0" not in result["data"]["text"]:
+                            data.update(result["data"])
+                            data["next_offset"] = result.get("next_offset")
+                            source_truncated = result.get("next_offset") is not None
+                        else:
+                            data["note"] = "Binary file: metadata only."
+                    except ToolOperationError as error:
+                        if error.result.error.code not in {"INVALID_ARGS", "OUTPUT_TOO_LARGE"}:
+                            raise
+                        data["note"] = "Binary or large file: metadata only."
+        elif item.kind == "session":
+            record = await self.store.get_thread(user, item.id)
+            if record is None:
+                raise LookupError("Referenced session is unavailable")
+            label = record["title"] or item.id
+            summary = await self.summary_for(user, item.id) if self.summary_for else None
+            turns = await self.store.list_turns(
+                user_id=user, thread_id=item.id, limit=2 if summary else 6, newest_first=True
+            )
+            data = {
+                "title": label,
+                "updated_at": record["updated_at"],
+            }
+            if summary:
+                data["summary"] = summary[:1600]
+                source_truncated = len(summary) > 1600
+            excerpt = max(80, (3000 - len(data.get("summary", ""))) // max(1, len(turns) * 2))
+            data["turns_newest_first"] = [
+                {"user": turn.user_input[:excerpt], "assistant": turn.response[:excerpt]}
+                for _, turn in turns
+            ]
+            source_truncated |= any(
+                len(turn.user_input) > excerpt or len(turn.response) > excerpt
+                for _, turn in turns
+            )
+        else:
+            record = next(
+                (
+                    entry
+                    for entry in self.connectors.list()
+                    if entry["id"] == item.id and not entry["builtin"]
+                ),
+                None,
+            )
+            if record is None:
+                raise LookupError("Referenced plugin is unavailable")
+            label = record["name"]
+            status = "ok" if record["enabled"] else "disabled"
+            data = {key: record[key] for key in ("name", "kind", "description", "enabled")}
+            data["tools"] = record["tools"][:20] if record["enabled"] else []
+            data["note"] = "Reference only; tool permissions and approval are unchanged."
+        meta = {
+            **item.model_dump(exclude_none=True),
+            "id": identity,
+            "label": label[:200],
+            "status": status,
+            "reference_id": item.key,
+        }
+        cap = {"file": 8000, "folder": 4000, "session": 4000, "plugin": 2000}[item.kind]
+        block = json.dumps({**meta, "data": data}, ensure_ascii=False, separators=(",", ":"))
+        size = min(cap, max(0, remaining - 1))
+        truncated = len(block) > size
+        if truncated:
+            block = block[: max(0, size - 14)] + " [truncated]" if size >= 14 else ""
+        meta["truncated"] = truncated or source_truncated
+        meta["included"] = bool(block)
+        return meta, block

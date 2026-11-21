@@ -8,6 +8,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from app.config import CheckpointSettings
+from app.infrastructure.storage_version import STORAGE_VERSION
 
 
 class SQLiteCheckpointStore:
@@ -57,6 +58,7 @@ class SQLiteCheckpointStore:
             async with self.connection.executescript(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;"
                 f"PRAGMA busy_timeout={self.settings.busy_timeout_ms};"
+                f"PRAGMA user_version={STORAGE_VERSION};"
             ):
                 pass
             self.saver = AsyncSqliteSaver(

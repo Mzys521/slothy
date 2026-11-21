@@ -5,6 +5,7 @@ import asyncio
 import json
 import math
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -17,7 +18,11 @@ from app.api import create_app
 from app.config import CheckpointSettings
 from app.conversations import ConversationTurn
 from app.infrastructure.conversations import SQLiteConversationStore
-from app.infrastructure.storage_version import prepare_storage
+from app.infrastructure.storage_version import (
+    StorageRecoveryRequired,
+    prepare_storage,
+    reset_storage,
+)
 from app.infrastructure.workspace import BoundedWorkspaceContext
 from app.memory.learning import MemoryLearner
 from app.memory.semantics import frequency_strength, identity_intent
@@ -260,7 +265,7 @@ async def test_duplicate_fact_concurrency_and_capacity(tmp_path):
         assert await d.store.get_memory("alice", facts[0]["id"]) is None
 
 
-def test_storage_reset_once_preserves_files_and_configuration(tmp_path):
+def test_storage_recovery_preserves_files_until_an_explicit_reset(tmp_path):
     checkpoint = tmp_path / "checkpoints.sqlite"
     for name in (
         "checkpoints.sqlite",
@@ -273,9 +278,15 @@ def test_storage_reset_once_preserves_files_and_configuration(tmp_path):
     (tmp_path / "providers.json").write_text("provider-config")
     (tmp_path / "workspaces").mkdir()
     (tmp_path / "workspaces" / "important.py").write_text("print('keep')")
-    metadata = prepare_storage(checkpoint)
+    # Damaged data is never deleted implicitly; the caller must offer an explicit choice.
+    # 损坏数据不会被隐式删除；调用方必须给出明确选择。
+    with pytest.raises(StorageRecoveryRequired):
+        prepare_storage(checkpoint)
+    assert checkpoint.read_bytes() == b"old"
+    metadata = reset_storage(checkpoint)
     assert metadata["version"] == 3 and metadata["reset"]
     assert not checkpoint.exists()
+    assert (Path(metadata["backup"]) / "checkpoints.sqlite").read_bytes() == b"old"
     checkpoint.write_bytes(b"new-data")
     assert prepare_storage(checkpoint) == metadata
     assert checkpoint.read_bytes() == b"new-data"
@@ -504,16 +515,21 @@ async def test_ambiguous_skill_and_task_mentions_never_become_profile_facts(tmp_
         )
 
 
-def test_storage_refuses_future_version_and_retries_interrupted_old_reset(tmp_path):
+def test_storage_refuses_future_version_and_requires_an_explicit_legacy_decision(tmp_path):
     checkpoint = tmp_path / "app.sqlite"
     checkpoint.write_bytes(b"legacy")
     marker = checkpoint.with_suffix(".storage.json")
     marker.write_text(json.dumps({"version": 4, "epoch": "future"}))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(StorageRecoveryRequired):
         prepare_storage(checkpoint)
     assert checkpoint.read_bytes() == b"legacy"
     marker.write_text(json.dumps({"version": 2, "epoch": "old"}))
-    metadata = prepare_storage(checkpoint)
+    with pytest.raises(StorageRecoveryRequired):
+        prepare_storage(checkpoint)
+    assert checkpoint.read_bytes() == b"legacy"
+    # Only an explicit, verified reset replaces the legacy files.
+    # 只有显式且经过校验的重置才会替换旧版文件。
+    metadata = reset_storage(checkpoint)
     assert metadata["version"] == 3 and not checkpoint.exists()
 
 

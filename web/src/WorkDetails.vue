@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { t } from './preferences'
 import { threadPath, workRequest } from './workApi'
+import { ReadGuard } from './readGuard'
 
 interface JournalEvent {
   schema_version?: number
@@ -27,6 +28,8 @@ const events = ref<JournalEvent[]>([])
 const selectedId = ref('')
 const loading = ref(false)
 const error = ref('')
+const reads = new ReadGuard<string>()
+let controller: AbortController | undefined
 const labels: Record<string, [string, string]> = {
   system: ['System prompt', '系统提示词'],
   runtime: ['Runtime context', '运行上下文'],
@@ -51,22 +54,51 @@ const categories = computed(() => {
   })).filter(item => item.value > 0)
 })
 const total = computed(() => categories.value.reduce((sum, item) => sum + item.value, 0))
-watch(() => props.thread, load, { immediate: true })
+watch(() => props.thread, () => void load(), { immediate: true })
+onUnmounted(() => {
+  // An unmounted panel must never publish a late response.
+  // 已卸载的面板绝不能提交迟到的响应。
+  reads.invalidate(props.thread ?? '')
+  controller?.abort()
+  controller = undefined
+  clear()
+})
+
+/** Resets every value this panel owns. / 重置该面板拥有的全部状态。 */
+function clear() {
+  events.value = []
+  selectedId.value = ''
+  error.value = ''
+  loading.value = false
+}
 
 /** Load persisted JSONL work records for the active session. / 读取当前会话的持久化记录。 */
 async function load() {
-  selectedId.value = ''
-  events.value = []
-  error.value = ''
-  if (!props.thread) return
+  const thread = props.thread ?? ''
+  // The read owns this thread only while it stays the selection and no newer read starts.
+  // 该读取只在其仍是选中会话且没有更新读取时拥有该会话。
+  const token = reads.begin(thread)
+  controller?.abort()
+  controller = undefined
+  clear()
+  if (!thread) return
+  const active = () => reads.owns(token, props.thread ?? '')
+  const next = new AbortController()
+  controller = next
   loading.value = true
   try {
-    const result = await workRequest<{ items: JournalEvent[] }>(threadPath(props.thread) + '/work-details')
+    const result = await workRequest<{ items: JournalEvent[] }>(
+      threadPath(thread) + '/work-details', 'GET', undefined, { signal: next.signal },
+    )
+    if (!active()) return
     events.value = result.items ?? []
     selectedId.value = events.value.at(-1)?.model_call_id ?? ''
   } catch (reason) {
+    if (!active()) return
     error.value = reason instanceof Error ? reason.message : String(reason)
-  } finally { loading.value = false }
+  } finally {
+    if (active()) loading.value = false
+  }
 }
 </script>
 

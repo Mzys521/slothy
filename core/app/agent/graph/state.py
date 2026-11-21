@@ -13,6 +13,7 @@ from langgraph.managed import RemainingSteps
 from pydantic import JsonValue
 from typing_extensions import TypedDict
 
+from app.agent.decision.contracts import DECISION_POLICY_VERSION
 from app.config import AgentSettings
 
 
@@ -111,6 +112,10 @@ class AgentState(TypedDict, total=False):
     decision_reasons: list[str]
     decision_source: str | None
     decision_enforced: bool
+    # Interpretation version of the stored plan. Checkpoints written before the decision
+    # policy changed lack this key and keep the previous, non-restrictive behavior. /
+    # 中文：已存计划的解释版本。决策策略变化前写入的检查点没有该键，沿用此前不施加限制的行为。
+    decision_policy_version: int
 
 
 def create_initial_state(
@@ -198,4 +203,5 @@ def create_initial_state(
         model_stats=[],
         tool_contract_version=2,
         tool_approval_wait={},
+        decision_policy_version=DECISION_POLICY_VERSION,
     )

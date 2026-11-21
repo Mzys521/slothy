@@ -5,7 +5,7 @@ export interface ReferenceItem {
   label: string
   source?: 'workspace' | 'attachment'
   path?: string
-  status?: 'ok' | 'missing' | 'disabled'
+  status?: 'ok' | 'missing' | 'disabled' | 'unreadable'
   reference_id?: string
   sublabel?: string
   truncated?: boolean

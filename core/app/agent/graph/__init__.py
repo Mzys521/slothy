@@ -7,7 +7,7 @@ Callers import this package instead of the individual modules. / 调用方依赖
 from app.agent.graph.runtime import build_graph_config
 from app.agent.graph.services import AgentServices, ContextBuildResult
 from app.agent.graph.state import AgentState, create_initial_state
-from app.agent.graph.workflow import build_agent_graph
+from app.agent.graph.workflow import build_agent_graph, build_readonly_graph
 
 __all__ = [
     "AgentServices",
@@ -15,5 +15,6 @@ __all__ = [
     "ContextBuildResult",
     "build_agent_graph",
     "build_graph_config",
+    "build_readonly_graph",
     "create_initial_state",
 ]

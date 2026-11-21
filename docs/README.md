@@ -12,11 +12,14 @@ Slothy documentation is bilingual: every public guide exists in English and
 | API reference | [api.md](api.md) | [api.zh-CN.md](api.zh-CN.md) | all `/api/v1` routes, SSE events, approval flow, examples |
 | Brand guidelines | [brand.md](brand.md) | [brand.md#中文](brand.md#中文) | name, slogan, colors, logo usage, voice, UI principles |
 | Changelog | [CHANGELOG.md](../CHANGELOG.md) | — | release history |
-| Release notes | [0.1.4.2-beta](releases/0.1.4.2-beta.md) | same file, 中文 after English | bilingual release details |
+| 0.1.5 stable release notes | [English](releases/0.1.5.md#english) | [简体中文](releases/0.1.5.md#简体中文) | Windows x64 installer, upgrade and API changes |
+| Previous release | [0.1.4.2-beta](releases/0.1.4.2-beta.md#english) | [中文](releases/0.1.4.2-beta.md#中文) | beta release history |
 
 ## Diagrams
 
-Rendered SVG plus Mermaid sources live in [`diagrams/`](diagrams):
+The README architecture diagrams are available as PNG in
+[English](assets/diagrams/architecture-en.png) and [简体中文](assets/diagrams/architecture-zh-CN.png).
+Rendered SVGs and Mermaid sources for the other diagrams live in [`diagrams/`](diagrams):
 
 | File | Content |
 |---|---|

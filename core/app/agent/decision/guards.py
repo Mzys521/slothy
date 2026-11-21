@@ -31,6 +31,11 @@ class DecisionGuards:
     def apply(self, raw: DecisionOutput, state: dict, mode: str = "chat") -> StepPlan:
         """Clamp one proposal and record changed reasons. / 收敛一次提议并记录原因。
 
+        An empty ``allowed`` list means nothing is allowed; ``None`` means the proposal did
+        not restrict tools. Unknown names are dropped, and a ``tool`` route without a usable
+        tool is downgraded to ``model``. / 空 ``allowed`` 表示不允许任何工具；``None`` 表示未
+        施加限制。未知名称被丢弃，没有可用工具的 ``tool`` 路由降级为 ``model``。
+
         Args:
             raw: Decision-model output. / 决策模型输出。
             state: Current graph state (user input). / 当前图状态。
@@ -48,18 +53,21 @@ class DecisionGuards:
         if route == "identity" and intent is None:
             route = "model"
             guarded = True
-        allowed = [name for name in raw.tool_policy.allowed if name in pool]
-        if raw.tool_policy.allowed and len(allowed) != len(raw.tool_policy.allowed):
-            guarded = True
-        if route == "tool" and not allowed:
+        raw_allowed = raw.tool_policy.allowed
+        if raw_allowed is None:
+            allowed: list[str] | None = None
+        else:
+            allowed = [name for name in raw_allowed if name in pool]
+            if len(allowed) != len(raw_allowed):
+                guarded = True
+        if route == "tool" and allowed is not None and not allowed:
             route = "model"
             guarded = True
-        if not raw.tool_policy.allowed:
-            allowed = [] if route != "tool" else pool
+        visible = pool if allowed is None else allowed
         expected = raw.tool_policy.expected_review or any(
             getattr(descriptor, "requires_approval", False)
             for descriptor in self.registry.descriptors(mode)
-            if descriptor.name in allowed
+            if descriptor.name in visible
         )
         memory_top_k = min(
             max(0, raw.context_plan.memory_top_k), self.agent_settings.memory_top_k
@@ -82,7 +90,9 @@ class DecisionGuards:
             tool_policy=raw.tool_policy.model_copy(
                 update={
                     "allowed": allowed,
-                    "preferred": [name for name in raw.tool_policy.preferred if name in allowed],
+                    "preferred": [
+                        name for name in raw.tool_policy.preferred if name in visible
+                    ],
                     "expected_review": expected,
                 }
             ),

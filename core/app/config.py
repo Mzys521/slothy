@@ -298,6 +298,15 @@ class AgentSettings(_ProjectSettings):
     memory_context_token_budget: int = Field(
         default=1200, ge=1, validation_alias="MEMORY_CONTEXT_TOKEN_BUDGET"
     )
+    # 中文：模型目录未提供上下文窗口时的保守默认总窗口，必须显式记录来源。
+    # English: Conservative total window when the catalog omits one; the source is recorded.
+    context_window_default: int = Field(default=32_768, ge=1024, le=2_000_000)
+    # 中文：每次模型调用预留的最大输出 token，仍受模型窗口上限约束。
+    # English: Maximum output tokens reserved per model call, still bounded by the window.
+    output_token_reserve: int = Field(default=2048, ge=256, le=32768)
+    # 中文：输入预算中为工具 schema 预留的 token 上限，避免工具过多挤掉对话。
+    # English: Token cap reserved for tool schemas inside the input budget.
+    tool_schema_reserve: int = Field(default=4096, ge=0, le=65536)
 
 
 class DecisionSettings(_ProjectSettings):

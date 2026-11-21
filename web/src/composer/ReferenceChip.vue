@@ -7,10 +7,11 @@ defineEmits<{ remove: [] }>()
 const icons = { folder: Folder, file: File, session: MessageSquare, plugin: Plug }
 </script>
 <template>
-  <span :class="['reference-chip', { 'reference-unavailable': item.status === 'missing' }]" :title="item.sublabel || item.id">
+  <span :class="['reference-chip', { 'reference-unavailable': item.status === 'missing' || item.status === 'unreadable' }]" :title="item.sublabel || item.id">
     <component :is="icons[item.kind]" aria-hidden="true" /><span>{{ item.label }}</span>
     <small v-if="item.status === 'disabled'">{{ t('Disabled', '未启用') }}</small>
     <small v-if="item.status === 'missing'">{{ t('Unavailable', '已失效') }}</small>
+    <small v-else-if="item.status === 'unreadable'">{{ t('Unreadable', '无法读取') }}</small>
     <small v-else-if="item.included === false">{{ t('Over budget', '超出预算') }}</small>
     <small v-else-if="item.truncated">{{ t('Truncated', '已截断') }}</small>
     <button v-if="removable" type="button" :aria-label="t('Remove reference', '移除引用') + ': ' + item.label" @click="$emit('remove')" @keydown.backspace.prevent="$emit('remove')"><X /></button>

@@ -7,7 +7,7 @@
 <p align="center"><em>Small Steps Toward A Better Future · 小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.2--beta-60DD06" />
+  <img alt="version 0.1.5" src="https://img.shields.io/badge/version-0.1.5-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -15,15 +15,16 @@
 </p>
 
 <p align="center">
-  <a href="README.zh-CN.md">简体中文</a> ·
   <a href="docs/architecture.md">Architecture</a> ·
   <a href="docs/getting-started.md">Getting started</a> ·
   <a href="docs/api.md">API</a> ·
-  <a href="docs/brand.md">Brand</a>
+  <a href="docs/brand.md">Brand</a> ·
+  <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.2-beta"><strong>Download Slothy 0.1.4.2 Beta for Windows x64</strong></a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.5"><strong>Download Slothy 0.1.5 for Windows x64</strong></a> ·
+  <a href="docs/releases/0.1.5.md#english">Release notes</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -41,7 +42,7 @@ reviewable. Fully manual review is also available. Each request retrieves releva
 memory. Tool calls that change your machine are reviewed by you, not trusted
 blindly.
 
-## Memory V3 — 0.1.4.2-beta
+## Memory V3
 
 The background model extracts typed concepts and evidence-backed relations. Python
 and beginner are separate concepts; proficiency belongs to Python, not to the user
@@ -51,12 +52,10 @@ need no embedding service. Manual profile edits and automatic learning share the
 same facts; corrections retire old versions, and identity questions use reliable
 facts directly. The context panel shows what was actually provided and why.
 
-This development release resets all three business databases **once on first V3
-startup**, without migrating/relearning old conversations. Provider keys, connector
-configuration files, UI preferences and workspace files remain. Old browser session
-caches are cleared when the data epoch changes. No TTL or time decay is applied.
-The published GitHub release now carries this `0.1.4.2-beta` build; building this
-checkout reproduces the same version locally.
+Slothy 0.1.5 checks existing databases before opening them. It opens compatible data
+and prompts for a recovery decision when the storage format needs attention. Upgrading
+a compatible legacy store through that prompt creates a verified backup first.
+See the [0.1.5 release notes](docs/releases/0.1.5.md#english) for upgrade and installer details.
 
 ## Why Slothy
 
@@ -71,7 +70,7 @@ checkout reproduces the same version locally.
 ## Features
 
 - **Agent runtime** — LangGraph `StateGraph` with the nodes
-  `prepare_run → load_profile → retrieve_memories → build_personalized_context →
+  `prepare_run → decide → load_profile → retrieve_memories → build_personalized_context →
   agent → (tools) → finalize_response`, synchronous checkpointing and bounded
   recursion.
 - **Human-in-the-loop tools** — risky tool calls pause the graph through an
@@ -159,31 +158,18 @@ checkout reproduces the same version locally.
 - **Workspaces on disk** — each workspace maps to a real folder; tool instances
   and artifact roots are isolated per directory, without changing the process
   working directory.
+- **Conversation forks** — fork a conversation with its archived turns and artifact
+  links.
 - **Model providers** — DeepSeek, MiMo, Anthropic and any OpenAI-compatible
   endpoint; keys are stored with Windows DPAPI and only masked state is exposed
   to the API.
 
 ## Architecture at a glance
 
-```
-┌──────────────────────────── Electron desktop ────────────────────────────┐
-│ main process                     renderer (Vue 3 + TypeScript)           │
-│  window / IPC / token            chat · memory · profile · graph · settings│
-│  spawns & supervises backend     fetches http://127.0.0.1:<port>/api/v1  │
-└──────────────┬───────────────────────────────────────────────────────────┘
-               │ X-Slothy-Token (loopback only)
-┌──────────────▼───────────────────────────────────────────────────────────┐
-│ FastAPI service (uvicorn, 127.0.0.1)                                      │
-│  /api/v1 routers ──▶ AgentRunner ──▶ LangGraph online_agent               │
-│                                  ├── ▶ tool review / resume               │
-│                                  └── ▶ memory · profile · workspaces     │
-│  SQLite: checkpoints · sessions · workspace memory                        │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+![Slothy architecture. The Electron renderer calls the local FastAPI and LangGraph backend, which uses configured model endpoints and local SQLite stores.](docs/assets/diagrams/architecture-en.png)
 
 See [Architecture](docs/architecture.md) for the module map, graph topology,
-prompt layering, storage schema and security boundaries. The rendered diagrams
-are in [`docs/diagrams/`](docs/diagrams/).
+prompt layering, storage schema and security boundaries.
 
 ## Quick start
 
@@ -223,9 +209,9 @@ Install and package details, environment variables and troubleshooting live in
 core/                  Python backend (FastAPI + LangGraph)
   app/api.py           HTTP routers, SSE, lifespan wiring
   app/agent/           graph, tools, providers, prompt planning
-  app/personalization/ memory extraction, profile projection
+  app/memory/          memory learning, evidence, profiles and graph
   app/infrastructure/  SQLite stores, LLM adapters, subprocess runner
-  tests/               424 backend automated tests
+  tests/               backend regression tests
 web/                   Electron + Vue desktop client
   electron/            main process, preload bridge, backend supervision
   src/                 Vue pages and TypeScript API layer
@@ -236,12 +222,12 @@ docs/                  public documentation (EN + 中文) and diagrams
 
 ```powershell
 cd core
-.\.venv\Scripts\python.exe -m pytest      # 424 tests
+.\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe -m ruff check app tests
 
 cd ..\web
 npm run typecheck                         # vue-tsc
-node --test tests/*.test.mjs              # 43 frontend/serverless tests (+ 3 desktop directory tests)
+node --test tests/*.test.mjs electron/directory.test.mjs
 npm run production:audit                  # packaged-asset allowlist audit
 ```
 
@@ -261,7 +247,6 @@ npm run production:audit                  # packaged-asset allowlist audit
 - [ ] Scheduled memory consolidation with decay and retention enforcement (settings
   are reserved today; automatic permanent deletion is not enabled).
 - [ ] Richer memory retrieval (optional embeddings, hybrid ranking).
-- [ ] Conversation branching (documented plan; not implemented yet).
 - [ ] More providers and richer cache analytics in the UI.
 
 ## Documentation
@@ -271,6 +256,7 @@ npm run production:audit                  # packaged-asset allowlist audit
 | Architecture | [architecture.md](docs/architecture.md) | [architecture.zh-CN.md](docs/architecture.zh-CN.md) |
 | Getting started | [getting-started.md](docs/getting-started.md) | [getting-started.zh-CN.md](docs/getting-started.zh-CN.md) |
 | API reference | [api.md](docs/api.md) | [api.zh-CN.md](docs/api.zh-CN.md) |
+| 0.1.5 release notes | [English](docs/releases/0.1.5.md#english) | [简体中文](docs/releases/0.1.5.md#简体中文) |
 | Brand guidelines | [brand.md](docs/brand.md) | [brand.md](docs/brand.md#中文) |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) | [CHANGELOG.md](CHANGELOG.md) |
 

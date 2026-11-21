@@ -174,6 +174,7 @@ class ArtifactStore:
         invoke: Callable[[], Awaitable[ToolResult]],
         *,
         version="1",
+        retain: set[str] | None = None,
     ) -> tuple[ToolResult, bool, int]:
         """
         Run one side-effecting invocation behind its journal. /
@@ -184,6 +185,9 @@ class ArtifactStore:
             本次调用的可信执行身份。
             tool: Registered tool name recorded in the journal. / 写入日志的已注册工具名称。
             invoke: Coroutine performing the actual tool work. / 执行实际工具工作的协程。
+            version: Tool contract version recorded in the journal. / 写入日志的工具契约版本。
+            retain: Manifest keys still referenced by a session, kept by retention. /
+                仍被会话引用、必须保留的清单标识。
 
         Returns:
             Tuple of result, whether it was reused, and duration in ms. /
@@ -261,25 +265,35 @@ class ArtifactStore:
             },
         )
         try:
-            self.prune(exclude=context.key)
+            self.prune(exclude=context.key, retain=retain)
         except OSError:
             pass  # Retention cleanup must not turn a committed execution into failure.
         return result, False, elapsed
 
-    def prune(self, *, exclude: str):
+    def prune(self, *, exclude: str, retain: set[str] | None = None):
         """
         Delete the oldest completed journals beyond the retention limit. /
         删除超出保留上限的最旧已完成日志。
 
+        Journals still referenced by a session are never pruned, so retention of files and
+        retention of receipts stay separate decisions. / 仍被会话引用的日志绝不清理，文件保留与
+        回执保留保持独立决策。
+
         Args:
             exclude: Journal key kept even when it is the oldest. /
-            即使最旧也必须保留的日志标识。
+                即使最旧也必须保留的日志标识。
+            retain: Journal keys referenced by a session. / 被会话引用的日志标识。
         """
+        keep = retain or set()
         if not self.root.is_dir():
             return
         completed = []
         for directory in self.root.iterdir():
-            if not KEY.fullmatch(directory.name) or directory.name == exclude:
+            if (
+                not KEY.fullmatch(directory.name)
+                or directory.name == exclude
+                or directory.name in keep
+            ):
                 continue
             try:
                 directory = self.directory(directory.name)
@@ -303,6 +317,53 @@ class ArtifactStore:
             if checked.is_dir() and checked.resolve().parent == self.root.resolve():
                 shutil.rmtree(checked)
 
+    def lookup_manifest(
+        self, artifact_id: str, key: str, user: str, thread: str
+    ) -> tuple[Artifact, Path]:
+        """
+        Find an artifact inside one known invocation journal. / 在已知调用日志中查找产物。
+
+        Used by the conversation archive's generation-time locator, so a moved session still
+        resolves the workspace the artifact was created in.
+
+        / 供会话归档的生成时定位使用，会话被移动后仍按生成时的工作区解析。
+
+        Args:
+            artifact_id: Artifact identifier from a recorded result. /
+                已记录结果中的产物标识。
+            key: Invocation journal identity. / 调用日志标识。
+            user: Trusted user that must own the journal. / 必须拥有该日志的可信用户。
+            thread: Conversation that must own the journal. / 必须拥有该日志的会话。
+
+        Returns:
+            Tuple of artifact metadata and its validated path. /
+            产物元数据与其校验后路径的元组。
+
+        Raises:
+            LookupError: If the journal or artifact is unavailable. / 日志或产物不可用时抛出。
+        """
+        if not KEY.fullmatch(artifact_id) or not KEY.fullmatch(key):
+            raise LookupError("Artifact is unavailable in this conversation.")
+        path = self.directory(key) / "manifest.json"
+        try:
+            if path.resolve() != path.absolute() or path.stat().st_size > 1_000_000:
+                raise LookupError("Artifact is unavailable in this conversation.")
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                record.get("managed_by") != MARKER
+                or record.get("key") != key
+                or record.get("user_id") != user
+                or record.get("thread_id") != thread
+                or record.get("status") != "completed"
+            ):
+                raise LookupError("Artifact is unavailable in this conversation.")
+            for artifact in ToolResult.model_validate(record["result"]).artifacts:
+                if artifact.id == artifact_id:
+                    return artifact, self.validate_artifact(artifact)
+        except (ValueError, KeyError, OSError) as error:
+            raise LookupError("Artifact is unavailable in this conversation.") from error
+        raise LookupError("Artifact is unavailable in this conversation.")
+
     def lookup(self, artifact_id: str, user: str, thread: str) -> tuple[Artifact, Path]:
         """
         Find an artifact produced for one conversation. / 查找某个会话产出的产物。
@@ -320,6 +381,28 @@ class ArtifactStore:
         Raises:
             LookupError: If no matching artifact exists in this conversation. /
             此会话没有匹配产物时抛出。
+        """
+        located = self.locate(artifact_id, user, thread)
+        if located is None:
+            raise LookupError("Artifact is unavailable in this conversation.")
+        artifact, path, _key = located
+        return artifact, path
+
+    def locate(
+        self, artifact_id: str, user: str, thread: str
+    ) -> tuple[Artifact, Path, str] | None:
+        """
+        Find an artifact and the journal key that produced it. / 查找产物及其生成它的日志标识。
+
+        Args:
+            artifact_id: Artifact identifier from a recorded result. /
+            已记录结果中的产物标识。
+            user: Trusted user that must own the journal. / 必须拥有该日志的可信用户。
+            thread: Conversation that must own the journal. / 必须拥有该日志的会话。
+
+        Returns:
+            Artifact metadata, validated path and manifest key, or None. /
+            产物元数据、校验后路径与清单标识；未找到时为 None。
         """
         if self.root.is_dir() and KEY.fullmatch(artifact_id):
             for directory in self.root.iterdir():
@@ -339,7 +422,7 @@ class ArtifactStore:
                         continue
                     for artifact in ToolResult.model_validate(record["result"]).artifacts:
                         if artifact.id == artifact_id:
-                            return artifact, self.validate_artifact(artifact)
+                            return artifact, self.validate_artifact(artifact), directory.name
                 except (ValueError, KeyError, OSError):
                     continue
-        raise LookupError("Artifact is unavailable in this conversation.")
+        return None

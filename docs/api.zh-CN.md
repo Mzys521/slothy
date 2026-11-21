@@ -18,6 +18,9 @@
 | GET | `/ready` | 就绪检查；未配置模型运行时返回 503 |
 | GET | `/models` | 模型目录与默认模型 |
 | GET | `/runtime` | 能力快照：就绪状态、chat/work 工具名、缓存统计 |
+| GET | `/storage/recovery` | 启动存储状态及原数据是否可保留 |
+| POST | `/storage/recovery/adopt` | 备份并继续使用符合条件的原数据库 |
+| POST | `/storage/recovery/reset` | 验证备份后初始化新库 |
 
 ## 2. 模型服务与设置
 
@@ -29,7 +32,7 @@
 | DELETE | `/settings/providers/{id}` | 删除服务 |
 | POST | `/settings/providers/discover` | 用给定凭据请求 `{base_url}/models` |
 | POST | `/settings/providers/test-models` | 用真实小请求验证所选模型，支持部分成功 |
-| GET | `/settings/decision` | 决策模型选择与可用模型 ID |
+| GET | `/settings/decision` | 模型选择、可用模型 ID、模式、来源与可用性原因 |
 | PUT | `/settings/decision` | 选择/清除决策模型并重建 Runner |
 | GET | `/settings/search` | DeepSeek 搜索凭据状态（不含密钥） |
 | PUT | `/settings/search` | 保存独立搜索密钥 |
@@ -37,7 +40,7 @@
 | POST | `/settings/search/test` | 发起一次真实搜索测试 |
 | GET | `/settings` | 全局个性化开关 |
 | PATCH | `/settings` | 设置全局个性化开关 |
-| GET | `/settings/memory` | 记忆规划器配置（14 项，带 revision） |
+| GET | `/settings/memory` | 已保存与已生效版本、待应用状态和容量 |
 | PATCH | `/settings/memory` | 按 revision 校验更新配置 |
 
 ## 3. 账户
@@ -108,9 +111,9 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 不复制正文。直接身份问答跳过生成，从有效全局身份事实直答；缺失、待学习、待确认、冲突、关闭、
 读取失败分别提示。
 
-`/runtime` 新增 `storage_version=3` 和 `data_epoch`。首次启动 V3 仅一次重置三份业务数据库，
-不回放旧消息；模型/连接器配置文件、界面偏好和工作区实际文件保留。前端数据纪元变化时清除
-旧会话缓存，不再向新业务库导入旧浏览器消息。
+`/runtime` 返回 `storage_version` 和 `data_epoch`。Slothy 0.1.5 在打开已有业务库前核验结构。
+需要恢复时，普通路由返回 `503 STORAGE_RECOVERY_REQUIRED`，存储恢复接口仍可调用。恢复动作
+返回 `restart_required: true` 时，在重启后端后生效。
 
 ## 5. 工作区、会话与附件
 
@@ -122,10 +125,18 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 | GET/PATCH/DELETE | `/threads/{id}` | 读取 / 归档 / 删除会话 |
 | GET | `/threads/{id}/messages` | 已归档轮次（含活动、指标、溯源） |
 | DELETE | `/threads/{id}/messages` | 清空归档消息与未完成检查点 |
-| POST | `/threads/{id}/attachments` | 上传附件（原始 body，`filename` 查询参数） |
+| POST | `/threads/{id}/attachments` | 上传原始字节，查询参数含 `filename` 和可选 `file_request_id` |
 | GET | `/attachments` | 附件库 |
-| POST | `/threads/{id}/fork` | 分叉会话（复制历史与画像快照） |
+| POST | `/threads/{id}/fork` | 分叉会话，继承历史、画像快照与产物链接 |
 | GET | `/threads/{id}/memory-receipts` | 某次运行产生的记忆/候选回执 |
+| GET | `/operations/{id}` | 查看清理操作状态及已完成步骤 |
+
+清空消息、删除会话和删除工作区在清理完成后返回 `204`。收到 `202` 时，响应包含
+`operation_id`、`state` 和 `error`。可查询 `/operations/{id}`，直到 `state` 为
+`done` 或 `failed`。清理任务在重启后仍保留。
+
+在同一会话内复用 `file_request_id` 可取得已保存的附件。无法读取的文档返回
+`422 ATTACHMENT_UNREADABLE`。历史轮次可用 `missing: true` 标记缺失附件。
 
 ## 6. 聊天与运行控制
 
@@ -133,6 +144,7 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 |---|---|---|
 | POST | `/chat` | 发送消息；返回 `ChatResult`（JSON）或 SSE 流 |
 | POST | `/threads/{id}/resume` | 恢复暂停/中断的运行 |
+| GET | `/threads/{id}/run-status` | 按 `client_request_id` 或 `run_id` 对账最新运行 |
 | GET | `/threads/{id}/approval` | 读取该线程待审批批次 |
 | POST | `/threads/{id}/approval/{approval_id}` | 批准或拒绝待审批批次 |
 
@@ -141,6 +153,7 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 ```json
 {
   "thread_id": "uuid-or-null",
+  "client_request_id": "stable-id-for-this-submission",
   "message": "帮我把方案整理成文档",
   "mode": "work",
   "model": "provider/model-id",
@@ -156,6 +169,8 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 - `thread_id: null` 表示新建会话；`mode` 固定工具集（`chat` 仅安全工具，`work` 全部工具）。
 - 存在待审批时，非流式请求返回 **202** 与 `ToolReview`，而不是 `ChatResult`。
 - 线程存在未完成运行时，新消息返回 `409 RUN_PENDING`；需先恢复或清理。
+- 向已有会话重复发送同一提交时，应使用稳定的 `client_request_id`。已经完成的请求会返回保存的
+  结果。用同一 ID 提交不同的消息、附件或引用会返回 `409 REQUEST_CONFLICT`。
 
 ### 检查点恢复
 
@@ -163,11 +178,15 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 run ID、checkpoint ID、保存的模型选择、附件元数据、引用和活动。应用重启且无浏览器缓存时
 也能找回未完成轮次；已完成检查点缺失的归档会幂等补写。
 
-使用 `POST /threads/{id}/resume?stream=true&checkpoint_id=<预期ID>`，请求体为空对象。
-checkpoint ID 可省略，仅用于并发校验；状态变化返回 `409 CHECKPOINT_STALE`，不会按旧 ID
-回放历史。恢复始终读取最新检查点并保留原始输入，人工审批仍需走已有的显式审批接口。
-最新检查点已经完成时直接返回保存的结果，不重新调用模型；没有保存的运行时返回
-`409 NO_PENDING_RUN`。
+使用 `GET /threads/{id}/run-status` 对账最新运行。状态包括 `not_started`、`pending`、
+`awaiting_approval`、`completed` 和 `failed`，已完成时会附带保存的结果。没有配置模型时，
+仍可读取检查点和待审批记录。
+
+从检查点继续时，向 `/threads/{id}/resume?stream=true&run_id=<运行ID>&checkpoint_id=<预期ID>`
+发送空请求体。两个查询参数可用于校验身份与并发状态。运行不符返回 `409 RUN_MISMATCH`，
+检查点已变更返回 `409 CHECKPOINT_STALE`。恢复保留原始输入，人工审批继续使用专用接口。
+没有待继续运行且未指定运行身份时，返回 `409 NO_PENDING_RUN`。指定匹配的已完成运行，可在
+回执丢失后取回其结果。
 
 工具批次内已完成调用由 LangGraph task 保存，恢复时不重复执行。被中断的模型节点从节点
 边界重新生成，不支持 token 级接续。`/retry` 和“从检查点继续”使用此路径，不会静默重发

@@ -58,11 +58,32 @@ class MemoryRuntime(BaseModel):
     budgeted_tokens: int = 0
 
 
+class MemoryCapacity(BaseModel):
+    """Capacity plan for one active-memory limit.
+    / 单个有效记忆上限的容量计划。
+
+    ``protected`` is the minimum capacity that must stay active; ``required`` is how many
+    unprotected facts would be archived to reach ``limit``, and ``reachable`` says whether the
+    archivable candidates suffice. / ``protected`` 是必须保留的最低容量；``required`` 是为达到
+    ``limit`` 需要归档的非保护事实数；``reachable`` 表示可归档候选是否足够。
+    """
+
+    limit: int = 0
+    active: int = 0
+    protected: int = 0
+    required: int = 0
+    archivable: int = 0
+    reachable: bool = True
+
+
 class MemoryConfigurationPublic(BaseModel):
-    """Configuration revision with defaults and runtime state.
-    / 含默认值与运行时状态的配置修订。"""
+    """Configuration revision with defaults, application progress and runtime state.
+    / 含默认值、应用进度与运行时状态的配置修订。"""
 
     revision: int
+    applied_revision: int = 0
+    pending_application: bool = False
+    capacity: MemoryCapacity | None = None
     configuration: MemoryConfiguration
     defaults: MemoryConfiguration
     runtime: MemoryRuntime

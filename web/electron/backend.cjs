@@ -7,6 +7,7 @@
 const { spawn } = require('node:child_process')
 const { randomBytes } = require('node:crypto')
 const path = require('node:path')
+const { displayVersion, version } = require('../package.json')
 
 // This module is shipped; build and verification entry points are never packaged.
 // 本模块会随包发布；构建与验证入口永远不会被打包。
@@ -19,7 +20,7 @@ const path = require('node:path')
  * @param options.resourcesPath - Electron `process.resourcesPath`, used to locate the frozen service. / Electron `process.resourcesPath`，用于定位冻结服务。
  * @param options.userData - Per-user data directory; the backend stores its data under `data/`. / 每用户数据目录，后端数据放在其 `data/` 子目录。
  * @param options.development - Run the Python entry point from the virtualenv instead of the packaged exe. / 为 true 时使用虚拟环境中的 Python 入口而非打包 exe。
- * @returns Backend handle with `child`, `origin`, `token` and `getLastError()`. / 后端句柄，包含 `child`、`origin`、`token` 与 `getLastError()`。
+ * @returns Backend handle with `child`, `origin`, `token`, `recovery` and `getLastError()`. / 后端句柄，包含 `child`、`origin`、`token`、`recovery` 与 `getLastError()`。
  */
 async function startBackend({ resourcesPath, userData, development }) {
   // A fresh random token authorizes every API request for this process lifetime.
@@ -37,6 +38,7 @@ async function startBackend({ resourcesPath, userData, development }) {
   Object.assign(env, {
     SLOTHY_DESKTOP: '1', SLOTHY_DATA_DIR: path.join(userData, 'data'), SLOTHY_API_TOKEN: token,
     SLOTHY_PARENT_PID: String(process.pid),
+    SLOTHY_APP_VERSION: displayVersion || version,
     PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8',
   })
   if (development) env.PYTHONPATH = path.resolve(__dirname, '../../core')
@@ -80,7 +82,20 @@ async function startBackend({ resourcesPath, userData, development }) {
       await new Promise(resolve => setTimeout(resolve, 200))
     }
     if (!ready) throw new Error('slothy 服务未能完成初始化。' + lastError)
-    return { child, origin, token, getLastError: () => lastError }
+    // A missing or older storage marker must never delete business data implicitly; surface
+    // the backend recovery state so the main process can ask the user before loading the UI.
+    // 缺失或过旧的存储标记绝不会隐式删除业务数据；这里把后端的恢复状态交给主进程，先让用户选择。
+    let recovery = null
+    try {
+      const response = await fetch(origin + '/api/v1/storage/recovery', {
+        headers: { 'X-Slothy-Token': token }, signal: AbortSignal.timeout(2000),
+      })
+      if (response.ok) {
+        const state = await response.json()
+        if (state && state.required) recovery = state
+      }
+    } catch { /* Health already passed; an older service has no recovery surface. */ }
+    return { child, origin, token, recovery, getLastError: () => lastError }
   } catch (error) {
     child.kill()
     throw error

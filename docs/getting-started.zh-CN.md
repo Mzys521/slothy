@@ -110,8 +110,8 @@ npm run dev
 - **新建会话**：发一条消息，确认回复以流式返回。
 - **工具审批**：请求生成文档或执行命令时，运行会暂停并展示完整调用参数，批准后继续。
 - **记忆 V3**：陈述偏好、习惯、目标或事实后，后台模型会提炼语义概念与有证据的有向事实；
-  身份问答直接使用可靠事实，上下文面板展示实际提供的证据。首次启动 V3 会一次性重置三份业务
-  数据库（不会重新学习旧消息）——升级前请先导出需要保留的数据。
+  身份问答直接使用可靠事实，上下文面板展示实际提供的证据。Slothy 0.1.5 会在启动时核验已有
+  数据库。兼容的旧库需要迁移时，可在恢复提示中选择「继续使用原目录」，确认备份后再升级。
 
 ### 输入区命令与引用
 
@@ -126,25 +126,30 @@ npm run dev
 
 | 模式 | 数据目录 |
 |---|---|
-| 开发 | `core/data/`（检查点、会话归档、工作区记忆、产物） |
-| 安装版 | `%APPDATA%\slothy\data\` |
+| 安装版与 Electron 开发模式 | 默认是 `%APPDATA%\slothy\data\`。开发模式可用 `DESKTOP_USER_DATA` 指定父目录。 |
+| 独立后端 | 默认是 `core/data/`，可通过 `CHECKPOINT_SQLITE_PATH` 指定位置 |
 
-两者都包含 `checkpoints.sqlite`、`checkpoints.sessions.sqlite`、
-`checkpoints.workspace.sqlite`、`providers.json` 与 `artifacts/`。**记忆 V3**：首次启动
-V3 会一次性重置三份业务数据库；模型密钥、连接器配置文件、界面偏好与工作区实际文件保留。删除目录即可重置应用；
-备份目录即可保留记忆。
+桌面数据目录包含 `checkpoints.sqlite`、`checkpoints.sessions.sqlite`、
+`checkpoints.workspace.sqlite`、`providers.json` 与 `artifacts/`。复制数据目录前先退出 Slothy，
+以同时保留 SQLite 数据库及其日志。出现恢复提示时，「继续使用原目录」会先验证备份，再升级符合条件
+的旧库。「备份后重新开始」会在验证备份后初始化新库。详见 [0.1.5 发布说明](releases/0.1.5.md#简体中文)。
 
 ## 6. 构建 Windows 安装包
 
+先设置 Python 虚拟环境，再从仓库根目录运行以下命令。
+
 ```powershell
-cd ..\web
-python -m pip install "pyinstaller>=6"    # build:backend 需要，未包含在 [dev] 中
+.\core\.venv\Scripts\python.exe -m pip install -e "./core[documents]" "pyinstaller>=6"
+Set-Location .\web
+npm ci
 npm run build
+npm run production:audit
 ```
 
 构建分四步：渲染层构建（`vite build` + `vue-tsc`）、后端冻结（PyInstaller，
 `core/desktop/service.spec`）、发布准备、NSIS 打包（`electron-builder`）。
-安装包输出到 `web/release/slothy/`。
+0.1.5 Windows x64 安装包输出为 `web/release/slothy/0.1.5/slothy-0.1.5-x64-Setup.exe`。
+同目录还包含差分映射和解包版应用。构建产物位于本机。
 
 常用子命令：
 
@@ -165,6 +170,7 @@ cd core
 # 桌面端
 cd ..\web
 npm run typecheck
+node --test tests/*.test.mjs electron/directory.test.mjs
 npm run production:audit
 ```
 

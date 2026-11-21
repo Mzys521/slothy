@@ -121,8 +121,9 @@ First run checklist:
 - **Memory V3**: state a preference, habit, goal or fact. The background model
   extracts typed concepts and evidence-backed directed facts; identity questions
   answer from reliable facts, and the context panel shows the provided evidence.
-  On first V3 startup the three business databases reset once (old messages are not
-  relearned) — export anything you need before upgrading.
+  Slothy 0.1.5 checks existing stores on startup. If a compatible legacy store needs
+  migration, choose **继续使用原目录 (Keep existing data)** in the recovery dialog
+  to back it up before upgrading.
 
 ### Composer commands and references
 
@@ -140,27 +141,33 @@ received first, then the model gets a bounded preview and can page through the r
 
 | Mode | Data directory |
 |---|---|
-| Development | `core/data/` (checkpoints, session archive, workspace memory, artifacts) |
-| Installed app | `%APPDATA%\slothy\data\` |
+| Desktop app and Electron development | `%APPDATA%\slothy\data\` by default. In development, `DESKTOP_USER_DATA` can override the parent directory. |
+| Standalone backend | `core/data/` by default, or the location configured in `CHECKPOINT_SQLITE_PATH` |
 
-Both contain `checkpoints.sqlite`, `checkpoints.sessions.sqlite`,
-`checkpoints.workspace.sqlite`, `providers.json` and `artifacts/`. **Memory V3**:
-the first V3 startup resets the three business databases once; provider keys,
-connector configuration files, UI preferences and workspace files remain. Delete the
-directory to reset the app; back it up to keep your memory.
+The desktop data directory contains `checkpoints.sqlite`, `checkpoints.sessions.sqlite`,
+`checkpoints.workspace.sqlite`, `providers.json` and `artifacts/`. Close Slothy before
+copying its data directory so SQLite files and their journals stay together. If Slothy
+opens the recovery dialog, **继续使用原目录 (Keep existing data)** upgrades an
+eligible store after verifying a backup. **备份后重新开始 (Back up and start fresh)**
+creates a new store after verifying the backup. See the [0.1.5 release notes](releases/0.1.5.md#english).
 
 ## 6. Build a Windows installer
 
+Run these commands from the repository root after setting up the Python virtual environment.
+
 ```powershell
-cd ..\web
-python -m pip install "pyinstaller>=6"    # required by build:backend, not in [dev]
+.\core\.venv\Scripts\python.exe -m pip install -e "./core[documents]" "pyinstaller>=6"
+Set-Location .\web
+npm ci
 npm run build
+npm run production:audit
 ```
 
 The build runs four steps: renderer build (`vite build` + `vue-tsc`), backend
 freeze (PyInstaller, `core/desktop/service.spec`), release preparation, and
-NSIS packaging (`electron-builder`). The installer is written to
-`web/release/slothy/`.
+NSIS packaging (`electron-builder`). The 0.1.5 Windows x64 installer is
+`web/release/slothy/0.1.5/slothy-0.1.5-x64-Setup.exe`. This folder also holds the
+blockmap and unpacked app. The build output is local.
 
 Useful variants:
 
@@ -181,6 +188,7 @@ cd core
 # desktop
 cd ..\web
 npm run typecheck
+node --test tests/*.test.mjs electron/directory.test.mjs
 npm run production:audit
 ```
 

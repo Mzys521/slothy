@@ -8,15 +8,12 @@ from anyio import CancelScope
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, StateSnapshot
 
-from app.agent.activity import run_activity
 from app.agent.graph import AgentState, build_graph_config, create_initial_state
 from app.agent.graph.review import ApprovalPolicy, pending_review
-from app.agent.metrics import run_metrics
-from app.agent.reasoning import reasoning_text
 from app.concurrency import SessionLocks
 from app.config import AgentSettings
-from app.conversations import ConversationTurn, ConversationWriter
-from app.services.recovery import checkpoint_state
+from app.conversations import ConversationWriter
+from app.services.recovery import ConversationArchiver, checkpoint_state
 
 
 class AgentRunner:
@@ -53,6 +50,7 @@ class AgentRunner:
         self.graph = graph
         self.settings = settings if settings is not None else AgentSettings()
         self.conversation_writer = conversation_writer
+        self.archiver = ConversationArchiver(conversation_writer)
         self._locks = SessionLocks()
 
     async def archive_completed(self, snapshot: StateSnapshot) -> None:
@@ -61,29 +59,7 @@ class AgentRunner:
         Args:
             snapshot: Saved checkpoint snapshot. / 已保存的快照。
         """
-        if self.conversation_writer is None or snapshot.next or not snapshot.values.get("response"):
-            return
-        values = snapshot.values
-        await self.conversation_writer.save_turn(
-            ConversationTurn(
-                values["user_id"],
-                values["thread_id"],
-                values["run_id"],
-                values["user_input"],
-                values["response"],
-                reasoning=reasoning_text(values.get("messages", [])),
-                learn_memory=values.get("personalization_enabled", False)
-                and values.get("response_source") != "identity_fact",
-                project_id=values.get("project_id"),
-                attachment_ids=tuple(values.get("attachment_ids", ())),
-                activity=tuple(run_activity(values)),
-                metrics=run_metrics(values),
-                used_memory_ids=tuple(values.get("used_memory_ids", ())),
-                profile_version=values.get("profile_version"),
-                references=tuple(values.get("resolved_references", ())),
-                memory_trace=values.get("memory_trace", {}),
-            )
-        )
+        await self.archiver.archive_completed(snapshot)
 
     async def ainvoke(
         self,

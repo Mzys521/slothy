@@ -199,6 +199,57 @@ async function createWindow() {
   mainWindow.show()
 }
 
+/**
+ * Asks the user how to treat existing business data and applies the chosen recovery action.
+ *
+ * 询问用户如何处理已有业务数据，并执行所选恢复操作；任何情况下都不隐式删除数据。
+ *
+ * @param backendHandle - Handle returned by `startBackend` carrying `recovery`. / 携带恢复状态的后端句柄。
+ * @returns `true` to restart the backend with the decision applied, `false` to quit. / `true` 表示重启后端应用该决定，`false` 表示退出。
+ */
+async function resolveStorageRecovery(backendHandle) {
+  const state = backendHandle.recovery ?? {}
+  const databases = (state.databases ?? [])
+    .map(item => `${item.name}: ${item.status}${item.detail ? ' (' + item.detail + ')' : ''}`)
+    .join('\n')
+  const keepable = state.status === 'legacy' || state.status === 'empty'
+  const buttons = keepable
+    ? ['继续使用原目录', '备份后重新开始', '退出']
+    : ['备份后重新开始', '退出']
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    title: desktop.productName,
+    message: '已有业务数据需要确认',
+    detail: (state.detail || '业务数据结构无法直接使用。') +
+      '\n不会自动删除任何数据。' +
+      (keepable ? '\n「继续使用原目录」会先备份，再用当前迁移升级原数据。' : '') +
+      '\n「备份后重新开始」会先备份并校验，然后创建新库。' +
+      (databases ? '\n\n' + databases : ''),
+    buttons,
+    defaultId: 0,
+    cancelId: buttons.length - 1,
+    noLink: true,
+  })
+  if (response >= buttons.length - 1) return false
+  const action = keepable && response === 0 ? 'adopt' : 'reset'
+  const result = await fetch(`${backendHandle.origin}/api/v1/storage/recovery/${action}`, {
+    method: 'POST', headers: { 'X-Slothy-Token': backendHandle.token },
+    signal: AbortSignal.timeout(120_000),
+  })
+  if (!result.ok) {
+    const body = await result.json().catch(() => ({}))
+    throw new Error(body.message || `存储恢复失败 (${result.status})。`)
+  }
+  const applied = await result.json().catch(() => ({}))
+  if (action === 'reset') {
+    dialog.showMessageBox({
+      type: 'info', title: desktop.productName, message: '已备份原数据并重新开始',
+      detail: applied.backup ? `备份目录：${applied.backup}` : '已完成。', buttons: ['继续'], noLink: true,
+    }).catch(() => {})
+  }
+  return true
+}
+
 app.setName(desktop.productName)
 app.setAppUserModelId(desktop.appId)
 if (!app.isPackaged && process.env.DESKTOP_USER_DATA) app.setPath('userData', process.env.DESKTOP_USER_DATA)
@@ -211,7 +262,15 @@ app.on('second-instance', () => {
 app.whenReady().then(async () => {
   if (!ownsInstance) return
   if (app.isPackaged || !process.env.DESKTOP_API_ORIGIN) {
-    backend = await startBackend({ resourcesPath: process.resourcesPath, userData: app.getPath('userData'), development: !app.isPackaged })
+    const start = () => startBackend({ resourcesPath: process.resourcesPath, userData: app.getPath('userData'), development: !app.isPackaged })
+    backend = await start()
+    if (backend.recovery) {
+      if (!await resolveStorageRecovery(backend)) { app.quit(); return }
+      // The decision only takes effect when the service reopens its stores.
+      // 恢复决定需要服务重新打开存储后才生效。
+      await stopBackend(backend)
+      backend = await start()
+    }
     api = new URL(backend.origin)
     backend.child.once('exit', code => {
       if (!quitting) {

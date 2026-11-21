@@ -5,6 +5,21 @@ import { ApiError, workRequest, type ModelItem } from './workApi'
 import { loadMemorySettings, saveMemorySettings, type MemoryConfiguration, type MemoryConfigurationPublic } from './memorySettings'
 
 type NumberKey = Exclude<keyof MemoryConfiguration, 'mode' | 'model'>
+/** Capacity decision reported with the saved configuration. / 随已保存配置上报的容量决策。 */
+type CapacityPlan = {
+  limit: number
+  active: number
+  protected: number
+  required: number
+  archivable: number
+  reachable: boolean
+}
+/** Public payload plus saved-versus-applied progress. / 公开载荷及保存与生效进度。 */
+type MemorySettingsState = MemoryConfigurationPublic & {
+  applied_revision?: number
+  pending_application?: boolean
+  capacity?: CapacityPlan | null
+}
 /** Numeric planner setting rendered as a labelled input with min/max bounds. / 以带最小/最大边界的标签输入框呈现的数值型规划器设置。 */
 type NumberField = {
   key: NumberKey
@@ -31,7 +46,7 @@ const groups: { id: string; title: [string, string]; fields: NumberField[] }[] =
     { key: 'daily_token_budget', en: 'Daily token budget', zh: '每日 Token 预算', description: ['Daily model budget for the planner. Zero disables planner model calls.', '规划器每日模型用量上限；设为 0 表示不允许规划器调用模型。'], unit: ['tokens', 'tokens'], min: 0, max: 10000000 },
   ] },
 ]
-const state = ref<MemoryConfigurationPublic>()
+const state = ref<MemorySettingsState>()
 const draft = ref<MemoryConfiguration>()
 const loading = ref(true)
 const saving = ref(false)
@@ -40,6 +55,7 @@ const error = ref('')
 const toggleError = ref('')
 const notice = ref('')
 const conflict = ref(false)
+const capacityConflict = ref(false)
 const models = ref<ModelItem[]>([])
 const modelsLoading = ref(false)
 const modelsError = ref('')
@@ -51,6 +67,28 @@ const enabled = computed(() => state.value?.runtime.personalization_enabled ?? f
 const llmLearning = computed(() => state.value?.runtime.engine === 'llm_learning')
 /** Settings keys the active engine currently applies; others are saved as reserved values. / 当前引擎实际生效的设置键；其余键仅作为预留值保存。 */
 const appliedFields = computed(() => new Set(state.value?.runtime.applied_fields ?? []))
+/** Revision whose capacity and profile changes are actually in effect. / 容量与画像实际生效的修订号。 */
+const appliedRevision = computed(() => state.value?.applied_revision ?? state.value?.revision ?? 0)
+/** True while the saved revision is ahead of the applied one. / 已保存修订领先于已生效修订时为 true。 */
+const pendingApplication = computed(() => state.value?.pending_application === true)
+/** Capacity decision for the saved configuration. / 已保存配置的容量决策。 */
+const capacity = computed(() => state.value?.capacity ?? null)
+/** Attempted active limit shown in the structured capacity conflict. / 结构化容量冲突中展示的目标上限。 */
+const capacityLimit = computed(() => draft.value?.active_limit ?? 0)
+/** Active protected facts that cannot be archived automatically. / 无法自动归档的有效受保护事实数。 */
+const protectedCount = computed(() => capacity.value?.protected ?? 0)
+/** Protected facts that must leave the active set before the limit is reachable. / 需先退出有效集合的受保护事实数。 */
+const capacityGap = computed(() => Math.max(0, protectedCount.value - capacityLimit.value))
+/** Bilingual explanation of the structured capacity conflict. / 结构化容量冲突的双语说明。 */
+const capacityMessage = computed(() => t(
+  `A limit of ${capacityLimit.value} is below the ${protectedCount.value} protected memories. Archive or unprotect at least ${capacityGap.value} protected ${capacityGap.value === 1 ? 'memory' : 'memories'} before lowering the limit. The saved revision was not changed.`,
+  `上限 ${capacityLimit.value} 低于 ${protectedCount.value} 条受保护记忆。请先归档或取消保护至少 ${capacityGap.value} 条受保护记忆，再降低上限；已保存的修订没有改变。`,
+))
+/** Bilingual explanation of the saved-versus-applied gap. / 已保存与已生效修订差距的双语说明。 */
+const pendingMessage = computed(() => t(
+  `Saved as revision ${state.value?.revision ?? 0}; revision ${appliedRevision.value} is still in effect. Capacity and profile updates will be applied automatically or when the app restarts.`,
+  `配置已保存为第 ${state.value?.revision ?? 0} 版；当前生效的是第 ${appliedRevision.value} 版。容量与画像更新会自动重试，或在应用重启后继续应用。`,
+))
 /** Human-readable summary of the active memory engine and processing mode. / 当前记忆引擎与处理模式的可读摘要。 */
 const engineDescription = computed(() => {
   if (!enabled.value) return t('Personalized memory is off', '定制记忆已关闭')
@@ -94,9 +132,22 @@ function accept(value: MemoryConfigurationPublic) {
 async function load() {
   if (saving.value || toggling.value) return
   loading.value = true; error.value = ''; notice.value = ''
-  try { accept(await loadMemorySettings()); conflict.value = false }
+  try { accept(await loadMemorySettings()); conflict.value = false; capacityConflict.value = false }
   catch (reason) { error.value = message(reason) }
   finally { loading.value = false }
+}
+/** Refreshes only application progress and capacity without discarding the draft. / 仅刷新应用进度与容量，不丢弃草稿。 */
+async function refreshProgress() {
+  try {
+    const latest = (await loadMemorySettings()) as MemorySettingsState
+    if (!state.value) return
+    state.value.revision = latest.revision
+    state.value.applied_revision = latest.applied_revision
+    state.value.pending_application = latest.pending_application
+    state.value.capacity = latest.capacity
+    state.value.runtime = latest.runtime
+    settings.personalizedMemory = latest.runtime.personalization_enabled
+  } catch (reason) { error.value = message(reason) }
 }
 /** Loads configured models for the planner-model datalist. / 为规划模型候选列表加载已配置的模型。 */
 async function loadModels() {
@@ -116,20 +167,37 @@ async function toggle() {
   } catch (reason) { toggleError.value = message(reason) }
   finally { toggling.value = false }
 }
-/** Saves the draft using the last known revision, flagging 409 conflicts. / 使用最近已知版本保存草稿，并标记 409 冲突。 */
+/** Saves the draft using the last known revision, flagging conflicts and pending application. / 使用最近已知版本保存草稿，并标记冲突与待生效状态。 */
 async function save() {
-  if (!state.value || !payload.value || saving.value || !dirty.value || conflict.value) return
+  if (!state.value || !payload.value || saving.value || !dirty.value || conflict.value || capacityConflict.value) return
   saving.value = true; error.value = ''; notice.value = ''
   try {
-    accept(await saveMemorySettings(payload.value, state.value.revision))
-    notice.value = llmLearning.value
-      ? t('Saved. Active settings apply to the next background batch.', '已保存，生效参数将用于下一批后台学习。')
-      : t('Configuration saved for the memory planner.', '记忆规划器配置已保存。')
+    const saved = (await saveMemorySettings(payload.value, state.value.revision)) as MemorySettingsState
+    accept(saved)
+    capacityConflict.value = false
+    notice.value = saved.pending_application
+      ? t(
+          `Saved as revision ${saved.revision}, not in effect yet. Application will be retried automatically or after a restart.`,
+          `配置已保存为第 ${saved.revision} 版，但尚未生效。系统会自动重试，或在重启后继续应用。`,
+        )
+      : llmLearning.value
+        ? t('Saved. Active settings apply to the next background batch.', '已保存，生效参数将用于下一批后台学习。')
+        : t('Configuration saved for the memory planner.', '记忆规划器配置已保存。')
   } catch (reason) {
-    conflict.value = reason instanceof ApiError && reason.status === 409
-    error.value = conflict.value
-      ? t('These settings were changed elsewhere. Your draft is kept; load the latest settings before editing again.', '配置已在其他窗口更新。当前草稿已保留，请加载最新配置后重新编辑。')
-      : message(reason)
+    const apiError = reason instanceof ApiError ? reason : undefined
+    if (apiError?.status === 409 && apiError.code === 'MEMORY_CAPACITY_PROTECTED') {
+      // The server rejected the limit before writing; keep the draft and show the structured gap.
+      // 服务端在写入前拒绝了该上限；保留草稿并展示结构化的容量缺口。
+      capacityConflict.value = true
+      conflict.value = false
+      error.value = ''
+      await refreshProgress()
+    } else {
+      conflict.value = apiError?.status === 409
+      error.value = conflict.value
+        ? t('These settings were changed elsewhere. Your draft is kept; load the latest settings before editing again.', '配置已在其他窗口更新。当前草稿已保留，请加载最新配置后重新编辑。')
+        : message(reason)
+    }
   } finally { saving.value = false }
 }
 /**
@@ -144,10 +212,11 @@ function reset(toDefaults = false) {
   if (!state.value || saving.value) return
   draft.value = { ...(toDefaults ? state.value.defaults : state.value.configuration) }
   notice.value = toDefaults ? t('Defaults restored in this draft. Save to keep them.', '已在草稿中恢复默认值，保存后才会写入。') : ''
+  capacityConflict.value = false
   if (!conflict.value) error.value = ''
 }
-// Clear the saved notice as soon as the user edits the draft. / 用户一修改草稿就清除“已保存”提示。
-watch(draft, () => { notice.value = '' }, { deep: true, flush: 'sync' })
+// Clear saved/conflict notices as soon as the user edits the draft. / 用户一修改草稿就清除“已保存”与冲突提示。
+watch(draft, () => { notice.value = ''; capacityConflict.value = false }, { deep: true, flush: 'sync' })
 // Load configuration and model list on mount. / 挂载时加载配置与模型列表。
 onMounted(() => { void load(); void loadModels() })
 </script>
@@ -175,10 +244,20 @@ onMounted(() => { void load(); void loadModels() })
         </template>
         <p v-else>{{ t('The legacy rule-and-review engine is active.', '当前使用兼容的规则提取与审核引擎。') }}</p>
       </div>
+      <div v-if="pendingApplication" class="memory-config-status" role="status">
+        <p>{{ pendingMessage }}</p>
+        <p v-if="capacity && !capacity.reachable">{{ capacityMessage }}</p>
+        <button class="quiet-button" type="button" :disabled="saving || loading" @click="refreshProgress">{{ t('Refresh application status', '刷新生效状态') }}</button>
+      </div>
+      <div v-if="capacityConflict" class="memory-config-error" role="alert">
+        <p>{{ capacityMessage }}</p>
+        <button class="quiet-button" type="button" :disabled="saving" @click="capacityConflict = false">{{ t('Adjust the limit', '调整上限') }}</button>
+      </div>
+      <p v-if="capacity" class="memory-config-status">{{ t(`Capacity · ${capacity.active} active · ${capacity.protected} protected · limit ${capacity.limit}`, `容量 · 有效 ${capacity.active} 条 · 受保护 ${capacity.protected} 条 · 上限 ${capacity.limit}`) }}</p>
       <form class="memory-config-form" @submit.prevent="save">
         <fieldset :disabled="saving || toggling || conflict">
           <section class="memory-config-section" aria-labelledby="memory-planner-title">
-            <header><h2 id="memory-planner-title">{{ t('Memory planner configuration', '记忆规划器配置') }}</h2><span>{{ llmLearning ? t('Live configuration', '运行配置') : t('Preconfiguration', '预配置') }} · v{{ state.revision }}</span></header>
+            <header><h2 id="memory-planner-title">{{ t('Memory planner configuration', '记忆规划器配置') }}</h2><span>{{ llmLearning ? t('Live configuration', '运行配置') : t('Preconfiguration', '预配置') }} · v{{ state.revision }}<template v-if="pendingApplication"> · {{ t('in effect', '已生效') }} v{{ appliedRevision }}</template></span></header>
             <div class="setting">
               <div><h3 id="memory-mode-label">{{ t('Processing mode', '处理模式') }}</h3><p>{{ selectedMode?.description }}</p></div>
               <select v-model="draft.mode" aria-labelledby="memory-mode-label"><option v-for="mode in modes" :key="mode.id" :value="mode.id">{{ mode.label }}</option></select>
@@ -205,8 +284,8 @@ onMounted(() => { void load(); void loadModels() })
           </details>
         </fieldset>
         <footer class="memory-config-actions">
-          <p role="status" aria-live="polite">{{ notice || (dirty ? t('Unsaved changes', '有未保存的修改') : state.revision ? t('Saved on this device’s server', '配置保存在本机服务端') : t('Deployment defaults · not saved yet', '部署默认值 · 尚未保存')) }}</p>
-          <div><button type="button" class="quiet-button" :disabled="saving || conflict" @click="reset(true)">{{ t('Restore defaults', '恢复默认值') }}</button><button type="button" class="quiet-button" :disabled="saving || !dirty || conflict" @click="reset()">{{ t('Discard', '撤销修改') }}</button><button type="submit" class="accent-button" :disabled="saving || toggling || !dirty || conflict">{{ saving ? t('Saving…', '正在保存…') : t('Save configuration', '保存配置') }}</button></div>
+          <p role="status" aria-live="polite">{{ notice || (pendingApplication ? t('Saved but not applied yet', '已保存但尚未生效') : dirty ? t('Unsaved changes', '有未保存的修改') : state.revision ? t('Saved on this device’s server', '配置保存在本机服务端') : t('Deployment defaults · not saved yet', '部署默认值 · 尚未保存')) }}</p>
+          <div><button type="button" class="quiet-button" :disabled="saving || conflict" @click="reset(true)">{{ t('Restore defaults', '恢复默认值') }}</button><button type="button" class="quiet-button" :disabled="saving || !dirty || conflict" @click="reset()">{{ t('Discard', '撤销修改') }}</button><button type="submit" class="accent-button" :disabled="saving || toggling || !dirty || conflict || capacityConflict">{{ saving ? t('Saving…', '正在保存…') : t('Save configuration', '保存配置') }}</button></div>
         </footer>
       </form>
     </template>

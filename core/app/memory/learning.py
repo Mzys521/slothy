@@ -269,9 +269,13 @@ class MemoryLearner:
             await wake.wait()
             wake.clear()
             try:
+                configuration_retry = await self.resume_pending_configurations()
+                projection_retry = await self.retry_pending_projections()
                 jobs = await self.conversations.learning_jobs()
                 if not jobs:
                     delay = await self.conversations.learning_retry_delay()
+                    if projection_retry or configuration_retry:
+                        delay = 30 if delay is None else min(30, delay)
                 else:
                     _, configuration = await self.configuration(jobs[0][1])
                     if (
@@ -299,6 +303,71 @@ class MemoryLearner:
                     await asyncio.wait_for(wake.wait(), timeout=30)
                 except TimeoutError:
                     wake.set()
+
+    async def resume_pending_configurations(self):
+        """Apply saved memory configurations whose capacity reconciliation did not finish.
+
+        The save records the revision as pending, so this worker retries transient apply
+        failures without waiting for another settings edit or a restart. / 保存会把修订标记为
+        待应用，因此工作器无需等待新的设置修改或重启即可重试暂时性失败。
+
+        Returns:
+            True when at least one revision still needs another attempt.
+            / 仍有修订需要再次尝试时为 True。
+        """
+
+        resume = getattr(self.evolution, "resume_pending_configurations", None)
+        if resume is None:
+            return False
+        try:
+            return await resume()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not resume pending memory configurations", exc_info=False)
+            return True
+
+    async def retry_pending_projections(self):
+        """Rebuild profiles whose projection failed in an earlier batch.
+
+        The needs-rebuild marker is committed together with the facts that required it, so this
+        worker converges the projection without waiting for another batch to happen. Learning
+        jobs keep settling independently. / 待重建标记与需要它的事实一同提交，因此工作器无需等待
+        下一批学习即可收敛投影；学习任务仍独立结算。
+
+        Returns:
+            True when at least one projection still needs another attempt.
+            / 仍有投影需要再次尝试时为 True。
+        """
+
+        pending = getattr(self.evolution, "pending_rebuilds", None)
+        retry = getattr(self.evolution, "retry_projection", None)
+        if pending is None or retry is None:
+            return False
+        try:
+            users = await pending()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Could not read pending profile projections", exc_info=False)
+            return True
+        remaining = False
+        for user in users:
+            try:
+                _, configuration = await self.configuration(user)
+                if (
+                    configuration.mode == "off"
+                    or not await self.conversations.personalization_enabled(user)
+                ):
+                    continue
+                if not await retry(user):
+                    remaining = True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                remaining = True
+                logger.warning("Memory profile projection retry failed", exc_info=False)
+        return remaining
 
     async def process_jobs(self, jobs: list[tuple]):
         """Process one homogeneous batch of queued turns.
@@ -862,6 +931,11 @@ class MemoryLearner:
                 row = await self.conversations.learning_metadata(user, turn["thread"], turn["run"])
                 if not row or row["state"] != 1 or row["generation"] != turn["generation"]:
                     raise PlanningError("MEMORY_STATE_CHANGED")
+                # A late result for a session that is being cleared or deleted must never write
+                # memories back after the cleanup decided to remove them. / 正在清空或删除的会话
+                # 的迟到结果不得在清理后又写回记忆。
+                if await self.conversations.cleanup_pending(user, turn["thread"]):
+                    raise PlanningError("MEMORY_STATE_CHANGED")
             applied = 0
             if configuration.mode != "shadow":
                 for candidate in sorted(
@@ -870,18 +944,21 @@ class MemoryLearner:
                 ):
                     applied += await self._apply(user, candidate, configuration)
                 # Profile projection must never wedge the durable learning queue: a broken
-                # projection is logged and the turns still settle, so the next batch can retry.
-                # 画像投影不得卡死持久学习队列：投影失败只记录日志，轮次仍正常结算，
-                # 下一批可再次尝试投影。
+                # projection is recorded in this fact transaction and retried by the worker,
+                # while the turns still settle. / 画像投影不得卡死持久学习队列：投影失败会在本次
+                # 事实事务中记录，由工作器重试，轮次仍正常结算。
                 try:
                     async with asyncio.timeout(15):
                         await self.evolution.rebuild(user)
                         await self.evolution.refresh_relationships(user)
                 except Exception:
                     logger.warning(
-                        "Memory profile projection failed; learning queue continues",
+                        "Memory profile projection failed; queued for retry",
                         exc_info=False,
                     )
+                    mark = getattr(self.evolution, "mark_rebuild_pending", None)
+                    if mark is not None:
+                        await mark(user)
             for turn in state["turns"]:
                 await self.evolution.db.execute(
                     "INSERT OR IGNORE INTO memory_learning_turns VALUES(?,?,?,?,?)",

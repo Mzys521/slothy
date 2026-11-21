@@ -6,10 +6,12 @@ profiles, attachments and provider settings.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import secrets
+import tempfile
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import aclosing, asynccontextmanager, suppress
 from functools import cache, partial
@@ -38,13 +40,23 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.accounts import AccountActivity, summarize_activity, validate_avatar
 from app.agent.activity import RunActivity, run_activity
+from app.agent.decision.resolution import (
+    DecisionResolution,
+    disabled_resolution,
+    resolve_decision_settings,
+)
 from app.agent.decision.settings_store import DecisionConfigStore
-from app.agent.graph import AgentServices, build_agent_graph, build_graph_config
+from app.agent.graph import (
+    AgentServices,
+    build_agent_graph,
+    build_graph_config,
+    build_readonly_graph,
+)
 from app.agent.graph.review import ApprovalPolicy, pending_review
 from app.agent.graph.services import HistorySummaryResult
 from app.agent.metrics import RunMetrics, run_metrics
 from app.agent.prompting.history import extractive_summary
-from app.agent.prompting.plan import canonical
+from app.agent.prompting.plan import ContextLimitExceeded, canonical
 from app.agent.prompting.sections import PromptSection, assemble_sections
 from app.agent.prompting.telemetry import PromptTelemetry
 from app.agent.prompts.system import BASE_SYSTEM_PROMPT
@@ -66,12 +78,21 @@ from app.config import (
 from app.connectors.api import router as connectors_router
 from app.connectors.registry import ConnectorRegistry
 from app.infrastructure.checkpoints import SQLiteCheckpointStore
-from app.infrastructure.conversations import SQLiteConversationStore
+from app.infrastructure.conversations import CleanupPending, SQLiteConversationStore
 from app.infrastructure.directories import WorkspaceDirectories
 from app.infrastructure.llm import OpenAICompatibleProvider
 from app.infrastructure.llm.catalog import ModelItem, configured_models
 from app.infrastructure.prompt_cache import CachedMemoryReader, ProfileSnapshots
-from app.infrastructure.storage_version import prepare_storage
+from app.infrastructure.storage_version import (
+    STORAGE_VERSION,
+    StorageRecoveryRequired,
+    StorageState,
+    backup_databases,
+    inspect_storage,
+    mark_storage_current,
+    prepare_storage,
+    reset_storage,
+)
 from app.infrastructure.workspace import (
     PROFILE_HISTORY_LIMIT,
     BoundedWorkspaceContext,
@@ -100,11 +121,13 @@ from app.providers import (
 )
 from app.references import ReferenceInput, ReferenceResolver
 from app.services import AgentRunner
-from app.services.recovery import checkpoint_state
+from app.services.recovery import CheckpointReader, ConversationArchiver, run_status
+from app.services.thread_lifecycle import ThreadLifecycle
 from app.tools.artifacts import ArtifactStore
 from app.tools.contracts import ToolOperationError
 from app.tools.read_attachment import (
     MAX_ATTACHMENTS,
+    MAX_THREAD_UPLOAD_BYTES,
     MAX_UPLOAD_BYTES,
     read_attachment,
 )
@@ -117,6 +140,14 @@ ORIGINS = [
 ]
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
 Mode = Literal["chat", "work"]
+# Only these paths stay reachable while business data awaits a recovery decision. /
+# 等待恢复决定时仅下列路径可用。
+RECOVERY_PATHS = {
+    "/api/v1/health",
+    "/api/v1/storage/recovery",
+    "/api/v1/storage/recovery/adopt",
+    "/api/v1/storage/recovery/reset",
+}
 router = APIRouter()
 
 
@@ -206,6 +237,9 @@ class ChatInput(Input):
     personalization_enabled: bool | None = None
     stream: bool = False
     approval_policy: ApprovalPolicy = "ask"
+    # Stable local turn identity; the server claims exactly one run per request id.
+    # 稳定的本地轮次标识；服务端据此保证一个逻辑请求只有一个运行。
+    client_request_id: Identifier | None = None
 
     @model_validator(mode="after")
     def validate_content(self):
@@ -330,6 +364,7 @@ class ThreadMessage(BaseModel):
     used_reference_ids: list[str] = Field(default_factory=list)
     memory_trace: dict = Field(default_factory=dict)
     response_source: str = "model"
+    client_request_id: str | None = None
 
 
 class Attachment(BaseModel):
@@ -338,6 +373,10 @@ class Attachment(BaseModel):
     id: str
     filename: str
     byte_size: int
+    # A later clear may remove a file referenced by an older turn; the marker keeps the rest
+    # of the page readable instead of invalidating the whole history.
+    # 后续清空可能删除旧轮次引用的文件；该标记保证其余历史仍可读，而不是让整页失效。
+    missing: bool = False
 
 
 class LibraryAttachment(Attachment):
@@ -374,6 +413,7 @@ class PendingRun(BaseModel):
     personalization_enabled: bool = False
     activity: list[RunActivity] = Field(default_factory=list)
     metrics: RunMetrics | None = None
+    client_request_id: str | None = None
 
 
 class ModelList(BaseModel):
@@ -445,6 +485,30 @@ class ChatResult(BaseModel):
     used_reference_ids: list[str] = Field(default_factory=list)
     memory_trace: dict = Field(default_factory=dict)
     response_source: str = "model"
+
+
+class RunStatusResponse(BaseModel):
+    """Read-only lifecycle status of one logical run. / 一次逻辑运行的只读生命周期状态。"""
+
+    status: Literal["not_started", "pending", "awaiting_approval", "completed", "failed"]
+    run_id: str | None = None
+    checkpoint_id: str | None = None
+    message: str = ""
+    archived: bool = False
+    client_request_id: str | None = None
+    result: ChatResult | None = None
+
+
+class CleanupStatus(BaseModel):
+    """Durable cleanup task state. / 持久化清理任务状态。"""
+
+    id: str
+    kind: str
+    target_id: str
+    threads: list[str] = Field(default_factory=list)
+    steps: list[str] = Field(default_factory=list)
+    state: Literal["pending", "running", "failed", "done"]
+    error: str | None = None
 
 
 MemoryType = Literal["episodic", "semantic", "preference", "identity", "skill"]
@@ -833,6 +897,10 @@ async def require_thread(request: Request, thread_id: str, *, writable: bool = F
         raise problem(404, "NOT_FOUND", "Session does not exist.")
     if writable and thread["archived"]:
         raise problem(409, "SESSION_ARCHIVED", "Restore this session before changing it.")
+    if writable and await store(request).thread_cleanup_state(LOCAL_USER, thread_id) is not None:
+        raise problem(
+            409, "SESSION_CLEANING", "This session is being cleared; wait for it to finish."
+        )
     return thread
 
 
@@ -845,6 +913,187 @@ async def health() -> dict:
     """
 
     return {"status": "ok"}
+
+
+class StorageRecoveryStatus(BaseModel):
+    """Startup storage decision surfaced to the desktop shell. / 桌面壳可见的存储恢复状态。"""
+
+    required: bool
+    status: str
+    version: int
+    detail: str
+    adoptable: bool = False
+    databases: list[dict] = Field(default_factory=list)
+    backup: str | None = None
+    restart_required: bool = False
+
+
+def recovery_payload(state: StorageState | None, **extra) -> dict:
+    """Project a recovery state for the desktop shell. / 把恢复状态投影给桌面壳。
+
+    Args:
+        state: Inspected state, or None when storage is usable. / 已核验状态；可用时为 None。
+        extra: Additional response fields such as the backup directory. / 备份目录等附加字段。
+
+    Returns:
+        A JSON-safe recovery payload. / 可安全序列化的恢复载荷。
+    """
+    if state is None:
+        return {
+            "required": False,
+            "status": "current",
+            "version": STORAGE_VERSION,
+            "detail": "",
+            "adoptable": False,
+            "databases": [],
+            **extra,
+        }
+    return {"required": True, **state.as_dict(), **extra}
+
+
+@router.get("/storage/recovery", response_model=StorageRecoveryStatus)
+async def storage_recovery(request: Request):
+    """Report whether startup storage needs an explicit decision. / 报告启动存储是否需要显式决定。
+
+    Args:
+        request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
+
+    Returns:
+        The pending recovery state, or a current status when none is pending. /
+        待处理恢复状态；无待处理时返回当前状态。
+    """
+    return recovery_payload(getattr(request.app.state, "storage_recovery", None))
+
+
+async def require_recovery(request: Request) -> StorageState:
+    """Return the pending recovery state or reject an unnecessary call. / 返回待恢复状态或拒绝调用。
+
+    Args:
+        request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
+
+    Returns:
+        The inspected state awaiting a user decision. / 等待用户决定的已核验状态。
+
+    Raises:
+        HTTPException: 409 when no recovery decision is pending. / 无待恢复决定时返回 409。
+    """
+    state = getattr(request.app.state, "storage_recovery", None)
+    if state is None:
+        raise problem(
+            409,
+            "STORAGE_RECOVERY_NOT_REQUIRED",
+            "Startup storage is usable; no recovery decision is pending.",
+        )
+    return state
+
+
+async def migrate_legacy_storage(checkpoint: Path) -> dict:
+    """Back up and upgrade recognizable legacy data in place with existing migrations. /
+    备份后使用现有增量迁移原地升级可识别的旧版数据。
+
+    The verified backup is written before any additive migration touches the originals, so a
+    failed upgrade leaves a usable copy of the pre-migration data. / 在任何增量迁移改动原文件前先
+    写入经过校验的备份，升级失败时仍保留迁移前的可用副本。
+
+    Args:
+        checkpoint: Base checkpoint database path. / 基础检查点数据库路径。
+
+    Returns:
+        Stored marker metadata, including the backup directory for legacy data. /
+        已存储的标记元数据；旧版数据附备份目录。
+
+    Raises:
+        StorageRecoveryRequired: When the data cannot be upgraded safely. / 无法安全升级时抛出。
+    """
+    settings = CheckpointSettings(sqlite_path=checkpoint)
+    state = await asyncio.to_thread(inspect_storage, checkpoint)
+    if state.status == "current":
+        return await asyncio.to_thread(mark_storage_current, checkpoint, adopted=True)
+    if state.status not in {"empty", "legacy"}:
+        raise StorageRecoveryRequired(state)
+    backup = await asyncio.to_thread(backup_databases, checkpoint)
+    async with (
+        SQLiteCheckpointStore(settings),
+        SQLiteConversationStore.open(settings),
+        WorkspaceStore.open(
+            settings.sqlite_path.with_suffix(".workspace.sqlite"),
+            settings.busy_timeout_ms / 1000,
+        ),
+    ):
+        pass
+    return await asyncio.to_thread(
+        mark_storage_current,
+        checkpoint,
+        adopted=True,
+        backup=str(backup),
+        migrated_from=state.status,
+    )
+
+
+@router.post("/storage/recovery/adopt", response_model=StorageRecoveryStatus)
+async def adopt_existing_storage(request: Request):
+    """Keep the existing data after the user chooses the original directory. /
+    用户选择原目录后继续使用已有数据。
+
+    Recognizable legacy data is backed up and upgraded in place by the current additive
+    migrations; already verified current data is adopted without touching any row.
+    / 可识别的旧版数据会先备份再由当前增量迁移原地升级；已验证的当前数据不做任何行改动直接接管。
+
+    Args:
+        request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
+
+    Returns:
+        A restart-required payload naming the verified backup when one was written. /
+        需要重启的载荷；写入备份时附带备份目录。
+
+    Raises:
+        HTTPException: 409 when nothing is pending; 422 when data cannot be kept. /
+            无待恢复时 409；数据无法保留时 422。
+    """
+    pending = await require_recovery(request)
+    try:
+        metadata = await migrate_legacy_storage(request.app.state.checkpoint_path)
+    except StorageRecoveryRequired as error:
+        request.app.state.storage_recovery = error.state
+        raise problem(422, "STORAGE_NOT_ADOPTABLE", str(error)) from error
+    except Exception:
+        request.app.state.storage_recovery = pending
+        raise problem(
+            422,
+            "STORAGE_MIGRATION_FAILED",
+            "The existing data could not be upgraded; the verified backup is unchanged.",
+        ) from None
+    request.app.state.storage_recovery = None
+    return recovery_payload(None, restart_required=True, backup=metadata.get("backup"))
+
+
+@router.post("/storage/recovery/reset", response_model=StorageRecoveryStatus)
+async def reset_unreadable_storage(request: Request):
+    """Back up the existing databases, verify the copies and start fresh. /
+    备份并校验已有数据库后重新开始。
+
+    Args:
+        request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
+
+    Returns:
+        A restart-required payload naming the verified backup. / 需要重启并指明已验证备份的载荷。
+
+    Raises:
+        HTTPException: 409 when nothing is pending; 422 when the backup cannot be verified. /
+            无待恢复时 409；备份无法校验时 422。
+    """
+    await require_recovery(request)
+    try:
+        metadata = await asyncio.to_thread(reset_storage, request.app.state.checkpoint_path)
+    except StorageRecoveryRequired as error:
+        request.app.state.storage_recovery = error.state
+        raise problem(
+            422,
+            "STORAGE_BACKUP_UNVERIFIED",
+            "The backup could not be verified; no data was deleted.",
+        ) from error
+    request.app.state.storage_recovery = None
+    return recovery_payload(None, restart_required=True, backup=metadata.get("backup"))
 
 
 @router.get("/ready")
@@ -981,16 +1230,42 @@ class DecisionInput(BaseModel):
     model: str | None = None
 
 
+def _decision_payload(
+    resolution: DecisionResolution, selected: str | None, models: dict
+) -> dict:
+    """Project one resolution into the settings API contract. / 将解析结果投影为设置 API 契约。
+
+    Availability, mode and source all come from the same resolution the engine uses, so the
+    UI never reports a protocol as available when execution would use another one. / 可用性、
+    模式与来源均来自引擎所用的同一解析，界面不会把执行时不使用的协议报告为可用。
+
+    Args:
+        resolution: Effective decision resolution. / 有效决策解析。
+        selected: Model ID saved in ``decision.json``, if any. / ``decision.json`` 中保存的模型。
+        models: Available catalog model IDs. / 可用目录模型 ID。
+
+    Returns:
+        The settings payload. / 设置响应体。
+    """
+    return {
+        "model": selected,
+        "available": resolution.available,
+        "mode": resolution.mode,
+        "source": resolution.source,
+        "reason": resolution.reason,
+        "models": sorted(models),
+    }
+
+
 @router.get("/settings/decision")
 async def get_decision_settings(request: Request):
     """Return decision-model selection and availability. / 返回决策模型与可用性。"""
     store = request.app.state.decision_store
-    selected = store.model()
-    return {
-        "model": selected,
-        "available": bool(selected and selected in request.app.state.model_items),
-        "models": sorted(request.app.state.model_items),
-    }
+    return _decision_payload(
+        request.app.state.resolved_decision_settings(),
+        store.model(),
+        request.app.state.model_items,
+    )
 
 
 @router.put("/settings/decision")
@@ -1001,11 +1276,11 @@ async def save_decision_settings(request: Request, body: DecisionInput):
         raise problem(404, "DECISION_MODEL_NOT_FOUND", "Select a configured model.")
     request.app.state.decision_store.save(selected)
     request.app.state.reload_models()
-    return {
-        "model": selected,
-        "available": bool(selected),
-        "models": sorted(request.app.state.model_items),
-    }
+    return _decision_payload(
+        request.app.state.resolved_decision_settings(),
+        selected,
+        request.app.state.model_items,
+    )
 
 
 @router.get("/settings/providers", response_model=ProviderList)
@@ -1170,26 +1445,42 @@ async def get_settings(request: Request) -> dict:
 
 
 async def memory_settings_result(request: Request) -> MemoryConfigurationPublic:
-    """Assemble memory configuration with runtime state. / 组装记忆配置及其运行时状态。
+    """Assemble memory configuration with saved/applied revisions and runtime state.
+    / 组装记忆配置及其已保存/已生效修订与运行时状态。
 
     Args:
         request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
 
     Returns:
-        Saved or default configuration plus runtime details. / 已保存或默认配置及运行时信息。
+        Saved or default configuration, application progress, capacity plan and runtime details.
+        / 已保存或默认配置、应用进度、容量计划及运行时信息。
     """
 
-    saved = await store(request).memory_configuration(LOCAL_USER)
+    conversations = store(request)
+    evolution = request.app.state.memory_evolution
+    saved = await conversations.memory_configuration(LOCAL_USER)
+    state = await conversations.memory_configuration_state(LOCAL_USER)
     defaults = request.app.state.memory_defaults
+    configuration = MemoryConfiguration.model_validate(saved[1]) if saved else defaults
+    revision = state["revision"] if state else 0
+    applied = state["applied_revision"] if state else 0
+    try:
+        capacity = (await evolution.plan_capacity(LOCAL_USER, configuration.active_limit)).as_dict()
+    except Exception:
+        logger.warning("Could not plan memory capacity", exc_info=False)
+        capacity = None
     return MemoryConfigurationPublic(
-        revision=saved[0] if saved else 0,
-        configuration=MemoryConfiguration.model_validate(saved[1]) if saved else defaults,
+        revision=revision,
+        applied_revision=applied,
+        pending_application=applied < revision,
+        capacity=capacity,
+        configuration=configuration,
         defaults=defaults,
         runtime=MemoryRuntime(
-            personalization_enabled=await store(request).personalization_enabled(LOCAL_USER),
+            personalization_enabled=await conversations.personalization_enabled(LOCAL_USER),
             **(
-                await request.app.state.memory_evolution.planner.runtime(LOCAL_USER)
-                if request.app.state.memory_evolution.planner
+                await evolution.planner.runtime(LOCAL_USER)
+                if evolution.planner
                 else {}
             ),
         ),
@@ -1204,7 +1495,8 @@ async def get_memory_settings(request: Request) -> MemoryConfigurationPublic:
         request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
 
     Returns:
-        Memory configuration with runtime state. / 记忆配置及运行时状态。
+        Memory configuration with application progress and runtime state.
+        / 记忆配置、应用进度及运行时状态。
     """
 
     return await memory_settings_result(request)
@@ -1214,33 +1506,75 @@ async def get_memory_settings(request: Request) -> MemoryConfigurationPublic:
 async def update_memory_settings(
     request: Request, body: MemoryConfigurationInput
 ) -> MemoryConfigurationPublic:
-    """Save memory configuration with an optimistic revision check. / 以乐观版本校验保存记忆配置。
+    """Save memory configuration, validate its capacity plan and apply it.
+
+    The stored revision only advances after the expected revision and the capacity plan pass;
+    protected facts that would exceed the requested limit reject the write with a structured
+    conflict and leave the stored revision unchanged. / 只有期望版本与容量计划都通过才推进存储
+    修订；受保护事实超过请求上限时以结构化冲突拒绝写入，存储修订号保持不变。
 
     Args:
         request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
         body: Configuration patch with the expected revision. / 带期望版本的配置补丁。
 
     Returns:
-        The stored configuration with runtime state. / 已保存配置及运行时状态。
+        The stored configuration with application progress and runtime state.
+        / 已保存配置、应用进度及运行时状态。
 
     Raises:
-        HTTPException: 409 when the revision is stale. / 版本过期时返回 409。
+        HTTPException: 409 VERSION_CONFLICT when the revision is stale, or 409
+            MEMORY_CAPACITY_PROTECTED with the protected count when protected facts exceed the
+            requested limit. / 版本过期时 409 VERSION_CONFLICT；受保护事实超出请求上限时返回带
+            受保护数量的 409 MEMORY_CAPACITY_PROTECTED。
     """
-    async with request.app.state.memory_evolution.lock:
-        revision = await store(request).save_memory_configuration(
-            LOCAL_USER, body.configuration.model_dump(), body.expected_revision
+
+    conversations = store(request)
+    evolution = request.app.state.memory_evolution
+    saved = await conversations.memory_configuration(LOCAL_USER)
+    current_revision = saved[0] if saved else 0
+    if body.expected_revision != current_revision:
+        raise problem(
+            409,
+            "VERSION_CONFLICT",
+            "Memory configuration changed. Reload the latest settings before saving.",
         )
-        if revision is None:
-            raise problem(
-                409,
-                "VERSION_CONFLICT",
-                "Memory configuration changed. Reload the latest settings before saving.",
-            )
-    request.app.state.workspace.strength_parameters[LOCAL_USER] = body.configuration.strength_c
-    async with request.app.state.memory_evolution.transaction():
-        await request.app.state.memory_evolution.ensure_capacity(LOCAL_USER, 0)
-        await request.app.state.memory_evolution.rebuild(LOCAL_USER)
-    await store(request).wake_learning(LOCAL_USER)
+    plan = await evolution.plan_capacity(
+        LOCAL_USER, body.configuration.active_limit, body.configuration.strength_c
+    )
+    if not plan.reachable:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MEMORY_CAPACITY_PROTECTED",
+                "message": (
+                    f"The active limit cannot be applied: {plan.protected} protected memories "
+                    "must stay active. Archive or unprotect enough of them first. / "
+                    f"无法应用该有效记忆上限：{plan.protected} 条受保护记忆必须保留。请先归档或"
+                    "取消保护足够多的受保护记忆。"
+                ),
+                "protected_count": plan.protected,
+                "active_count": plan.active,
+                "archivable_count": plan.archivable,
+                "new_limit": plan.limit,
+            },
+        )
+    revision = await conversations.save_memory_configuration(
+        LOCAL_USER, body.configuration.model_dump(), body.expected_revision
+    )
+    if revision is None:
+        raise problem(
+            409,
+            "VERSION_CONFLICT",
+            "Memory configuration changed. Reload the latest settings before saving.",
+        )
+    # A save can complete while capacity reconciliation fails; the response then reports the
+    # applied revision behind the saved one instead of claiming the change took effect.
+    # 保存成功时容量协调仍可能失败；响应会让已生效修订落后于已保存修订，而不是宣称已经生效。
+    try:
+        await evolution.reconcile_configuration(LOCAL_USER, revision)
+    except Exception:
+        logger.warning("Memory configuration saved but not applied", exc_info=False)
+    await conversations.wake_learning(LOCAL_USER)
     return await memory_settings_result(request)
 
 
@@ -2079,15 +2413,22 @@ async def delete_workspace(request: Request, workspace_id: Identifier):
     if workspace_id == "personal":
         raise problem(409, "WORKSPACE_PROTECTED", "The personal workspace cannot be deleted.")
     async with request.app.state.workspace_lock:
-        await require_workspace(request, workspace_id)
-        for thread_id in await store(request).workspace_threads(LOCAL_USER, workspace_id):
-            try:
-                await delete_thread(request, thread_id)
-            except HTTPException as error:
-                if error.status_code != 404:
-                    raise
-        await store(request).delete_workspace(LOCAL_USER, workspace_id)
-    return Response(status_code=204)
+        pending_cleanup = await store(request).pending_cleanup_for_workspace(
+            LOCAL_USER, workspace_id
+        )
+        if pending_cleanup is not None:
+            task = pending_cleanup
+        else:
+            await require_workspace(request, workspace_id)
+            threads = await store(request).workspace_threads(LOCAL_USER, workspace_id)
+            task = await request.app.state.thread_lifecycle.begin_cleanup(
+                user=LOCAL_USER,
+                kind="workspace_delete",
+                target_id=workspace_id,
+                thread_ids=list(threads),
+            )
+    outcome = await request.app.state.thread_lifecycle.run(task)
+    return cleanup_response(outcome)
 
 
 @router.post(
@@ -2110,9 +2451,12 @@ async def create_thread(request: Request, body: ThreadInput) -> dict:
     async with request.app.state.workspace_lock:
         if body.workspace_id is not None:
             await require_workspace(request, body.workspace_id)
-        thread = await store(request).create_thread(
-            LOCAL_USER, uuid4().hex, body.title, body.mode, body.workspace_id
-        )
+        try:
+            thread = await store(request).create_thread(
+                LOCAL_USER, uuid4().hex, body.title, body.mode, body.workspace_id
+            )
+        except CleanupPending as error:
+            raise problem(409, "WORKSPACE_CLEANING", str(error)) from error
         if await store(request).personalization_enabled(LOCAL_USER):
             await request.app.state.profile_snapshots.capture(LOCAL_USER, thread["thread_id"])
         return thread
@@ -2189,24 +2533,25 @@ async def archive_thread(request: Request, thread_id: Identifier, body: ThreadPa
         thread = await require_thread(request, thread_id)
         if body.workspace_id is not None:
             await require_workspace(request, body.workspace_id)
-            if (
-                body.workspace_id != thread.get("workspace_id", "personal")
-                and request.app.state.runner
-            ):
-                config = build_graph_config(
-                    {"user_id": LOCAL_USER, "thread_id": thread_id},
-                    request.app.state.agent_settings,
+            if body.workspace_id != thread.get("workspace_id", "personal"):
+                # Moving a session must always inspect the native checkpoint, even when no
+                # model is configured, so an unfinished run cannot be moved silently.
+                # 移动会话时始终检查原生检查点；即使未配置模型，未完成运行也不能被静默移动。
+                snapshot, _ = await request.app.state.checkpoint_reader.get_thread_state(
+                    LOCAL_USER, thread_id
                 )
-                snapshot = await request.app.state.runner.graph.aget_state(config)
                 if snapshot.next:
                     raise problem(
                         409,
                         "RUN_PENDING",
                         "Finish or clear the pending run before moving this session.",
                     )
-        await store(request).update_thread(
-            LOCAL_USER, thread_id, body.model_dump(exclude_unset=True)
-        )
+        try:
+            await store(request).update_thread(
+                LOCAL_USER, thread_id, body.model_dump(exclude_unset=True)
+            )
+        except CleanupPending as error:
+            raise problem(409, "SESSION_CLEANING", str(error)) from error
         return await require_thread(request, thread_id)
 
 
@@ -2216,9 +2561,19 @@ async def work_details(
     thread_id: Identifier,
     limit: Annotated[int, Query(ge=1, le=2000)] = 500,
 ) -> dict:
-    """Return persisted model-call JSONL records for one session. / 返回会话的模型调用记录。"""
+    """Return persisted model-call JSONL records for one session. / 返回会话的模型调用记录。
+
+    Diagnostics stay independent of the model: this always returns a bounded list and adds
+    the writer health so a degraded journal is visible. / 诊断独立于模型：始终返回有界列表，
+    并附带写入器健康状态以便发现降级。
+    """
     await require_thread(request, thread_id)
-    return {"items": await request.app.state.runtime_journal.read(thread_id, limit=limit)}
+    journal = request.app.state.runtime_journal
+    await journal.flush()
+    return {
+        "items": await journal.read(thread_id, limit=limit),
+        "diagnostics": journal.health.as_dict(),
+    }
 
 
 @router.get("/threads/{thread_id}/messages", response_model=MessageList)
@@ -2241,41 +2596,53 @@ async def messages(
         A page of turns and the next cursor. / 一页轮次及下一页游标。
     """
     async with lock_for(request, thread_id):
-        thread = await require_thread(request, thread_id)
-        runner = (
-            request.app.state.work_runner if thread["mode"] == "work" else request.app.state.runner
+        await require_thread(request, thread_id)
+        # Reads never depend on a configured model: the projection graph shares the execution
+        # topology, so pending runs and approvals stay visible after providers are removed.
+        # 读取不依赖已配置模型：投影图与执行图拓扑一致，移除服务商后待处理运行与审批仍然可见。
+        snapshot, values = await request.app.state.checkpoint_reader.get_thread_state(
+            LOCAL_USER, thread_id
         )
-        snapshot, values = None, {}
-        if runner is not None:
-            config = build_graph_config(
-                {"user_id": LOCAL_USER, "thread_id": thread_id}, request.app.state.agent_settings
+        if values and (
+            values.get("user_id") != LOCAL_USER or values.get("thread_id") != thread_id
+        ):
+            raise problem(
+                409,
+                "CHECKPOINT_IDENTITY",
+                "The checkpoint does not belong to this conversation.",
             )
-            snapshot, values = await checkpoint_state(runner.graph, config)
-            if values and (
-                values.get("user_id") != LOCAL_USER or values.get("thread_id") != thread_id
-            ):
-                raise problem(
-                    409,
-                    "CHECKPOINT_IDENTITY",
-                    "The checkpoint does not belong to this conversation.",
-                )
-            await runner.archive_completed(snapshot)
+        await request.app.state.archiver.archive_completed(snapshot)
         turns = await store(request).list_turns(
             user_id=LOCAL_USER, thread_id=thread_id, after_id=after_id, limit=limit + 1
         )
+        # One metadata query for the whole page: history never loads attachment bodies, and a
+        # file missing from an older turn only marks that entry invalid.
+        # 整页只做一次元数据查询：历史读取绝不加载附件正文，旧轮次缺失的文件只标记该项失效。
+        page_ids = list(
+            dict.fromkeys(file_id for _, turn in turns[:limit] for file_id in turn.attachment_ids)
+        )
+        attachment_metadata = {
+            item["id"]: item
+            for item in await store(request).read_attachment_metadata(
+                LOCAL_USER, thread_id, page_ids
+            )
+        }
+        claims = await store(request).client_requests_for_runs(
+            LOCAL_USER, thread_id, [turn.run_id for _, turn in turns[:limit]]
+        )
         items = []
         for row_id, turn in turns[:limit]:
-            attachments = await store(request).read_attachments(
-                LOCAL_USER, thread_id, list(turn.attachment_ids)
-            )
             items.append(
                 {
                     "id": row_id,
                     "run_id": turn.run_id,
+                    "client_request_id": claims.get(turn.run_id),
                     "message": turn.user_input,
                     "response": turn.response,
                     "reasoning": turn.reasoning,
-                    "attachments": attachments,
+                    "attachments": [
+                        attachment_metadata[file_id] for file_id in turn.attachment_ids
+                    ],
                     "activity": turn.activity,
                     "metrics": turn.metrics,
                     "used_memory_ids": turn.used_memory_ids,
@@ -2306,8 +2673,8 @@ async def messages(
                     else "failed"
                     if any(task.error for task in snapshot.tasks)
                     else "interrupted",
-                    "attachments": await store(request).read_attachment_previews(
-                        LOCAL_USER, thread_id, values.get("attachment_ids", []), 0
+                    "attachments": await store(request).read_attachment_metadata(
+                        LOCAL_USER, thread_id, values.get("attachment_ids", [])
                     ),
                     "references": await request.app.state.references.history_metadata(
                         LOCAL_USER,
@@ -2318,6 +2685,11 @@ async def messages(
                     "personalization_enabled": values.get("personalization_enabled", False),
                     "activity": run_activity(values, waiting_for_approval=review is not None),
                     "metrics": metrics,
+                    "client_request_id": (
+                        await store(request).client_requests_for_runs(
+                            LOCAL_USER, thread_id, [values["run_id"]]
+                        )
+                    ).get(values["run_id"]),
                 }
     return {
         "items": items,
@@ -2344,42 +2716,79 @@ async def upload_attachment(
     request: Request,
     thread_id: Identifier,
     filename: Annotated[str, Query(min_length=1, max_length=180)],
+    file_request_id: Identifier | None = None,
 ):
     """Stream an upload into the attachment library. / 把上传文件流式写入附件库。
+
+    The session and its remaining quota are checked before any byte is buffered, the body is
+    spooled to disk above a small threshold, and document parsing runs with bounded
+    concurrency. A repeated ``file_request_id`` returns the already stored attachment so a
+    retried upload never duplicates a file. / 缓冲任何字节前先校验会话与剩余配额；超过小阈值时
+    正文落到临时文件；文档解析并发受限；重复的 ``file_request_id`` 返回已存储附件，重试上传
+    不会重复保存。
 
     Args:
         request: The incoming request; streams the raw bytes. / 传入请求，用于流式读取字节。
         thread_id: Target session identifier. / 目标会话标识。
         filename: Client-provided filename without a path. / 客户端提供的无路径文件名。
+        file_request_id: Optional stable client identity for retry reconciliation. /
+            可选的稳定客户端标识，用于重试对账。
 
     Returns:
         Attachment metadata for the stored file. / 已存储文件的附件元数据。
 
     Raises:
         HTTPException: 413 when over the size or quota limit; 422 for an invalid or
-            unreadable file. / 超过大小或配额时 413；文件名无效或文件不可读时 422。
-            超过大小或配额时 413；文件名无效或文件不可读时 422。
+            unreadable file; 404 when the session does not exist. /
+            超过大小或配额时 413；文件名无效或文件不可读时 422；会话不存在时 404。
     """
     if not filename.strip() or any(char in "/\\" or ord(char) < 32 for char in filename):
         raise problem(422, "INVALID_FILENAME", "Provide a filename without a path.")
-    data = bytearray()
-    async for chunk in request.stream():
-        if len(data) + len(chunk) > MAX_UPLOAD_BYTES:
-            raise problem(413, "ATTACHMENT_TOO_LARGE", "Files must be no larger than 32 MiB.")
-        data.extend(chunk)
+    conversations = store(request)
+    await require_thread(request, thread_id, writable=True)
+    if file_request_id is not None:
+        existing = await conversations.get_attachment_by_request_id(
+            LOCAL_USER, thread_id, file_request_id
+        )
+        if existing is not None:
+            return existing
+    if await conversations.attachment_usage(LOCAL_USER, thread_id) >= MAX_THREAD_UPLOAD_BYTES:
+        raise problem(413, "ATTACHMENT_QUOTA", "Conversation uploads exceed 128 MiB.")
+    with tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024) as buffer:
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise problem(413, "ATTACHMENT_TOO_LARGE", "Files must be no larger than 32 MiB.")
+            buffer.write(chunk)
+        if size == 0:
+            raise problem(422, "ATTACHMENT_UNREADABLE", "The uploaded file is empty.")
+        buffer.seek(0)
+        data = buffer.read()
     try:
-        content = await asyncio.to_thread(read_attachment, filename, bytes(data))
+        # Extraction is CPU-bound and document specific; bound how many run at once.
+        # 提取是 CPU 密集且依文档类型的行为；限制同时解析的数量。
+        async with request.app.state.attachment_parsing:
+            content = await asyncio.to_thread(read_attachment, filename, data)
     except ValueError as error:
         raise problem(422, "ATTACHMENT_UNREADABLE", str(error)) from error
     async with lock_for(request, thread_id):
         await require_thread(request, thread_id, writable=True)
         file_id = uuid4().hex
-        stored = await store(request).save_attachment(
-            LOCAL_USER, thread_id, file_id, filename, len(data), content
+        stored = await conversations.save_attachment(
+            LOCAL_USER, thread_id, file_id, filename, size, content, file_request_id
         )
-        if not stored:
+        if stored is None:
             raise problem(413, "ATTACHMENT_QUOTA", "Conversation uploads exceed 128 MiB.")
-    return {"id": file_id, "filename": filename, "byte_size": len(data)}
+        if stored != file_id and file_request_id is not None:
+            # A concurrent retry stored this file first; return that stored attachment.
+            # 并发重试已先保存该文件；返回已存储的附件。
+            existing = await conversations.get_attachment_by_request_id(
+                LOCAL_USER, thread_id, file_request_id
+            )
+            if existing is not None:
+                return existing
+    return {"id": file_id, "filename": filename, "byte_size": size}
 
 
 @router.get("/attachments", response_model=AttachmentList)
@@ -2420,20 +2829,75 @@ async def download_artifact(request: Request, thread_id: Identifier, artifact_id
     """
 
     thread = await require_thread(request, thread_id)
+    locator = await store(request).get_artifact_locator(LOCAL_USER, thread_id, artifact_id)
+    if locator is not None:
+        # Resolve against the workspace root and manifest recorded when the artifact was
+        # generated, so moving the session never breaks an existing link.
+        # 按生成时记录的工作区根与清单解析，移动会话不会使既有链接失效。
+        try:
+            settings = ToolSettings(_env_file=None, workspace_path=Path(locator["workspace_root"]))
+            artifact, path = ArtifactStore(settings).lookup_manifest(
+                artifact_id,
+                locator["manifest_key"],
+                LOCAL_USER,
+                locator["owner_thread_id"],
+            )
+        except (LookupError, ValueError, OSError):
+            raise problem(
+                404, "ARTIFACT_UNAVAILABLE", "Artifact is unavailable in this conversation."
+            ) from None
+        return artifact_response(artifact, path)
     record = await store(request).get_workspace(
         LOCAL_USER, thread.get("workspace_id") or "personal"
     )
+    # Legacy libraries have no locator yet: search the known workspace roots once and record
+    # where the artifact was found for later reads. / 旧库尚无定位记录：在已知工作区根中有界
+    # 搜索一次，并为后续读取补记位置。
+    candidates: list[ToolSettings] = []
     try:
         directory = request.app.state.directories.prepare(record)
         registry = request.app.state.registry_for(str(directory))
         settings = registry.settings or await request.app.state.reference_settings_for(
             LOCAL_USER, thread_id
         )
-        artifact, path = ArtifactStore(settings).lookup(artifact_id, LOCAL_USER, thread_id)
+        candidates.append(settings)
     except (LookupError, ValueError, OSError):
-        raise problem(
-            404, "ARTIFACT_UNAVAILABLE", "Artifact is unavailable in this conversation."
-        ) from None
+        pass
+    try:
+        candidates.append(ToolSettings(_env_file=None, workspace_path=Path(record["directory"])))
+    except (KeyError, TypeError, ValueError):
+        pass
+    for settings in candidates:
+        try:
+            located = ArtifactStore(settings).locate(artifact_id, LOCAL_USER, thread_id)
+        except (LookupError, ValueError, OSError):
+            continue
+        if located is None:
+            continue
+        artifact, path, manifest_key = located
+        with suppress(Exception):
+            await store(request).index_artifact(
+                LOCAL_USER,
+                thread_id,
+                artifact_id,
+                owner_thread=thread_id,
+                workspace_root=str(Path(settings.workspace_path).resolve()),
+                manifest_key=manifest_key,
+            )
+        return artifact_response(artifact, path)
+    raise problem(404, "ARTIFACT_UNAVAILABLE", "Artifact is unavailable in this conversation.")
+
+
+def artifact_response(artifact, path: Path) -> FileResponse:
+    """Build a safe download response for one validated artifact. / 为已验证产物构建安全下载响应。
+
+    Args:
+        artifact: Artifact metadata with its display name. / 含显示名称的产物元数据。
+        path: Validated artifact path inside its workspace. / 工作区内已验证的产物路径。
+
+    Returns:
+        A binary file response with no content sniffing. / 禁止内容嗅探的二进制文件响应。
+    """
     return FileResponse(
         path,
         filename=artifact.name,
@@ -2450,10 +2914,7 @@ async def purge_checkpoint(request: Request, thread_id: str) -> None:
         thread_id: Target session identifier. / 目标会话标识。
     """
 
-    config = build_graph_config(
-        {"user_id": LOCAL_USER, "thread_id": thread_id}, request.app.state.agent_settings
-    )
-    await request.app.state.checkpointer.adelete_thread(config["configurable"]["thread_id"])
+    await request.app.state.purge_checkpoint(LOCAL_USER, thread_id)
 
 
 @router.post(
@@ -2534,22 +2995,33 @@ async def clear_messages(request: Request, thread_id: Identifier) -> Response:
     """Clear a session's turns, checkpoint and memory while keeping the session. /
     清空会话的轮次、检查点与记忆，但保留会话本身。
 
+    The cleanup is a durable task: every store step is recorded, so an interrupted or failed
+    clear resumes instead of leaving half-cleared data. An immediate 204 means the whole
+    cleanup completed; 202 returns the operation id the desktop polls. / 清理是可持久化任务：
+    每个存储步骤都会记录，中断或失败的清空会继续而不是留下半完成状态。立即 204 表示全部完成；
+    202 返回桌面用于轮询的操作 ID。
+
     Args:
         request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
         thread_id: Target session identifier. / 目标会话标识。
 
     Returns:
-        An empty 204 response. / 空的 204 响应。
+        An empty 204 response, or a 202 with the operation id. / 空 204 响应，或含操作 ID 的 202。
     """
 
     async with lock_for(request, thread_id):
-        await require_thread(request, thread_id, writable=True)
-        await purge_checkpoint(request, thread_id)
-        await request.app.state.memory_evolution.forget_thread(
-            LOCAL_USER, thread_id, lambda: store(request).clear_thread(LOCAL_USER, thread_id)
-        )
-        await request.app.state.profile_snapshots.reset(LOCAL_USER, thread_id)
-    return Response(status_code=204)
+        pending_cleanup = await store(request).pending_cleanup_for_thread(LOCAL_USER, thread_id)
+        if pending_cleanup is not None:
+            # An interrupted clear is retried by continuing its recorded task.
+            # 中断的清空通过继续已记录任务来重试。
+            task = pending_cleanup
+        else:
+            await require_thread(request, thread_id, writable=True)
+            task = await request.app.state.thread_lifecycle.begin_cleanup(
+                user=LOCAL_USER, kind="thread_clear", target_id=thread_id, thread_ids=[thread_id]
+            )
+    outcome = await request.app.state.thread_lifecycle.run(task)
+    return cleanup_response(outcome)
 
 
 @router.delete("/threads/{thread_id}", status_code=204)
@@ -2561,20 +3033,44 @@ async def delete_thread(request: Request, thread_id: Identifier) -> Response:
         thread_id: Target session identifier. / 目标会话标识。
 
     Returns:
-        An empty 204 response. / 空的 204 响应。
+        An empty 204 response, or a 202 with the operation id. / 空 204 响应，或含操作 ID 的 202。
 
     Raises:
         HTTPException: 404 when the session does not exist. / 会话不存在时返回 404。
     """
 
     async with lock_for(request, thread_id):
-        await require_thread(request, thread_id)
-        await purge_checkpoint(request, thread_id)
-        await request.app.state.memory_evolution.forget_thread(
-            LOCAL_USER, thread_id, lambda: store(request).delete_thread(LOCAL_USER, thread_id)
-        )
-        await request.app.state.profile_snapshots.reset(LOCAL_USER, thread_id)
-    return Response(status_code=204)
+        pending_cleanup = await store(request).pending_cleanup_for_thread(LOCAL_USER, thread_id)
+        if pending_cleanup is not None:
+            task = pending_cleanup
+        else:
+            await require_thread(request, thread_id)
+            task = await request.app.state.thread_lifecycle.begin_cleanup(
+                user=LOCAL_USER, kind="thread_delete", target_id=thread_id, thread_ids=[thread_id]
+            )
+    outcome = await request.app.state.thread_lifecycle.run(task)
+    return cleanup_response(outcome)
+
+
+@router.get("/operations/{operation_id}", response_model=CleanupStatus)
+async def operation_status(request: Request, operation_id: Identifier):
+    """Report one cleanup operation. / 报告一个清理操作。
+
+    Args:
+        request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
+        operation_id: Cleanup task identifier. / 清理任务标识。
+
+    Returns:
+        The task state and its recorded steps. / 任务状态及其已记录步骤。
+
+    Raises:
+        HTTPException: 404 when the operation is unknown. / 操作不存在时返回 404。
+    """
+
+    task = await store(request).get_cleanup_task(operation_id)
+    if task is None or task["user_id"] != LOCAL_USER:
+        raise problem(404, "NOT_FOUND", "This operation does not exist.")
+    return task
 
 
 @router.get("/threads/{thread_id}/memory-receipts", response_model=MemoryReceipts)
@@ -2667,6 +3163,90 @@ def public_review(review: dict, state: dict) -> dict:
     }
 
 
+def run_input_digest(
+    message: str, attachment_ids: list[str] | None, references: list[dict] | None
+) -> str:
+    """Digest the request-defining input of one logical turn. / 摘要一个逻辑轮次的请求输入。
+
+    Only fields that define the request are hashed, so a repeated submission of the same
+    request id can be told apart from a conflicting reuse of it. / 仅摘要定义请求的字段，用于
+    区分同一请求标识的重复提交与冲突复用。
+
+    Args:
+        message: Original user text. / 原始用户文本。
+        attachment_ids: Uploaded attachment ids in request order. / 按请求顺序的附件 ID。
+        references: Selected reference identities. / 已选择引用的标识。
+
+    Returns:
+        Hex-encoded SHA-256 digest of the normalized input. / 规范化输入的十六进制摘要。
+    """
+    identities = [
+        ReferenceInput.model_validate(item).model_dump(exclude_none=True)
+        for item in (references or [])
+    ]
+    payload = {
+        "message": message,
+        "attachments": [str(item) for item in (attachment_ids or [])],
+        "references": identities,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
+
+
+def cleanup_response(outcome) -> Response:
+    """Render a cleanup attempt: 204 when complete, otherwise 202 with the operation id. /
+    呈现清理尝试：完成时 204，否则返回带操作 ID 的 202。
+
+    Args:
+        outcome: Result of advancing the cleanup task. / 推进清理任务的结果。
+
+    Returns:
+        The HTTP response describing the cleanup state. / 描述清理状态的 HTTP 响应。
+    """
+    if outcome.complete:
+        return Response(status_code=204)
+    return JSONResponse(
+        status_code=202,
+        content={
+            "operation_id": outcome.task_id,
+            "state": outcome.state,
+            "error": outcome.error,
+        },
+    )
+
+
+def archived_chat_result(thread_id: str, turn) -> ChatResult:
+    """Build the public result of one archived turn. / 由一条已归档轮次构建公开结果。
+
+    Args:
+        thread_id: Conversation that owns the turn. / 轮次所属会话。
+        turn: Archived conversation turn. / 已归档的会话轮次。
+
+    Returns:
+        The public chat result for a lost receipt. / 回执丢失时返回的公开结果。
+    """
+    return ChatResult(
+        run_id=turn.run_id,
+        thread_id=thread_id,
+        response=turn.response,
+        reasoning=turn.reasoning,
+        message=turn.user_input,
+        profile_version=turn.profile_version,
+        used_memory_ids=list(turn.used_memory_ids),
+        activity=list(turn.activity),
+        metrics=turn.metrics,
+        references=list(turn.references),
+        used_reference_ids=[
+            item["reference_id"] for item in turn.references if item.get("included", True)
+        ],
+        memory_trace=turn.memory_trace,
+        response_source=turn.memory_trace.get("response_source", "model"),
+    )
+
+
 async def run_chat(
     request: Request,
     thread_id: str,
@@ -2680,6 +3260,8 @@ async def run_chat(
     references: list[dict] | None = None,
     model_selection: dict | None = None,
     expected_checkpoint_id: str | None = None,
+    expected_run_id: str | None = None,
+    client_request_id: str | None = None,
 ) -> ChatResult | StreamingResponse | JSONResponse:
     """Execute or resume a run and optionally stream events. / 执行或恢复运行，可选流式返回事件。
 
@@ -2704,14 +3286,19 @@ async def run_chat(
             模型 ID、思考强度与上下文窗口；恢复时为 None。
         expected_checkpoint_id: Optional latest-checkpoint concurrency guard, not a replay ID.
             / 最新检查点的可选并发校验值，不用于历史回放。
+        expected_run_id: Optional run identity the caller expects to continue or read. /
+            调用方期望继续或读取的运行标识。
+        client_request_id: Optional stable request identity claiming exactly one run. /
+            可选的稳定请求标识，用于领取唯一的运行。
 
     Returns:
         ChatResult, a StreamingResponse, or a 202 JSONResponse awaiting approval. /
             ChatResult、流式响应，或等待审批的 202 JSON 响应。
 
     Raises:
-        HTTPException: 503 without a runner; 409 on pending or stale runs; 502 when the run fails. /
-            无运行器时 503；运行待处理或审批过期时 409；运行失败时 502。
+        HTTPException: 503 without a runner; 409 on pending, stale or mismatched runs;
+            502 when the run fails. / 无运行器时 503；运行待处理、过期或身份不符时 409；
+            运行失败时 502。
     """
 
     async def execute(thread: dict):
@@ -2736,15 +3323,12 @@ async def run_chat(
                     409, "PROJECT_MISMATCH", "The session belongs to a different workspace."
                 )
             current_project = workspace_id
-        runner: AgentRunner | None = (
-            request.app.state.work_runner if thread["mode"] == "work" else request.app.state.runner
-        )
-        if runner is None:
-            raise problem(503, "MODEL_UNAVAILABLE", "Configure the server model before chatting.")
-        config = build_graph_config(
-            {"user_id": LOCAL_USER, "thread_id": thread_id}, request.app.state.agent_settings
-        )
-        snapshot, saved = await checkpoint_state(runner.graph, config)
+        # Identity and the saved snapshot are read without any model, so a completed result or
+        # a pending run stays readable when no provider is configured.
+        # 身份与已保存快照不依赖模型即可读取；未配置服务商时已完成结果或待处理运行仍可读。
+        reader: CheckpointReader = request.app.state.checkpoint_reader
+        config = reader.config(LOCAL_USER, thread_id)
+        snapshot, saved = await reader.get_thread_state(LOCAL_USER, thread_id)
         if (
             expected_checkpoint_id is not None
             and (snapshot.config or {}).get("configurable", {}).get("checkpoint_id")
@@ -2753,6 +3337,59 @@ async def run_chat(
             raise problem(
                 409, "CHECKPOINT_STALE", "The saved run changed. Refresh before resuming."
             )
+        if expected_run_id is not None and saved.get("run_id") != expected_run_id:
+            raise problem(
+                409,
+                "RUN_MISMATCH",
+                "The saved run belongs to a different request.",
+            )
+        pending = bool(snapshot.next)
+        claim: dict | None = None
+        run_id: str | None = None
+        if message is not None and client_request_id is not None:
+            digest = run_input_digest(message, attachment_ids, references)
+            claim = await store(request).claim_run(
+                LOCAL_USER, thread_id, client_request_id, uuid4().hex, digest
+            )
+            if claim["input_digest"] != digest:
+                raise problem(
+                    409,
+                    "REQUEST_CONFLICT",
+                    "This request identity was already used for different input.",
+                )
+            run_id = claim["run_id"]
+            if claim["state"] == "completed":
+                archived = await store(request).get_turn(
+                    user_id=LOCAL_USER, thread_id=thread_id, run_id=run_id
+                )
+                if archived is not None:
+                    yield ("done", archived_chat_result(thread_id, archived[1]).model_dump())
+                    return
+            if saved.get("run_id") == run_id and pending:
+                raise problem(
+                    409, "RUN_PENDING", "This request is already running; resume or clear it."
+                )
+        if message is None:
+            if not pending:
+                if expected_run_id is None or saved.get("run_id") != expected_run_id:
+                    raise problem(409, "NO_PENDING_RUN", "This session has no unfinished run.")
+                # A lost completion acknowledgement returns the archived result of the run the
+                # caller names; an unqualified resume never replays a previous run.
+                # 回执丢失时只按调用方指定的运行返回已归档结果；无限定的恢复绝不回放上一轮。
+                await request.app.state.archiver.archive_completed(snapshot)
+                yield ("done", chat_result(saved).model_dump())
+                return
+        elif pending:
+            terminal = await store(request).terminal_run(LOCAL_USER, thread_id)
+            if saved.get("run_id") not in (None, terminal):
+                raise problem(409, "RUN_PENDING", "Resume or clear the previous run first.")
+            # A run that could not be retried verbatim is discarded so the edited message can
+            # start a new turn; completed archives and tool receipts stay available.
+            # 无法原样重试的运行被丢弃，编辑后的消息可开启新轮次；已完成归档与工具回执仍可用。
+            await request.app.state.purge_checkpoint(LOCAL_USER, thread_id)
+            await store(request).clear_terminal_run(LOCAL_USER, thread_id)
+            snapshot, saved = await reader.get_thread_state(LOCAL_USER, thread_id)
+            pending = False
         selection = model_selection if message is not None else saved.get("model_selection")
         await require_workspace(request, workspace_id or "personal")
         record = await store(request).get_workspace(LOCAL_USER, workspace_id or "personal")
@@ -2765,7 +3402,7 @@ async def run_chat(
                 "工作目录不可用或已被移动，请检查目录后重试。 / "
                 "The workspace directory is unavailable.",
             ) from None
-        runner = request.app.state.runner_for(
+        runner: AgentRunner | None = request.app.state.runner_for(
             thread["mode"],
             selection["id"] if selection else request.app.state.model_name,
             selection.get("effort") if selection else None,
@@ -2778,23 +3415,23 @@ async def run_chat(
             raise problem(409, "REVIEW_STALE", "This approval request is no longer pending.")
         if snapshot.interrupts and decision is None:
             raise problem(409, "REVIEW_REQUIRED", "An explicit review decision is required.")
-        # A new message starts a run; a decision resumes one. / 新消息启动运行，审批决定恢复运行。
-        pending = bool(snapshot.next)
-        if pending != (message is None) and not (message is None and saved.get("response")):
-            if pending:
-                raise problem(409, "RUN_PENDING", "Resume or clear the previous run first.")
-            raise problem(409, "NO_PENDING_RUN", "This session has no unfinished run.")
         if attachment_ids:
-            try:
-                await store(request).read_attachments(LOCAL_USER, thread_id, attachment_ids)
-            except LookupError as error:
-                raise problem(404, "ATTACHMENT_NOT_FOUND", str(error)) from error
+            metadata = await store(request).read_attachment_metadata(
+                LOCAL_USER, thread_id, attachment_ids
+            )
+            if any(item.get("missing") for item in metadata):
+                raise problem(
+                    404,
+                    "ATTACHMENT_NOT_FOUND",
+                    "One or more attachments are unavailable in this conversation.",
+                )
         try:
             async with aclosing(
                 runner.astream(
                     user_id=LOCAL_USER,
                     thread_id=thread_id,
                     message=message,
+                    run_id=run_id,
                     project_id=current_project,
                     personalization_enabled=enabled,
                     approval_policy=approval_policy,
@@ -2852,13 +3489,57 @@ async def run_chat(
                             )
                 saved = await runner.graph.aget_state(config)
                 review = pending_review(saved)
+                # A resumed approval finishes the run claimed by the original request; the
+                # claim is keyed by run id, so it settles without the request id too.
+                # 审批恢复完成的是原请求领取的运行；领取记录按运行 ID 关联，无需请求 ID 也能结算。
+                finished_run = saved.values.get("run_id") or (
+                    claim["run_id"] if claim is not None else None
+                )
+                if finished_run:
+                    await store(request).update_run_state(
+                        LOCAL_USER,
+                        thread_id,
+                        finished_run,
+                        "awaiting_approval" if review is not None else "completed",
+                    )
                 if review is not None:
                     yield ("approval_required", public_review(review, saved.values))
                     return
                 if not state or not state.get("response"):
                     raise RuntimeError("Run did not complete")
+                await store(request).clear_terminal_run(LOCAL_USER, thread_id)
                 yield ("done", chat_result(state).model_dump())
+        except ContextLimitExceeded as error:
+            # The request cannot be retried verbatim; record that state so an edited message
+            # can start a new turn while completed archives and tool receipts stay intact.
+            # 该请求无法原样重试；记录终止状态，使用户编辑后可开启新轮次，同时保留已完成归档与
+            # 工具回执。
+            terminal_run = claim["run_id"] if claim is not None else None
+            with suppress(Exception):
+                _, latest = await reader.get_thread_state(LOCAL_USER, thread_id)
+                terminal_run = latest.get("run_id") or terminal_run
+                if terminal_run:
+                    await store(request).mark_terminal_run(LOCAL_USER, thread_id, terminal_run)
+            if terminal_run:
+                with suppress(Exception):
+                    await store(request).update_run_state(
+                        LOCAL_USER, thread_id, terminal_run, "context_limit"
+                    )
+            raise problem(
+                422,
+                "CONTEXT_LIMIT_EXCEEDED",
+                f"{error} Context window: {error.budget.context_window}; estimated input: "
+                f"{error.estimated}; input limit: {error.limit}.",
+            ) from None
         except Exception:
+            failed_run = claim["run_id"] if claim is not None else None
+            with suppress(Exception):
+                _, latest = await reader.get_thread_state(LOCAL_USER, thread_id)
+                failed_run = latest.get("run_id") or failed_run
+                if failed_run:
+                    await store(request).update_run_state(
+                        LOCAL_USER, thread_id, failed_run, "failed"
+                    )
             logger.warning("Agent execution failed for session %s", thread_id)
             raise problem(
                 502, "AGENT_RUN_FAILED", "The model could not complete the reply."
@@ -2924,8 +3605,6 @@ async def chat(request: Request, body: ChatInput) -> ChatResult | StreamingRespo
             409 on mode mismatch. / 无模型时 503；模型或思考强度不支持时 422；模式不一致时 409。
     """
 
-    if request.app.state.runner is None:
-        raise problem(503, "MODEL_UNAVAILABLE", "Configure the server model before chatting.")
     model_id = request.app.state.model_name if body.model in (None, "auto") else body.model
     model = request.app.state.model_items.get(model_id)
     if model is None and model_id is not None:
@@ -2949,6 +3628,17 @@ async def chat(request: Request, body: ChatInput) -> ChatResult | StreamingRespo
     enabled = await store(request).personalization_enabled(LOCAL_USER)
     enabled = enabled and body.personalization_enabled is not False
     references = [item.model_dump(exclude_none=True) for item in body.references]
+    selection = None
+    if model is not None:
+        # The window and its source travel with the run so the model call can be budgeted.
+        # 窗口及其来源随本轮传递，使模型调用可按预算裁剪。
+        window = model.context_window or AgentSettings().context_window_default
+        selection = {
+            "id": model.id,
+            "effort": body.reasoning_effort or model.default_effort,
+            "context_window": window,
+            "context_window_source": "catalog" if model.context_window else "default",
+        }
     if references:
         try:
             metadata, _ = await request.app.state.references.resolve(
@@ -2979,13 +3669,8 @@ async def chat(request: Request, body: ChatInput) -> ChatResult | StreamingRespo
         approval_policy=body.approval_policy,
         attachment_ids=body.attachment_ids,
         references=references,
-        model_selection={
-            "id": model.id,
-            "effort": body.reasoning_effort or model.default_effort,
-            "context_window": model.context_window,
-        }
-        if model
-        else None,
+        model_selection=selection,
+        client_request_id=body.client_request_id,
     )
 
 
@@ -2995,6 +3680,7 @@ async def resume(
     thread_id: Identifier,
     stream: bool = False,
     checkpoint_id: Identifier | None = None,
+    run_id: Identifier | None = None,
 ):
     """Resume the pending run of a session. / 恢复会话中待处理的运行。
 
@@ -3004,6 +3690,8 @@ async def resume(
         stream: Whether to return a streaming response. / 是否返回流式响应。
         checkpoint_id: Optional expected latest checkpoint; rejects stale callers.
             / 可选的最新检查点预期值，用于拒绝过期恢复。
+        run_id: Optional expected run identity; rejects resuming another run.
+            / 可选的预期运行标识，用于拒绝恢复其他运行。
 
     Returns:
         ChatResult, a StreamingResponse, or a 202 JSONResponse awaiting approval. /
@@ -3011,8 +3699,69 @@ async def resume(
     """
 
     return await run_chat(
-        request, thread_id, None, None, stream, expected_checkpoint_id=checkpoint_id
+        request,
+        thread_id,
+        None,
+        None,
+        stream,
+        expected_checkpoint_id=checkpoint_id,
+        expected_run_id=run_id,
     )
+
+
+@router.get("/threads/{thread_id}/run-status", response_model=RunStatusResponse)
+async def thread_run_status(
+    request: Request,
+    thread_id: Identifier,
+    client_request_id: Identifier | None = None,
+    run_id: Identifier | None = None,
+):
+    """Report one run's lifecycle stage without requiring a model. / 不依赖模型报告运行阶段。
+
+    The desktop shell uses this to tell apart a request that never started, a run awaiting
+    continuation or approval, and a completed run whose receipt was lost. / 桌面壳用它区分尚未
+    创建的请求、待继续或待审批的运行，以及回执丢失但已完成的运行。
+
+    Args:
+        request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
+        thread_id: Target session identifier. / 目标会话标识。
+        client_request_id: Optional local request identity used to claim runs. /
+            可选的本地请求标识，用于领取运行。
+        run_id: Optional run identity. / 可选的运行标识。
+
+    Returns:
+        The projected run status, including the archived reply when completed. /
+        投影的运行状态；已完成时附带已归档回复。
+    """
+
+    async with lock_for(request, thread_id):
+        await require_thread(request, thread_id)
+        snapshot, values = await request.app.state.checkpoint_reader.get_thread_state(
+            LOCAL_USER, thread_id
+        )
+        if client_request_id is not None:
+            claimed = await store(request).get_run_by_client_request_id(
+                LOCAL_USER, thread_id, client_request_id
+            )
+            if claimed is None:
+                return {"status": "not_started", "client_request_id": client_request_id}
+            if run_id is None:
+                run_id = claimed["run_id"]
+        if run_id is not None and values.get("run_id") not in (None, run_id):
+            raise problem(409, "RUN_MISMATCH", "The saved run belongs to a different request.")
+        archived = await request.app.state.archiver.archive_completed(snapshot)
+        status = run_status(snapshot, values, archived=archived)
+        payload = {
+            "status": status.status,
+            "run_id": status.run_id,
+            "checkpoint_id": status.checkpoint_id,
+            "message": status.message,
+            "archived": status.archived,
+            "client_request_id": client_request_id,
+        }
+        if status.status == "completed":
+            payload["result"] = chat_result(values).model_dump()
+        return payload
 
 
 @router.get("/threads/{thread_id}/approval", response_model=ToolReview | None)
@@ -3029,18 +3778,13 @@ async def get_approval(request: Request, thread_id: Identifier) -> dict | None:
     """
 
     async with lock_for(request, thread_id):
-        thread = await require_thread(request, thread_id)
-        runner = (
-            request.app.state.work_runner if thread["mode"] == "work" else request.app.state.runner
+        await require_thread(request, thread_id)
+        # A removed provider must not hide a pending approval. / 移除服务商不得隐藏待处理审批。
+        snapshot, values = await request.app.state.checkpoint_reader.get_thread_state(
+            LOCAL_USER, thread_id
         )
-        if runner is None:
-            return None
-        config = build_graph_config(
-            {"user_id": LOCAL_USER, "thread_id": thread_id}, request.app.state.agent_settings
-        )
-        snapshot = await runner.graph.aget_state(config)
         review = pending_review(snapshot)
-        return public_review(review, snapshot.values) if review is not None else None
+        return public_review(review, values) if review is not None else None
 
 
 @router.post(
@@ -3120,7 +3864,22 @@ def create_app(
         """
 
         checkpoint = checkpoint_settings or CheckpointSettings()
-        app.state.storage = prepare_storage(checkpoint.sqlite_path)
+        app.state.checkpoint_path = checkpoint.sqlite_path
+        app.state.storage_recovery = None
+        try:
+            app.state.storage = prepare_storage(checkpoint.sqlite_path)
+        except StorageRecoveryRequired as error:
+            # Existing business data is never deleted on startup; serve only the recovery
+            # surface until the user chooses the original directory or a verified backup.
+            # 启动时绝不删除已有业务数据；在用户选择原目录或经验证的备份前只开放恢复接口。
+            app.state.storage_recovery = error.state
+            app.state.storage = {
+                "version": error.state.version or STORAGE_VERSION,
+                "epoch": "",
+                "recovery": error.state.status,
+            }
+            yield
+            return
         agent_settings = AgentSettings()
         prompt_settings = PromptSettings()
         tool_settings = ToolSettings(workspace_path=checkpoint.sqlite_path.parent / "artifacts")
@@ -3161,13 +3920,60 @@ def create_app(
                 checkpoint.sqlite_path.with_name("decision.json")
             )
             configure_application_logging(checkpoint.sqlite_path.parent / "logs" / "application")
-            app.state.runtime_journal = RuntimeJournal(checkpoint.sqlite_path.parent / "logs")
+            app.state.runtime_journal = RuntimeJournal(
+                checkpoint.sqlite_path.parent / "logs",
+                application_version=os.environ.get("SLOTHY_APP_VERSION", "development"),
+            )
+            await app.state.runtime_journal.start()
             evolution = MemoryEvolution(learning_store, conversations)
             app.state.memory_evolution = evolution
             app.state.checkpointer = checkpointer
+            # Reads use a projection graph with the execution topology, so no model is bound.
+            # 读取使用与执行图相同拓扑的投影图，不绑定任何模型。
+            app.state.checkpoint_reader = CheckpointReader(
+                build_readonly_graph(checkpointer=checkpointer), agent_settings
+            )
+            app.state.archiver = ConversationArchiver(conversations)
             app.state.agent_settings = agent_settings
+
+            async def purge_checkpoint_thread(user: str, thread: str) -> None:
+                """Remove one native checkpoint thread. / 删除一个原生检查点线程。
+
+                Args:
+                    user: Trusted user identifier. / 可信用户标识。
+                    thread: Conversation identifier. / 会话标识。
+                """
+                config = build_graph_config({"user_id": user, "thread_id": thread}, agent_settings)
+                await checkpointer.adelete_thread(config["configurable"]["thread_id"])
+
+            async def forget_thread_memory(user: str, thread: str) -> None:
+                """Remove one thread's memory evidence and repair affected claims. /
+                删除会话的记忆证据并修复受影响的断言。
+
+                Args:
+                    user: Trusted user identifier. / 可信用户标识。
+                    thread: Conversation identifier. / 会话标识。
+                """
+
+                async def already_archived() -> None:
+                    """The archive step owns business-row deletion. / 业务行删除由归档步骤负责。"""
+                    return None
+
+                await evolution.forget_thread(user, thread, already_archived)
+
+            app.state.purge_checkpoint = purge_checkpoint_thread
+            app.state.thread_lifecycle = ThreadLifecycle(
+                conversations,
+                checkpoint_purger=purge_checkpoint_thread,
+                memory_forgetter=forget_thread_memory,
+                profile_resetter=app.state.profile_snapshots.reset,
+                journal_deleter=app.state.runtime_journal.delete_session,
+            )
             app.state.thread_locks = SessionLocks()
             app.state.workspace_lock = asyncio.Lock()
+            # Bounded document parsing concurrency keeps uploads from exhausting the process.
+            # 有界的文档解析并发避免上传耗尽进程资源。
+            app.state.attachment_parsing = asyncio.Semaphore(2)
             app.state.providers = providers
             app.state.directories = WorkspaceDirectories(
                 checkpoint.sqlite_path.parent / "workspaces",
@@ -3321,32 +4127,61 @@ def create_app(
                 app.state.prompt_telemetry.observe_summary(result.usage_metadata)
                 return HistorySummaryResult(result.text, result.usage_metadata)
 
-            def resolved_decision_settings() -> DecisionSettings:
-                """Resolve the user-selected decision model into connection settings.
-                / 将用户选择的决策模型解析为连接配置；不可用时关闭并由 LLM 自驱动。"""
-                selected = app.state.decision_store.model()
-                entry = catalog.get(selected) if selected else None
-                if entry is None:
-                    return DecisionSettings(_env_file=None, mode="off")
-                _, connection = entry
+            def catalog_provider(connection, effort: str | None = None):
+                """Build the existing Provider adapter for one catalog connection. /
+                为目录连接构建既有 Provider 适配器。
+
+                Both the chat runner and the decision resolver call this factory, so a model
+                is executable exactly when it is reported as available. / 聊天运行器与决策解析
+                共用此工厂，保证报告可用的模型就是执行时使用的适配器。
+
+                Args:
+                    connection: Provider connection or validated LLM settings. /
+                        服务商连接或已校验的 LLM 配置。
+                    effort: Reasoning effort, or None for the default. / 推理强度；None 为默认。
+
+                Returns:
+                    The protocol adapter for this connection. / 该连接的协议适配器。
+                """
+                if isinstance(connection, ProviderConnection):
+                    return connection.build_provider(effort)
+                return OpenAICompatibleProvider(connection, effort=effort)
+
+            def resolved_decision_settings() -> DecisionResolution:
+                """Resolve the decision model through the same adapter the runner uses.
+                / 通过与运行器相同的适配器解析决策模型。
+
+                Desktop keeps its isolated ``decision.json`` source; an independent backend
+                with no saved decision loads ``DECISION_*``/``DASHSCOPE__*`` environment
+                values. / 桌面沿用隔离的 ``decision.json`` 来源；独立后端未保存决策时加载
+                ``DECISION_*``/``DASHSCOPE__*`` 环境值。
+                """
+
+                def provider_for(model_id: str) -> ModelProvider | None:
+                    """Return the selected catalog model's existing adapter. /
+                    返回所选目录模型既有的适配器。"""
+                    entry = catalog.get(model_id)
+                    if entry is None:
+                        return None
+                    item, connection = entry
+                    return catalog_provider(connection, item.default_effort)
+
                 try:
-                    if isinstance(connection, ProviderConnection):
-                        return DecisionSettings(
-                            _env_file=None,
-                            mode="enforce",
-                            model=connection.model,
-                            api_key=connection.key.get_secret_value(),
-                            base_url=str(connection.settings.base_url),
-                        )
-                    return DecisionSettings(
-                        _env_file=None,
-                        mode="enforce",
-                        model=connection.model,
-                        api_key=connection.api_key.get_secret_value(),
-                        base_url=connection.resolved_base_url,
+                    environment = DecisionSettings()
+                except ValueError:
+                    # A malformed environment must not prevent the backend from starting. /
+                    # 环境配置非法时后端仍须能启动。
+                    logger.warning(
+                        "Decision environment configuration is invalid; layer stays off",
+                        exc_info=False,
                     )
-                except (AttributeError, ValueError):
-                    return DecisionSettings(_env_file=None, mode="off")
+                    return disabled_resolution("DECISION_INVALID_ENVIRONMENT")
+                return resolve_decision_settings(
+                    app.state.decision_store.selection(),
+                    desktop=desktop_mode,
+                    environment=environment,
+                    provider_for=provider_for,
+                )
 
             @cache
             def runner_for(
@@ -3376,11 +4211,7 @@ def create_app(
                     item, connection = entry
                     if effort is not None and effort not in item.reasoning_levels:
                         return None
-                    provider = (
-                        connection.build_provider(effort)
-                        if isinstance(connection, ProviderConnection)
-                        else OpenAICompatibleProvider(connection, effort=effort)
-                    )
+                    provider = catalog_provider(connection, effort)
                 registry = registry_for(directory)
                 tools = registry.for_mode(mode)
                 services = AgentServices(
@@ -3395,12 +4226,15 @@ def create_app(
                     prompt_observer=app.state.prompt_telemetry.observe,
                     runtime_journal=app.state.runtime_journal,
                     skill_reader=connectors.skill_references,
-                    reference_reader=app.state.references.resolve,
+                    reference_reader=partial(app.state.references.resolve, strict=False),
                     identity_reader=IdentityAnswers(workspace_store, conversations),
                     reference_metadata_reader=app.state.references.history_metadata,
                     memory_status_reader=conversations.learning_status,
                     tool_enabled=lambda name: name not in connectors.disabled,
+                    artifact_indexer=conversations.index_artifact,
+                    artifact_retainer=conversations.referenced_manifest_keys,
                 )
+                decision = resolved_decision_settings()
                 graph = build_agent_graph(
                     services,
                     settings=agent_settings,
@@ -3410,7 +4244,8 @@ def create_app(
                     tool_registry=registry,
                     mode=mode,
                     require_tool_review=True,
-                    decision_settings=resolved_decision_settings(),
+                    decision_settings=decision.settings,
+                    decision_provider=decision.provider,
                     system_prompt=assemble_sections(
                         [
                             PromptSection("persona", 100, BASE_SYSTEM_PROMPT),
@@ -3508,9 +4343,35 @@ def create_app(
                 evolution.planner = MemoryLearner(evolution, memory_configuration, memory_model_for)
 
             app.state.runner_for = runner_for
+            app.state.resolved_decision_settings = resolved_decision_settings
+            # Also expose the resolver on the app itself for callers that inspect availability
+            # and execution through one function. / 同时在 app 上暴露解析器，便于调用方用同一
+            # 函数检查可用性与执行配置。
+            app.resolved_decision_settings = resolved_decision_settings
             app.state.registry_for = registry_for
             app.state.reload_models = reload_models
             reload_models()
+            # Continue cleanups a crash or restart interrupted before the learning worker
+            # starts, so a half-cleared session cannot be learned from. / 在学习工作器启动前继续
+            # 被崩溃或重启中断的清理，避免从半清空的会话学习。
+            for outcome in await app.state.thread_lifecycle.resume_unfinished():
+                if not outcome.complete:
+                    logger.warning("Cleanup %s needs another attempt", outcome.task_id)
+            # Finish memory configuration revisions saved before the previous process applied
+            # them; capacity reconciliation is idempotent and reports failures without blocking
+            # startup. / 应用上次进程已保存却未生效的记忆配置修订；容量协调幂等，失败只记录而
+            # 不阻塞启动。
+            for pending_user, pending_revision in (
+                await conversations.pending_memory_configurations()
+            ):
+                try:
+                    await evolution.reconcile_configuration(pending_user, pending_revision)
+                except Exception:
+                    logger.warning(
+                        "Memory configuration revision %s needs another apply attempt",
+                        pending_revision,
+                        exc_info=False,
+                    )
             worker = asyncio.create_task(evolution.run())
             try:
                 yield
@@ -3518,6 +4379,7 @@ def create_app(
                 worker.cancel()
                 with suppress(asyncio.CancelledError):
                     await worker
+                await app.state.runtime_journal.stop()
 
     desktop_mode = os.environ.get("SLOTHY_DESKTOP") == "1"
     app = FastAPI(
@@ -3574,6 +4436,20 @@ def create_app(
                         "request_id": request.state.request_id,
                     },
                 )
+        recovery = getattr(request.app.state, "storage_recovery", None)
+        if recovery is not None and request.url.path not in RECOVERY_PATHS:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "STORAGE_RECOVERY_REQUIRED",
+                    "message": (
+                        "Existing business data needs a recovery decision before use. / "
+                        "已有业务数据需要先完成恢复选择。"
+                    ),
+                    "request_id": request.state.request_id,
+                    "storage": recovery.as_dict(),
+                },
+            )
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         return response

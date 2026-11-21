@@ -5,6 +5,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import aiosqlite
 
@@ -12,6 +13,12 @@ from app.agent.activity import RunActivity
 from app.agent.metrics import RunMetrics
 from app.config import CheckpointSettings
 from app.conversations import ConversationTurn
+from app.infrastructure.storage_version import STORAGE_VERSION
+
+
+class CleanupPending(RuntimeError):
+    """A thread or workspace is being cleaned up and must reject new writes. /
+    会话或工作区正在清理中，必须拒绝新的写入。"""
 
 
 class SQLiteConversationStore:
@@ -19,16 +26,27 @@ class SQLiteConversationStore:
 
     Args:
         connection: Connection owned by open(). / 由 open() 持有的连接。
+        path: Database path used for isolated write transactions. / 隔离写事务使用的数据库路径。
+        timeout: SQLite lock wait in seconds. / SQLite 锁等待秒数。
     """
 
-    def __init__(self, connection: aiosqlite.Connection) -> None:
+    def __init__(
+        self,
+        connection: aiosqlite.Connection,
+        path: Path | None = None,
+        timeout: float = 5.0,
+    ) -> None:
         """Bind the archive connection and create the learning wakeup event.
 
         Args:
             connection: Autocommit connection created by open().
                 / 由 open() 创建、处于自动提交模式的连接。
+            path: Database file for isolated write transactions. / 隔离写事务使用的数据库文件。
+            timeout: SQLite lock wait in seconds. / SQLite 锁等待秒数。
         """
         self._connection = connection
+        self._path = path
+        self._timeout = timeout
         self.learning_wakeup = asyncio.Event()
 
     @classmethod
@@ -115,7 +133,9 @@ class SQLiteConversationStore:
                 CREATE TABLE IF NOT EXISTS memory_configuration (
                     user_id TEXT PRIMARY KEY,
                     revision INTEGER NOT NULL,
-                    configuration_json TEXT NOT NULL
+                    configuration_json TEXT NOT NULL,
+                    applied_revision INTEGER NOT NULL DEFAULT 0,
+                    application_state TEXT NOT NULL DEFAULT 'applied'
                 );
                 CREATE TABLE IF NOT EXISTS local_accounts (
                     user_id TEXT PRIMARY KEY,
@@ -142,8 +162,49 @@ class SQLiteConversationStore:
                     PRIMARY KEY(user_id, id),
                     UNIQUE(user_id, name)
                 );
+                CREATE TABLE IF NOT EXISTS conversation_requests (
+                    user_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    client_request_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    input_digest TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'running',
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (user_id, thread_id, client_request_id)
+                );
+                CREATE INDEX IF NOT EXISTS conversation_requests_run
+                    ON conversation_requests (user_id, thread_id, run_id);
+                CREATE TABLE IF NOT EXISTS cleanup_tasks (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    threads_json TEXT NOT NULL DEFAULT '[]',
+                    steps_json TEXT NOT NULL DEFAULT '[]',
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                );
+                CREATE INDEX IF NOT EXISTS cleanup_tasks_state ON cleanup_tasks (state);
+                CREATE TABLE IF NOT EXISTS conversation_artifacts (
+                    user_id TEXT NOT NULL,
+                    thread_id TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    owner_thread_id TEXT NOT NULL,
+                    workspace_root TEXT NOT NULL,
+                    manifest_key TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (user_id, thread_id, artifact_id)
+                );
+                CREATE INDEX IF NOT EXISTS conversation_artifacts_owner
+                    ON conversation_artifacts (user_id, owner_thread_id);
                 """):
                 pass
+            # Record the storage epoch so a later startup can verify this schema read-only.
+            # 记录存储版本，便于后续启动以只读方式核验结构。
+            await connection.execute(f"PRAGMA user_version = {STORAGE_VERSION}")
             async with connection.execute("PRAGMA table_info(conversation_turns)") as cursor:
                 columns = {row[1] async for row in cursor}
             if "learning_state" not in columns:
@@ -192,6 +253,17 @@ class SQLiteConversationStore:
                 await connection.execute(
                     "ALTER TABLE conversation_workspaces ADD COLUMN directory TEXT"
                 )
+            async with connection.execute("PRAGMA table_info(conversation_files)") as cursor:
+                file_columns = {row[1] async for row in cursor}
+            if "file_request_id" not in file_columns:
+                await connection.execute(
+                    "ALTER TABLE conversation_files ADD COLUMN file_request_id TEXT"
+                )
+            await connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS conversation_file_request "
+                "ON conversation_files(user_id, thread_id, file_request_id) "
+                "WHERE file_request_id IS NOT NULL"
+            )
             await connection.execute(
                 "CREATE INDEX IF NOT EXISTS learning_queue ON conversation_turns(id) "
                 "WHERE learning_state = 1"
@@ -206,7 +278,427 @@ class SQLiteConversationStore:
                 await connection.execute(
                     "ALTER TABLE conversation_threads ADD COLUMN pinned INTEGER"
                 )
-            yield cls(connection)
+            if "cleanup_state" not in thread_columns:
+                await connection.execute(
+                    "ALTER TABLE conversation_threads ADD COLUMN cleanup_state TEXT"
+                )
+            if "terminal_run_id" not in thread_columns:
+                await connection.execute(
+                    "ALTER TABLE conversation_threads ADD COLUMN terminal_run_id TEXT"
+                )
+            async with connection.execute("PRAGMA table_info(memory_configuration)") as cursor:
+                configuration_columns = {row[1] async for row in cursor}
+            if "applied_revision" not in configuration_columns:
+                # Configurations written by an earlier build were applied inline at save time.
+                # 旧版本在保存时同步应用配置，因此迁移后视为已生效。
+                await connection.execute(
+                    "ALTER TABLE memory_configuration ADD COLUMN "
+                    "applied_revision INTEGER NOT NULL DEFAULT 0"
+                )
+                await connection.execute(
+                    "UPDATE memory_configuration SET applied_revision=revision"
+                )
+            if "application_state" not in configuration_columns:
+                await connection.execute(
+                    "ALTER TABLE memory_configuration ADD COLUMN "
+                    "application_state TEXT NOT NULL DEFAULT 'applied'"
+                )
+                await connection.execute(
+                    "UPDATE memory_configuration SET application_state="
+                    "CASE WHEN applied_revision < revision THEN 'pending' ELSE 'applied' END"
+                )
+            yield cls(connection, path, settings.busy_timeout_ms / 1000)
+
+    @asynccontextmanager
+    async def _isolated(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Run several statements in one isolated write transaction. /
+        在同一个隔离写事务中执行多条语句。
+
+        A dedicated connection keeps the transaction from absorbing statements issued by other
+        requests on the shared autocommit connection. / 独享连接避免事务吸收其他请求在共享自动
+        提交连接上发出的语句。
+
+        Yields:
+            Connection inside an immediate transaction. / 处于立即事务中的连接。
+
+        Raises:
+            RuntimeError: When the store was built without a database path.
+                / 存储缺少数据库路径时抛出。
+        """
+        if self._path is None:
+            raise RuntimeError("Isolated transactions require the database path")
+        async with aiosqlite.connect(
+            self._path, timeout=self._timeout, isolation_level=None
+        ) as connection:
+            await connection.execute("PRAGMA busy_timeout=5000")
+            await connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield connection
+            except BaseException:
+                await connection.execute("ROLLBACK")
+                raise
+            else:
+                await connection.execute("COMMIT")
+
+    async def cleanup_pending(self, user: str, thread: str) -> bool:
+        """Report whether a thread is covered by an unfinished cleanup task. /
+        报告会话是否处于未完成的清理任务中。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+
+        Returns:
+            True while a cleanup task still lists this thread. / 清理任务仍包含该会话时为 True。
+        """
+        async with self._connection.execute(
+            """SELECT 1 FROM cleanup_tasks WHERE user_id=? AND state<>'done' AND (
+                 EXISTS (SELECT 1 FROM json_each(cleanup_tasks.threads_json) WHERE value=?)
+                 OR (kind LIKE 'thread_%' AND target_id=?)
+               )""",
+            (user, thread, thread),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def thread_cleanup_state(self, user: str, thread: str) -> str | None:
+        """Return the cleanup state recorded on a thread row. / 返回会话行记录的清理状态。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+
+        Returns:
+            The cleanup kind while one is running, otherwise None. / 清理进行中的类型；否则为 None。
+        """
+        async with self._connection.execute(
+            "SELECT cleanup_state FROM conversation_threads WHERE user_id=? AND thread_id=?",
+            (user, thread),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    def _cleanup_dict(row: tuple) -> dict:
+        """Convert one cleanup row into a mapping. / 把清理任务行转换为映射。
+
+        Args:
+            row: Row with id, user, kind, target, threads, steps, state and error. /
+                含 ID、用户、类型、目标、会话清单、步骤、状态与错误的行。
+
+        Returns:
+            Cleanup mapping with parsed lists. / 已解析列表的清理映射。
+        """
+        task_id, user, kind, target, threads, steps, state, error = row
+        return {
+            "id": task_id,
+            "user_id": user,
+            "kind": kind,
+            "target_id": target,
+            "threads": json.loads(threads or "[]"),
+            "steps": json.loads(steps or "[]"),
+            "state": state,
+            "error": error,
+        }
+
+    async def get_cleanup_task(self, task_id: str) -> dict | None:
+        """Load one cleanup task. / 读取一个清理任务。
+
+        Args:
+            task_id: Cleanup task identifier. / 清理任务标识。
+
+        Returns:
+            The task mapping, or None when it does not exist. / 任务映射；不存在时为 None。
+        """
+        async with self._connection.execute(
+            """SELECT id, user_id, kind, target_id, threads_json, steps_json, state, error
+               FROM cleanup_tasks WHERE id=?""",
+            (task_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._cleanup_dict(row) if row else None
+
+    async def unfinished_cleanup_tasks(self) -> list[dict]:
+        """List cleanup tasks that still need work after a restart. / 列出重启后仍需继续的清理任务。
+
+        Returns:
+            Unfinished tasks in creation order. / 按创建顺序的未完成任务。
+        """
+        async with self._connection.execute(
+            """SELECT id, user_id, kind, target_id, threads_json, steps_json, state, error
+               FROM cleanup_tasks WHERE state<>'done' ORDER BY created_at, id"""
+        ) as cursor:
+            return [self._cleanup_dict(row) async for row in cursor]
+
+    async def pending_cleanup_for_thread(self, user: str, thread: str) -> dict | None:
+        """Load the newest unfinished cleanup covering one thread.
+        / 读取覆盖该会话的最新未完成清理。
+
+        A repeated delete or clear continues the recorded task instead of failing, so an
+        interrupted cleanup is retryable from the UI without a restart. / 重复删除或清空会继续
+        已记录的任务，而不是失败，因此中断的清理可无需重启地从界面重试。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+
+        Returns:
+            The unfinished task, or None. / 未完成任务；没有时为 None。
+        """
+        async with self._connection.execute(
+            """SELECT id, user_id, kind, target_id, threads_json, steps_json, state, error
+               FROM cleanup_tasks WHERE user_id=? AND state<>'done' AND (
+                 (kind LIKE 'thread_%' AND target_id=?)
+                 OR EXISTS (SELECT 1 FROM json_each(cleanup_tasks.threads_json) WHERE value=?)
+               ) ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (user, thread, thread),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._cleanup_dict(row) if row else None
+
+    async def pending_cleanup_for_workspace(self, user: str, workspace_id: str) -> dict | None:
+        """Load the newest unfinished cleanup of one workspace. / 读取工作区最新的未完成清理。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            workspace_id: Workspace identifier. / 工作区标识。
+
+        Returns:
+            The unfinished task, or None. / 未完成任务；没有时为 None。
+        """
+        async with self._connection.execute(
+            """SELECT id, user_id, kind, target_id, threads_json, steps_json, state, error
+               FROM cleanup_tasks WHERE user_id=? AND kind='workspace_delete'
+                 AND target_id=? AND state<>'done'
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (user, workspace_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._cleanup_dict(row) if row else None
+
+    async def begin_cleanup(
+        self,
+        user: str,
+        task_id: str,
+        kind: str,
+        target_id: str,
+        thread_ids: list[str],
+    ) -> dict:
+        """Persist a cleanup task and mark its threads in one transaction. /
+        在同一个事务中持久化清理任务并标记涉及的会话。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            task_id: New cleanup task identifier. / 新建清理任务标识。
+            kind: thread_clear, thread_delete or workspace_delete. / 清理类型。
+            target_id: Thread or workspace identifier. / 会话或工作区标识。
+            thread_ids: Threads covered by this cleanup. / 本次清理覆盖的会话。
+
+        Returns:
+            The stored cleanup task. / 已存储的清理任务。
+        """
+        async with self._isolated() as connection:
+            await connection.execute(
+                """INSERT INTO cleanup_tasks
+                     (id, user_id, kind, target_id, threads_json, steps_json, state)
+                   VALUES (?, ?, ?, ?, ?, '[]', 'pending')""",
+                (task_id, user, kind, target_id, json.dumps(thread_ids)),
+            )
+            for thread in thread_ids:
+                await connection.execute(
+                    """UPDATE conversation_threads SET cleanup_state=?
+                       WHERE user_id=? AND thread_id=?""",
+                    (kind, user, thread),
+                )
+        task = await self.get_cleanup_task(task_id)
+        if task is None:
+            raise LookupError("The cleanup task could not be stored.")
+        return task
+
+    async def mark_cleanup_step(self, task_id: str, step: str) -> None:
+        """Record one completed, idempotent cleanup step. / 记录一个已完成且幂等的清理步骤。
+
+        Args:
+            task_id: Cleanup task identifier. / 清理任务标识。
+            step: Step key such as ``journal:<thread>``. / 形如 ``journal:<thread>`` 的步骤键。
+        """
+        async with self._isolated() as connection:
+            async with connection.execute(
+                "SELECT steps_json FROM cleanup_tasks WHERE id=?", (task_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            steps = list(json.loads(row[0] or "[]")) if row else []
+            if step not in steps:
+                steps.append(step)
+            await connection.execute(
+                """UPDATE cleanup_tasks SET steps_json=?, state='running',
+                     updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?""",
+                (json.dumps(steps), task_id),
+            )
+
+    async def finish_cleanup(self, task_id: str) -> None:
+        """Mark a cleanup task complete. / 标记清理任务完成。
+
+        Args:
+            task_id: Cleanup task identifier. / 清理任务标识。
+        """
+        await self._connection.execute(
+            """UPDATE cleanup_tasks SET state='done', error=NULL,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?""",
+            (task_id,),
+        )
+
+    async def fail_cleanup(self, task_id: str, error: str) -> None:
+        """Record why a cleanup needs another attempt. / 记录清理需要再次尝试的原因。
+
+        Args:
+            task_id: Cleanup task identifier. / 清理任务标识。
+            error: Stable error code or short message. / 稳定错误码或简短说明。
+        """
+        await self._connection.execute(
+            """UPDATE cleanup_tasks SET state='failed', error=?,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?""",
+            (error[:500], task_id),
+        )
+
+    async def release_thread_cleanup(self, user: str, thread_ids: list[str]) -> None:
+        """Clear the cleanup marker once every thread step completed. / 全部会话步骤完成后清除标记。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread_ids: Threads whose cleanup finished. / 清理完成的会话。
+        """
+        for thread in thread_ids:
+            await self._connection.execute(
+                """UPDATE conversation_threads SET cleanup_state=NULL
+                   WHERE user_id=? AND thread_id=?""",
+                (user, thread),
+            )
+
+    async def index_artifact(
+        self,
+        user: str,
+        thread: str,
+        artifact_id: str,
+        *,
+        owner_thread: str,
+        workspace_root: str,
+        manifest_key: str,
+    ) -> None:
+        """Register where an artifact was generated so later moves keep it reachable. /
+        登记产物的生成位置，使会话移动后仍可定位。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread that may read the artifact. / 可读取该产物的会话。
+            artifact_id: Artifact identifier. / 产物标识。
+            owner_thread: Session that generated the artifact. / 生成产物的会话。
+            workspace_root: Workspace root used at generation time. / 生成时的工作区根目录。
+            manifest_key: Invocation journal that holds the manifest. / 保存清单的调用日志标识。
+        """
+        await self._connection.execute(
+            """INSERT INTO conversation_artifacts
+                 (user_id, thread_id, artifact_id, owner_thread_id, workspace_root, manifest_key)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (user_id, thread_id, artifact_id) DO UPDATE SET
+                 owner_thread_id=excluded.owner_thread_id,
+                 workspace_root=excluded.workspace_root,
+                 manifest_key=excluded.manifest_key""",
+            (user, thread, artifact_id, owner_thread, workspace_root, manifest_key),
+        )
+
+    async def get_artifact_locator(
+        self, user: str, thread: str, artifact_id: str
+    ) -> dict | None:
+        """Load the generation-time locator of one artifact. / 读取产物的生成时定位信息。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Session reading the artifact. / 读取产物的会话。
+            artifact_id: Artifact identifier. / 产物标识。
+
+        Returns:
+            Locator mapping, or None when this session never inherited the artifact. /
+            定位映射；会话未继承该产物时为 None。
+        """
+        async with self._connection.execute(
+            """SELECT owner_thread_id, workspace_root, manifest_key
+               FROM conversation_artifacts
+               WHERE user_id=? AND thread_id=? AND artifact_id=?""",
+            (user, thread, artifact_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return dict(zip(("owner_thread_id", "workspace_root", "manifest_key"), row, strict=True))
+
+    async def referenced_manifest_keys(self, user: str) -> set[str]:
+        """List invocation manifests still referenced by any session. / 列出仍被会话引用的调用清单。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+
+        Returns:
+            Manifest keys that retention pruning must keep. / 清理时必须保留的清单标识。
+        """
+        async with self._connection.execute(
+            "SELECT DISTINCT manifest_key FROM conversation_artifacts WHERE user_id=?", (user,)
+        ) as cursor:
+            return {row[0] async for row in cursor}
+
+    async def release_thread_artifacts(self, user: str, thread: str) -> None:
+        """Drop one session's artifact access records, keeping other sessions' links. /
+        删除单个会话的产物访问记录，保留其他会话的关联。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Session losing its access records. / 失去访问记录的会话。
+        """
+        await self._connection.execute(
+            "DELETE FROM conversation_artifacts WHERE user_id=? AND thread_id=?",
+            (user, thread),
+        )
+
+    async def mark_terminal_run(self, user: str, thread: str, run_id: str) -> None:
+        """Record a run that cannot be retried verbatim. / 记录无法原样重试的终止运行。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+            run_id: Run that ended in a terminal state. / 进入终止状态的运行。
+        """
+        await self._connection.execute(
+            "UPDATE conversation_threads SET terminal_run_id=? WHERE user_id=? AND thread_id=?",
+            (run_id, user, thread),
+        )
+
+    async def terminal_run(self, user: str, thread: str) -> str | None:
+        """Return the last run that cannot be retried verbatim. / 返回最近无法原样重试的运行。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+
+        Returns:
+            The terminal run id, or None. / 终止运行 ID；没有时为 None。
+        """
+        async with self._connection.execute(
+            "SELECT terminal_run_id FROM conversation_threads WHERE user_id=? AND thread_id=?",
+            (user, thread),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def clear_terminal_run(self, user: str, thread: str) -> None:
+        """Forget a terminal marker after a new run starts. / 新一轮开始后清除终止标记。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+        """
+        await self._connection.execute(
+            "UPDATE conversation_threads SET terminal_run_id=NULL WHERE user_id=? AND thread_id=?",
+            (user, thread),
+        )
 
     async def record_command(self, user: str, thread: str, name: str):
         """Record command lifecycle separately from tools and usage. / 命令审计独立于工具与用量。"""
@@ -262,7 +754,14 @@ class SQLiteConversationStore:
 
         Returns:
             The created thread fields. / 创建后的线程字段。
+
+        Raises:
+            CleanupPending: When the workspace is being deleted. / 工作区正在删除时抛出。
         """
+        if workspace_id is not None and await self.workspace_cleanup_pending(
+            user_id, workspace_id
+        ):
+            raise CleanupPending("The workspace is being deleted.")
         async with self._connection.execute(
             """INSERT INTO conversation_threads (user_id, thread_id, title, mode, workspace_id)
                VALUES (?, ?, ?, ?, ?)
@@ -357,7 +856,16 @@ class SQLiteConversationStore:
             user_id: Owning user id. / 所属用户 ID。
             thread_id: Thread identifier. / 线程标识。
             values: Field values to update. / 要更新的字段值。
+
+        Raises:
+            CleanupPending: When the thread or target workspace is being cleaned up. /
+                会话或目标工作区正在清理时抛出。
         """
+        if await self.thread_cleanup_state(user_id, thread_id) is not None:
+            raise CleanupPending("The thread is being cleaned up.")
+        target = values.get("workspace_id")
+        if target is not None and await self.workspace_cleanup_pending(user_id, target):
+            raise CleanupPending("The workspace is being deleted.")
         fields = [
             field for field in ("archived", "title", "workspace_id", "pinned") if field in values
         ]
@@ -453,16 +961,39 @@ class SQLiteConversationStore:
         ) as cursor:
             return [row[0] async for row in cursor]
 
-    async def delete_workspace(self, user: str, workspace_id: str):
-        """Delete a workspace row.
+    async def workspace_cleanup_pending(self, user: str, workspace_id: str) -> bool:
+        """Report whether a workspace is being deleted. / 报告工作区是否正在删除。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            workspace_id: Workspace identifier. / 工作区标识。
+
+        Returns:
+            True while a workspace cleanup still needs to finish. / 清理尚未完成时为 True。
+        """
+        async with self._connection.execute(
+            """SELECT 1 FROM cleanup_tasks WHERE user_id=? AND kind='workspace_delete'
+               AND target_id=? AND state<>'done' LIMIT 1""",
+            (user, workspace_id),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def delete_workspace(self, user: str, workspace_id: str) -> None:
+        """Delete a workspace row atomically. / 原子删除工作区记录。
+
+        Turns and attachments of its threads are removed by each covered cleanup task, so the
+        workspace row is deleted only after those steps complete. / 各会话的轮次与附件由覆盖它的
+        清理任务删除；只有这些步骤完成后才删除工作区记录。
 
         Args:
             user: Owning user id. / 所属用户 ID。
             workspace_id: Workspace identifier. / 工作区标识。
         """
-        await self._connection.execute(
-            "DELETE FROM conversation_workspaces WHERE user_id=? AND id=?", (user, workspace_id)
-        )
+        async with self._isolated() as connection:
+            await connection.execute(
+                "DELETE FROM conversation_workspaces WHERE user_id=? AND id=?",
+                (user, workspace_id),
+            )
 
     async def copy_turns(self, user_id: str, source_id: str, target_id: str) -> None:
         """Copy a thread's turns and referenced attachments for a fork.
@@ -499,36 +1030,83 @@ class SQLiteConversationStore:
             (target_id, user_id, source_id),
         ):
             pass
+        # Copied turns keep their tool artifacts; the fork inherits an internal association so
+        # the link keeps working after the source session is deleted.
+        # 复制的轮次保留其工具产物；派生会话继承内部关联，源会话删除后链接仍可用。
+        async with self._connection.execute(
+            """SELECT DISTINCT a.artifact_id, a.owner_thread_id, a.workspace_root, a.manifest_key
+               FROM conversation_artifacts a
+               JOIN conversation_turns t
+                 ON t.user_id=a.user_id AND t.thread_id=a.thread_id
+               JOIN json_each(t.activity) AS act
+               JOIN json_each(act.value, '$.artifacts') AS art
+               WHERE t.user_id=? AND t.thread_id=? AND art.value ->> 'id' = a.artifact_id""",
+            (user_id, source_id),
+        ) as cursor:
+            inherited = await cursor.fetchall()
+        for artifact_id, owner_thread, workspace_root, manifest_key in inherited:
+            await self.index_artifact(
+                user_id,
+                target_id,
+                artifact_id,
+                owner_thread=owner_thread,
+                workspace_root=workspace_root,
+                manifest_key=manifest_key,
+            )
 
     async def clear_thread(self, user_id: str, thread_id: str) -> None:
         """Delete a thread's turns and attachments but keep the thread row.
+
+        Business rows, archive and uploaded files change in one isolated write transaction so
+        an interrupted cleanup never leaves half-cleared history. / 业务行、归档与上传文件在同一
+        隔离写事务内变更，中断的清理不会留下半清空历史。
 
         Args:
             user_id: Owning user id. / 所属用户 ID。
             thread_id: Thread whose history is cleared. / 被清空历史的线程。
         """
-        async with self._connection.execute(
-            "DELETE FROM conversation_turns WHERE user_id=? AND thread_id=?",
-            (user_id, thread_id),
-        ):
-            pass
-        await self._connection.execute(
-            "DELETE FROM conversation_files WHERE user_id=? AND thread_id=?", (user_id, thread_id)
-        )
+        async with self._isolated() as connection:
+            await connection.execute(
+                "DELETE FROM conversation_turns WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
+            await connection.execute(
+                "DELETE FROM conversation_files WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
+            await connection.execute(
+                "DELETE FROM conversation_artifacts WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
 
     async def delete_thread(self, user_id: str, thread_id: str) -> None:
-        """Delete a thread, its turns and its attachments.
+        """Delete a thread, its turns and its attachments atomically. / 原子删除会话及其轮次与附件。
 
         Args:
             user_id: Owning user id. / 所属用户 ID。
             thread_id: Thread to delete. / 要删除的线程。
         """
-        await self.clear_thread(user_id, thread_id)
-        async with self._connection.execute(
-            "DELETE FROM conversation_threads WHERE user_id=? AND thread_id=?",
-            (user_id, thread_id),
-        ):
-            pass
+        async with self._isolated() as connection:
+            await connection.execute(
+                "DELETE FROM conversation_turns WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
+            await connection.execute(
+                "DELETE FROM conversation_files WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
+            await connection.execute(
+                "DELETE FROM conversation_requests WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
+            await connection.execute(
+                "DELETE FROM conversation_threads WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
+            await connection.execute(
+                "DELETE FROM conversation_artifacts WHERE user_id=? AND thread_id=?",
+                (user_id, thread_id),
+            )
 
     async def get_account(self, user_id: str) -> dict:
         """Load the local account profile fields.
@@ -637,13 +1215,79 @@ class SQLiteConversationStore:
             row = await cursor.fetchone()
             return (row[0], json.loads(row[1])) if row else None
 
+    async def memory_configuration_state(self, user_id: str) -> dict | None:
+        """Load the saved revision together with its application progress.
+
+        / 读取已保存的修订号及其应用进度。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+
+        Returns:
+            Revision, configuration, applied revision and application state, or None.
+            / 修订号、配置、已生效修订与应用状态；从未保存时为 None。
+        """
+        async with self._connection.execute(
+            "SELECT revision, configuration_json, applied_revision, application_state "
+            "FROM memory_configuration WHERE user_id=?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return (
+            {
+                "revision": row[0],
+                "configuration": json.loads(row[1]),
+                "applied_revision": row[2],
+                "application_state": row[3],
+            }
+            if row
+            else None
+        )
+
+    async def pending_memory_configurations(self) -> list[tuple[str, int]]:
+        """List saved configurations whose capacity has not been applied yet.
+
+        / 列出已保存但容量尚未应用的配置。
+
+        Returns:
+            (user_id, revision) pairs ordered by user. / 按用户排序的（用户 ID，修订号）序列。
+        """
+        async with self._connection.execute(
+            "SELECT user_id, revision FROM memory_configuration "
+            "WHERE applied_revision < revision OR application_state='pending' ORDER BY user_id"
+        ) as cursor:
+            return await cursor.fetchall()
+
+    async def mark_memory_configuration_applied(self, user_id: str, revision: int) -> bool:
+        """Mark one saved revision as applied unless it was superseded meanwhile.
+
+        The guard keeps a late worker from claiming a revision the user already replaced.
+        / 若该修订已被更新版本取代则不做标记，避免迟到的协程宣称旧版本已生效。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            revision: Revision whose capacity was applied. / 已完成容量应用的修订号。
+
+        Returns:
+            True when this call marked the revision applied. / 本次调用标记成功时为 True。
+        """
+        async with self._connection.execute(
+            """UPDATE memory_configuration
+               SET applied_revision=?, application_state='applied'
+               WHERE user_id=? AND revision=? AND applied_revision<?""",
+            (revision, user_id, revision, revision),
+        ) as cursor:
+            return cursor.rowcount > 0
+
     async def save_memory_configuration(
         self, user_id: str, configuration: dict, expected_revision: int
     ) -> int | None:
         """Write a memory configuration if the revision still matches.
 
         A single atomic optimistic statement prevents a stale editor from overwriting newer
-        settings. / 单条原子乐观语句防止旧编辑器覆盖更新的设置。
+        settings, and the saved revision is marked pending until capacity reconciliation
+        finishes. / 单条原子乐观语句防止旧编辑器覆盖更新的设置；新修订在容量协调完成前标记为
+        待应用。
 
         Args:
             user_id: Owning user id. / 所属用户 ID。
@@ -657,11 +1301,13 @@ class SQLiteConversationStore:
         # English: One atomic optimistic write; stale editors never overwrite newer settings.
         # 中文：单次原子乐观写入；过期编辑不会覆盖更新的设置。
         async with self._connection.execute(
-            """INSERT INTO memory_configuration (user_id, revision, configuration_json)
-               SELECT ?, ?+1, ? WHERE ?=COALESCE(
+            """INSERT INTO memory_configuration
+                   (user_id, revision, configuration_json, applied_revision, application_state)
+               SELECT ?, ?+1, ?, 0, 'pending' WHERE ?=COALESCE(
                    (SELECT revision FROM memory_configuration WHERE user_id=?), 0)
                ON CONFLICT(user_id) DO UPDATE SET revision=excluded.revision,
-                   configuration_json=excluded.configuration_json
+                   configuration_json=excluded.configuration_json,
+                   application_state='pending'
                RETURNING revision""",
             (
                 user_id,
@@ -1031,6 +1677,128 @@ class SQLiteConversationStore:
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    async def get_run_by_client_request_id(
+        self, user_id: str, thread_id: str, client_request_id: str
+    ) -> dict | None:
+        """Load the run claimed by one client request id. / 读取某个客户端请求标识领取的运行。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            thread_id: Thread identifier. / 线程标识。
+            client_request_id: Stable idempotency key sent by the desktop. / 桌面发送的稳定幂等键。
+
+        Returns:
+            The claim row, or None when this request never started. / 领取记录；从未开始时为 None。
+        """
+        async with self._connection.execute(
+            """SELECT run_id, input_digest, state, created_at, updated_at
+               FROM conversation_requests
+               WHERE user_id=? AND thread_id=? AND client_request_id=?""",
+            (user_id, thread_id, client_request_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        names = ("run_id", "input_digest", "state", "created_at", "updated_at")
+        return dict(zip(names, row, strict=True))
+
+    async def client_requests_for_runs(
+        self, user_id: str, thread_id: str, run_ids: list[str]
+    ) -> dict[str, str]:
+        """Map run identities back to their claiming client request ids. /
+        把运行标识映射回领取它的客户端请求标识。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            thread_id: Thread identifier. / 线程标识。
+            run_ids: Runs to resolve. / 待解析的运行。
+
+        Returns:
+            Mapping of run id to client request id. / 运行 ID 到请求 ID 的映射。
+        """
+        if not run_ids:
+            return {}
+        placeholders = ",".join("?" for _ in run_ids)
+        async with self._connection.execute(
+            f"""SELECT run_id, client_request_id FROM conversation_requests
+                WHERE user_id=? AND thread_id=? AND run_id IN ({placeholders})""",
+            (user_id, thread_id, *run_ids),
+        ) as cursor:
+            return {row[0]: row[1] async for row in cursor}
+
+    async def claim_run(
+        self,
+        user_id: str,
+        thread_id: str,
+        client_request_id: str,
+        run_id: str,
+        input_digest: str,
+    ) -> dict:
+        """Claim one run for a client request id, idempotently.
+        / 幂等地为客户端请求标识领取一次运行。
+
+        A concurrent duplicate submission keeps the first claim, so one logical request can
+        never create two runs. / 并发重复提交保留首次领取，一个逻辑请求不会创建两次运行。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            thread_id: Thread identifier. / 线程标识。
+            client_request_id: Stable idempotency key. / 稳定幂等键。
+            run_id: Run to associate with the claim. / 与领取关联的运行。
+            input_digest: Digest of the original input for conflict detection. / 原始输入的摘要。
+
+        Returns:
+            The stored claim, which may belong to an earlier submission. / 已存领取记录。
+        """
+        await self._connection.execute(
+            """INSERT INTO conversation_requests
+                 (user_id, thread_id, client_request_id, run_id, input_digest)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (user_id, thread_id, client_request_id) DO NOTHING""",
+            (user_id, thread_id, client_request_id, run_id, input_digest),
+        )
+        claim = await self.get_run_by_client_request_id(user_id, thread_id, client_request_id)
+        if claim is None:
+            raise LookupError("The run claim could not be stored.")
+        return claim
+
+    async def update_run_state(self, user_id: str, thread_id: str, run_id: str, state: str) -> None:
+        """Record the lifecycle state of one claimed run. / 记录已领取运行的生命周期状态。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            thread_id: Thread identifier. / 线程标识。
+            run_id: Run identifier. / 运行标识。
+            state: One of running, awaiting_approval, completed or failed. / 运行状态。
+        """
+        await self._connection.execute(
+            """UPDATE conversation_requests
+               SET state=?, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE user_id=? AND thread_id=? AND run_id=?""",
+            (state, user_id, thread_id, run_id),
+        )
+
+    async def get_turn(
+        self, *, user_id: str, thread_id: str, run_id: str
+    ) -> tuple[int, ConversationTurn] | None:
+        """Read one archived turn by its run identity. / 按运行标识读取一条已归档轮次。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            thread_id: Thread identifier. / 线程标识。
+            run_id: Run identifier unique within the thread. / 会话内唯一的运行标识。
+
+        Returns:
+            Row id and hydrated turn, or None when absent. / 行 ID 与水合轮次；不存在时为 None。
+        """
+        async with self._connection.execute(
+            f"""SELECT {self._TURN_COLUMNS}
+                FROM conversation_turns WHERE user_id=? AND thread_id=? AND run_id=?""",
+            (user_id, thread_id, run_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return (row[0], self._hydrate_turn(user_id, thread_id, row)) if row else None
+
     async def list_turns(
         self,
         *,
@@ -1062,8 +1830,7 @@ class SQLiteConversationStore:
             raise ValueError("Invalid conversation history page")
         async with self._connection.execute(
             f"""
-            SELECT id, run_id, user_input, response, reasoning, attachment_ids, activity, metrics,
-                   used_memory_ids, profile_version, explicit_references, memory_trace
+            SELECT {self._TURN_COLUMNS}
             FROM conversation_turns
             WHERE user_id=? AND thread_id=? AND id>?
             ORDER BY id {"DESC" if newest_first else "ASC"} LIMIT ?
@@ -1071,41 +1838,55 @@ class SQLiteConversationStore:
             (user_id, thread_id, after_id, limit),
         ) as cursor:
             return [
-                (
-                    row_id,
-                    ConversationTurn(
-                        user_id,
-                        thread_id,
-                        run_id,
-                        user_input,
-                        response,
-                        reasoning=reasoning,
-                        attachment_ids=tuple(json.loads(files)),
-                        activity=tuple(
-                            RunActivity.model_validate(item) for item in json.loads(trace)
-                        ),
-                        metrics=RunMetrics.model_validate_json(metrics) if metrics else None,
-                        used_memory_ids=tuple(json.loads(memory_ids)),
-                        profile_version=profile_version,
-                        references=tuple(json.loads(references)),
-                        memory_trace=json.loads(memory_diagnostics),
-                    ),
-                )
-                async for (
-                    row_id,
-                    run_id,
-                    user_input,
-                    response,
-                    reasoning,
-                    files,
-                    trace,
-                    metrics,
-                    memory_ids,
-                    profile_version,
-                    references,
-                    memory_diagnostics,
-                ) in cursor
+                (row[0], self._hydrate_turn(user_id, thread_id, row)) async for row in cursor
             ]
+
+    # Selected turn columns shared by history pages and single-run lookups.
+    # 历史分页与单次运行查询共用的轮次列。
+    _TURN_COLUMNS = """id, run_id, user_input, response, reasoning, attachment_ids, activity,
+        metrics, used_memory_ids, profile_version, explicit_references, memory_trace"""
+
+    @staticmethod
+    def _hydrate_turn(user_id: str, thread_id: str, row: tuple) -> ConversationTurn:
+        """Build one stored turn from a selected row. / 由查询行构建一条已存储轮次。
+
+        Args:
+            user_id: Owning user id. / 所属用户 ID。
+            thread_id: Thread identifier. / 线程标识。
+            row: Row following ``_TURN_COLUMNS`` order. / 按 ``_TURN_COLUMNS`` 顺序的行。
+
+        Returns:
+            The hydrated conversation turn. / 水合后的会话轮次。
+        """
+        (
+            _row_id,
+            run_id,
+            user_input,
+            response,
+            reasoning,
+            files,
+            trace,
+            metrics,
+            memory_ids,
+            profile_version,
+            references,
+            memory_diagnostics,
+        ) = row
+        return ConversationTurn(
+            user_id,
+            thread_id,
+            run_id,
+            user_input,
+            response,
+            reasoning=reasoning,
+            attachment_ids=tuple(json.loads(files)),
+            activity=tuple(RunActivity.model_validate(item) for item in json.loads(trace)),
+            metrics=RunMetrics.model_validate_json(metrics) if metrics else None,
+            used_memory_ids=tuple(json.loads(memory_ids)),
+            profile_version=profile_version,
+            references=tuple(json.loads(references)),
+            memory_trace=json.loads(memory_diagnostics),
+        )
 
     async def search_threads(self, user: str, query: str, limit: int = 8) -> list[dict]:
         """Search owned session titles and archived text. / 搜索所属会话标题与归档文本。"""
@@ -1125,11 +1906,15 @@ class SQLiteConversationStore:
                 async for row in cursor
             ]
 
-    async def save_attachment(self, user, thread, file_id, filename, size, content):
+    async def save_attachment(
+        self, user, thread, file_id, filename, size, content, file_request_id=None
+    ):
         """Store extracted attachment text under a per-thread quota.
 
-        The conditional insert enforces the 24 MiB thread quota atomically.
-        / 条件插入以原子方式执行每线程 24 MiB 配额。
+        The conditional insert enforces the 128 MiB thread quota atomically; a repeated client
+        file request id returns the existing row instead of storing a duplicate.
+        / 条件插入以原子方式执行每线程 128 MiB 配额；重复的客户端文件请求标识返回已有行，
+        不重复存储。
 
         Args:
             user: Owning user id. / 所属用户 ID。
@@ -1138,20 +1923,113 @@ class SQLiteConversationStore:
             filename: Original display filename. / 原始显示文件名。
             size: Original byte size. / 原始字节大小。
             content: Extracted UTF-8 text. / 提取出的 UTF-8 文本。
+            file_request_id: Optional stable client identity for retry reconciliation.
+                / 可选的稳定客户端标识，用于重试对账。
 
         Returns:
-            True when the row was stored, False when the quota was exceeded.
-            / 已存储为 True；超出配额为 False。
+            Stored file id, or None when the quota was exceeded.
+            / 已存储的文件 ID；超配额时为 None。
         """
+        if file_request_id is not None:
+            existing = await self.get_attachment_by_request_id(user, thread, file_request_id)
+            if existing is not None:
+                return existing["id"]
         async with self._connection.execute(
             """INSERT INTO conversation_files
-               SELECT ?, ?, ?, ?, ?, ? WHERE (
+               SELECT ?, ?, ?, ?, ?, ?, ? WHERE (
                  SELECT coalesce(sum(byte_size), 0) FROM conversation_files
                  WHERE user_id=? AND thread_id=?
                ) + ? <= ?""",
-            (file_id, user, thread, filename, size, content, user, thread, size, 128 * 1024 * 1024),
+            (
+                file_id,
+                user,
+                thread,
+                filename,
+                size,
+                content,
+                file_request_id,
+                user,
+                thread,
+                size,
+                128 * 1024 * 1024,
+            ),
         ) as cursor:
-            return cursor.rowcount == 1
+            return file_id if cursor.rowcount == 1 else None
+
+    async def get_attachment_by_request_id(
+        self, user: str, thread: str, file_request_id: str
+    ) -> dict | None:
+        """Load the attachment already stored for one client file request id. /
+        读取某个客户端文件请求标识已存储的附件。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread owning the file. / 文件所属线程。
+            file_request_id: Stable client identity. / 稳定客户端标识。
+
+        Returns:
+            Attachment metadata, or None when this file was never stored. /
+            附件元数据；从未存储时为 None。
+        """
+        async with self._connection.execute(
+            """SELECT id, filename, byte_size FROM conversation_files
+               WHERE user_id=? AND thread_id=? AND file_request_id=?""",
+            (user, thread, file_request_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return (
+            dict(zip(("id", "filename", "byte_size"), row, strict=True)) if row else None
+        )
+
+    async def attachment_usage(self, user: str, thread: str) -> int:
+        """Sum the stored attachment bytes of one thread. / 统计会话已存储附件的字节数。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread identifier. / 线程标识。
+
+        Returns:
+            Total stored bytes used by this thread's uploads. / 该会话上传占用的总字节数。
+        """
+        async with self._connection.execute(
+            """SELECT coalesce(sum(byte_size), 0) FROM conversation_files
+               WHERE user_id=? AND thread_id=?""",
+            (user, thread),
+        ) as cursor:
+            return int((await cursor.fetchone())[0] or 0)
+
+    async def read_attachment_metadata(self, user: str, thread: str, ids: list[str]) -> list[dict]:
+        """Read attachment metadata only, preserving request order.
+        / 仅读取附件元数据并保留请求顺序。
+
+        Missing ids are reported as invalid markers so one missing file never invalidates a
+        whole history page. / 缺失的 ID 以失效标记返回，单个缺件不会让整页历史失效。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            thread: Thread owning the files. / 文件所属线程。
+            ids: Requested attachment ids in order. / 按顺序请求的附件 ID。
+
+        Returns:
+            Metadata records with a ``missing`` flag for unavailable ids. / 含失效标记的元数据记录。
+        """
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        async with self._connection.execute(
+            f"""SELECT id, filename, byte_size FROM conversation_files
+                WHERE user_id=? AND thread_id=? AND id IN ({placeholders})""",
+            (user, thread, *ids),
+        ) as cursor:
+            records = {
+                row[0]: dict(zip(("id", "filename", "byte_size"), row, strict=True))
+                async for row in cursor
+            }
+        return [
+            records.get(file_id)
+            or {"id": file_id, "filename": "", "byte_size": 0, "missing": True}
+            for file_id in ids
+        ]
 
     async def list_attachments(
         self, user: str, limit: int, offset: int, thread_id: str | None = None
@@ -1201,21 +2079,22 @@ class SQLiteConversationStore:
             limit: Maximum characters to return. / 本页最大字符数。
 
         Returns:
-            Filename, page text, total character count and next offset.
-            / 文件名、本页文本、总字符数与下一页偏移。
+            Filename, byte size, page text, total character count and next offset.
+            / 文件名、字节数、本页文本、总字符数与下一页偏移。
         """
         async with self._connection.execute(
-            """SELECT filename, length(content), substr(content, ?, ?)
+            """SELECT filename, byte_size, length(content), substr(content, ?, ?)
                FROM conversation_files WHERE user_id=? AND thread_id=? AND id=?""",
             (offset + 1, limit, user, thread, file_id),
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
             raise LookupError("Attachment is unavailable in this conversation.")
-        filename, total, text = row
+        filename, byte_size, total, text = row
         end = offset + len(text)
         return {
             "filename": filename,
+            "byte_size": byte_size,
             "text": text,
             "total_chars": total,
             "next_offset": end if end < total else None,

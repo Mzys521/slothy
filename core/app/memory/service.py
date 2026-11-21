@@ -3,6 +3,7 @@
 
 import json
 import re
+from dataclasses import dataclass
 from uuid import uuid4
 
 from app.memory.semantics import (
@@ -14,6 +15,49 @@ from app.memory.semantics import (
     normalized,
 )
 from app.personalization.evolution import SENSITIVE, MemoryEvolution, profile_key
+from app.personalization.settings import MemoryConfiguration
+
+
+@dataclass(frozen=True)
+class CapacityPlan:
+    """Capacity decision for one active-memory limit.
+    / 单个有效记忆上限的容量决策。
+
+    Attributes:
+        limit: Requested active-memory limit. / 请求的有效记忆上限。
+        active: Active fact count before archiving. / 归档前的有效事实数。
+        protected: Minimum capacity that must stay active. / 必须保留的最低容量。
+        required: Facts that must be archived to reach the limit. / 为达到上限必须归档的事实数。
+        archivable: Unprotected active facts available as candidates. / 可归档的非保护候选数。
+        reachable: Whether the candidates suffice for the requested limit. / 候选是否足够。
+        archive: Candidate ids that would be archived, when reachable. / 可达时将被归档的候选 ID。
+    """
+
+    limit: int
+    active: int
+    protected: int
+    required: int
+    archivable: int
+    reachable: bool
+    archive: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict:
+        """Return the JSON-safe capacity projection used by the settings API.
+
+        / 返回设置接口使用的容量投影（可 JSON 序列化）。
+
+        Returns:
+            Mapping with the limit, counts and reachability. / 含上限、计数与可达性的映射。
+        """
+
+        return {
+            "limit": self.limit,
+            "active": self.active,
+            "protected": self.protected,
+            "required": self.required,
+            "archivable": self.archivable,
+            "reachable": self.reachable,
+        }
 
 
 def _profile_value(raw: str):
@@ -113,32 +157,307 @@ class MemoryService(MemoryEvolution):
         )
         return inserted
 
-    async def ensure_capacity(self, user, incoming=1):
-        configuration = (await self.planner.configuration(user))[1] if self.planner else None
-        limit = configuration.active_limit if configuration else 500
-        c = configuration.strength_c if configuration else 4.0
+    @staticmethod
+    def _capacity_rank(memory, strength_c):
+        """Rank unprotected facts for capacity archiving. / 为容量归档排序非保护事实。
+
+        Args:
+            memory: Active fact row with importance and effective frequency. /
+                含重要度与实际频次的有效事实行。
+            strength_c: Half-saturation constant of the scoring function. / 评分函数的半饱和常数。
+
+        Returns:
+            Sort key: lower-value facts are archived first. / 排序键：价值较低的事实优先归档。
+        """
+
+        return (
+            0.6 * memory["importance"]
+            + 0.4 * frequency_strength(memory["effective_frequency"], strength_c),
+            memory["id"],
+        )
+
+    async def _configured_strength_c(self, user):
+        """Read the scoring parameter saved with the current configuration.
+
+        / 读取当前配置中保存的评分参数。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+
+        Returns:
+            Configured ``strength_c`` or the deployment default.
+            / 配置的 ``strength_c`` 或部署默认值。
+        """
+
+        saved = await self.conversations.memory_configuration(user)
+        configuration = MemoryConfiguration.model_validate(saved[1]) if saved else None
+        return configuration.strength_c if configuration else MemoryConfiguration().strength_c
+
+    async def _plan_capacity(self, user, limit, strength_c=None, incoming=0):
+        """Compute the capacity plan without acquiring the write lock.
+
+        Callers either hold ``self.lock`` already or are inside a workspace transaction.
+        / 计算容量计划但不获取写锁；调用方已持有 ``self.lock`` 或处于工作区事务中。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            limit: Target active-memory limit. / 目标有效记忆上限。
+            strength_c: Scoring constant; reads the saved configuration when omitted. /
+                评分常数；省略时读取已保存配置。
+            incoming: Facts about to be inserted before archiving. / 归档前即将插入的事实数。
+
+        Returns:
+            The capacity decision for the requested limit. / 请求上限的容量决策。
+        """
+
+        if strength_c is None:
+            strength_c = await self._configured_strength_c(user)
         active = await self.rows(
             "SELECT id,importance,effective_frequency,protected FROM "
             "workspace_memories WHERE user_id=? AND status='active'",
             (user,),
         )
-        required = len(active) + incoming - limit
-        if required <= 0:
-            return True
         candidates = sorted(
             (m for m in active if not m["protected"]),
-            key=lambda m: (
-                0.6 * m["importance"] + 0.4 * frequency_strength(m["effective_frequency"], c),
-                m["id"],
-            ),
+            key=lambda memory: self._capacity_rank(memory, strength_c),
         )
-        if len(candidates) < required:
+        required = max(0, len(active) + incoming - limit)
+        reachable = required <= len(candidates)
+        return CapacityPlan(
+            limit=limit,
+            active=len(active),
+            protected=len(active) - len(candidates),
+            required=required,
+            archivable=len(candidates),
+            reachable=reachable,
+            archive=tuple(m["id"] for m in candidates[:required]) if reachable else (),
+        )
+
+    async def plan_capacity(self, user, new_limit, strength_c=None):
+        """Plan archiving for a new limit under the memory write lock.
+
+        Protected facts form the minimum capacity; only unprotected facts are candidates.
+        / 在记忆写锁下为新上限规划归档；受保护事实构成最低容量，只有非保护事实可作候选。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            new_limit: Requested active-memory limit. / 请求的有效记忆上限。
+            strength_c: Scoring constant to rank candidates, or None for the saved one. /
+                排序候选使用的评分常数；None 表示读取已保存值。
+
+        Returns:
+            The capacity decision for the requested limit. / 请求上限的容量决策。
+        """
+
+        async with self.lock:
+            return await self._plan_capacity(user, new_limit, strength_c)
+
+    async def ensure_capacity(self, user, incoming=1):
+        configuration = (await self.planner.configuration(user))[1] if self.planner else None
+        limit = configuration.active_limit if configuration else 500
+        c = configuration.strength_c if configuration else 4.0
+        plan = await self._plan_capacity(user, limit, c, incoming)
+        if plan.required <= 0:
+            return True
+        if not plan.reachable:
             await self.audit(user, "capacity_blocked", reason="all_remaining_facts_protected")
             return False
-        for memory in candidates[:required]:
-            await self.store.update_memory(user, memory["id"], {"status": "archived"})
-            await self.audit(user, "archived", memory["id"], "capacity")
+        for memory_id in plan.archive:
+            await self.store.update_memory(user, memory_id, {"status": "archived"})
+            await self.audit(user, "archived", memory_id, "capacity")
         return True
+
+    async def reconcile_configuration(self, user, revision):
+        """Apply one saved configuration revision to facts, profile and scoring.
+
+        A save advances the stored revision before capacity reconciliation; this method makes
+        the application idempotent so a crash, restart or retry converges. It archives
+        over-capacity facts and rebuilds the profile inside one workspace transaction, then
+        marks the revision applied and updates the scoring parameter.
+        / 保存会先推进修订号，再执行容量协调；本方法保证应用幂等，使崩溃、重启或重试都能收敛。
+        它在同一个工作区事务内归档超容量事实并重建画像，随后标记该修订已生效并更新评分参数。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            revision: Saved revision to apply. / 要应用的已保存修订号。
+
+        Returns:
+            Application state with ``applied`` and ``capacity`` details, or None when the
+            revision does not exist. / 含 ``applied`` 与 ``capacity`` 的应用状态；修订不存在
+            时为 None。
+        """
+
+        state = await self.conversations.memory_configuration_state(user)
+        if state is None:
+            return None
+        if state["applied_revision"] >= revision:
+            return {**state, "applied": True, "capacity": None}
+        if state["revision"] != revision:
+            # A newer save superseded this revision, which stays pending for the next retry.
+            # 更新的保存已取代此修订；该修订由下一次重试继续处理。
+            return {**state, "applied": False, "capacity": None}
+        configuration = MemoryConfiguration.model_validate(state["configuration"])
+        async with self.transaction():
+            current = await self.conversations.memory_configuration_state(user)
+            if current is None:
+                return None
+            if current["applied_revision"] >= revision:
+                return {**current, "applied": True, "capacity": None}
+            if current["revision"] != revision:
+                return {**current, "applied": False, "capacity": None}
+            configuration = MemoryConfiguration.model_validate(current["configuration"])
+            plan = await self._plan_capacity(
+                user, configuration.active_limit, configuration.strength_c
+            )
+            if not plan.reachable:
+                # The revision stays pending; protected facts must leave the active set first.
+                # 该修订保持待应用；需先让受保护事实退出有效集合。
+                return {**current, "applied": False, "capacity": plan.as_dict()}
+            for memory_id in plan.archive:
+                await self.store.update_memory(user, memory_id, {"status": "archived"})
+                await self.audit(user, "archived", memory_id, "capacity")
+            await self.rebuild(user)
+        await self.conversations.mark_memory_configuration_applied(user, revision)
+        final = await self.conversations.memory_configuration_state(user) or state
+        if final["revision"] == revision:
+            parameters = getattr(self.store, "strength_parameters", None)
+            if parameters is None:
+                parameters = self.store.strength_parameters = {}
+            parameters[user] = configuration.strength_c
+        return {
+            **final,
+            "applied": final["applied_revision"] >= revision,
+            "capacity": plan.as_dict(),
+        }
+
+    async def resume_pending_configurations(self):
+        """Apply saved revisions whose capacity reconciliation did not finish.
+
+        A capacity conflict waits for the user to free protected capacity; a transient failure
+        keeps returning True so the worker retries it. / 容量冲突等待用户释放受保护容量；暂时性
+        失败持续返回 True，由工作器继续重试。
+
+        Returns:
+            True when at least one revision needs another apply attempt.
+            / 仍有修订需要再次尝试应用时为 True。
+        """
+
+        remaining = False
+        for user, revision in await self.conversations.pending_memory_configurations():
+            try:
+                result = await self.reconcile_configuration(user, revision)
+            except Exception:
+                remaining = True
+                continue
+            if result is None or result["revision"] != revision:
+                continue
+            if not result["applied"] and result.get("capacity") is None:
+                remaining = True
+        return remaining
+
+    async def _ensure_projection_state(self):
+        """Create the durable pending-projection marker table on first use.
+
+        The marker lives in the workspace database so a failed profile rebuild is recorded
+        atomically with the facts that made it necessary. / 标记存放在工作区数据库中，使画像重建
+        失败与引发它的事实写入在同一事务内原子记录。
+        """
+
+        await self.db.execute(
+            """CREATE TABLE IF NOT EXISTS memory_projection_state (
+                user_id TEXT PRIMARY KEY,
+                needs_rebuild INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                requested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            )"""
+        )
+
+    async def mark_rebuild_pending(self, user, error="PROFILE_REBUILD_FAILED"):
+        """Persist a needs-rebuild marker inside the caller's fact transaction.
+
+        / 在调用方的事实事务内持久化待重建标记。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            error: Stable failure code kept for diagnostics. / 用于诊断的稳定失败码。
+        """
+
+        await self._ensure_projection_state()
+        await self.db.execute(
+            """INSERT INTO memory_projection_state (user_id, needs_rebuild, last_error)
+               VALUES (?,1,?) ON CONFLICT(user_id) DO UPDATE SET needs_rebuild=1,
+               last_error=excluded.last_error,
+               requested_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')""",
+            (user, error),
+        )
+
+    async def clear_rebuild_pending(self, user):
+        """Clear one durable needs-rebuild marker. / 清除一个持久化待重建标记。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+        """
+
+        await self._ensure_projection_state()
+        await self.db.execute(
+            "UPDATE memory_projection_state SET needs_rebuild=0,last_error=NULL WHERE user_id=?",
+            (user,),
+        )
+
+    async def pending_rebuilds(self):
+        """List users whose profile projection still needs a rebuild.
+
+        / 列出画像投影仍待重建的用户。
+
+        Returns:
+            User ids with an outstanding marker. / 仍有未完成标记的用户 ID。
+        """
+
+        await self._ensure_projection_state()
+        records = await self.rows(
+            "SELECT user_id FROM memory_projection_state WHERE needs_rebuild=1 ORDER BY user_id"
+        )
+        return [record["user_id"] for record in records]
+
+    async def retry_projection(self, user):
+        """Rebuild one pending profile projection and clear its marker on success.
+
+        / 重建一个待处理画像投影；成功时清除标记。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+
+        Returns:
+            True when the projection converged. / 投影已收敛时为 True。
+        """
+
+        try:
+            async with self.transaction():
+                await self.rebuild(user)
+                await self.refresh_relationships(user)
+                await self.clear_rebuild_pending(user)
+        except Exception as error:
+            await self._record_projection_failure(user, error)
+            return False
+        return True
+
+    async def _record_projection_failure(self, user, error):
+        """Record a failed projection retry without blocking the learner.
+
+        / 记录一次失败的投影重试，但不阻塞学习器。
+
+        Args:
+            user: Owning user id. / 所属用户 ID。
+            error: The failure raised by the rebuild attempt. / 重建尝试抛出的失败。
+        """
+
+        await self._ensure_projection_state()
+        await self.db.execute(
+            "UPDATE memory_projection_state SET attempts=attempts+1,last_error=? "
+            "WHERE user_id=? AND needs_rebuild=1",
+            (type(error).__name__, user),
+        )
 
     async def confirm(self, claim, value, *, rebuild=True, override=False):
         user = claim["user_id"]

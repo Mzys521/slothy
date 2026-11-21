@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { Archive, ArchiveRestore, BriefcaseBusiness, MessageSquare, Trash2 } from 'lucide-vue-next'
-import { activeWorkspace, archiveSession, deleteSession, runningSessions, sessions, sessionWorkspace, syncArchivedSessions, workspaceName, workspaces, type Session, type Turn } from './chat'
+import { activeWorkspace, archiveSession, cleanupConflict, cleanupConflictMessage, deleteSession, runningSessions, sessions, sessionWorkspace, syncArchivedSessions, workspaceName, workspaces, type Session, type Turn } from './chat'
 import { t } from './preferences'
 import { threadPath, workRequest } from './workApi'
 import MarkdownText from './MarkdownText.vue'
@@ -33,7 +33,8 @@ async function loadArchive() {
   try {
     await syncArchivedSessions()
   } catch (cause) {
-    archiveLoadError.value = cause instanceof Error ? cause.message : t('Could not load archived sessions.', '无法读取归档会话。')
+    archiveLoadError.value = cleanupConflict(cause) ? cleanupConflictMessage()
+      : cause instanceof Error ? cause.message : t('Could not load archived sessions.', '无法读取归档会话。')
   } finally {
     archiveLoading.value = false
   }
@@ -124,7 +125,8 @@ async function loadPreview() {
     current.items.push(...page.items)
     current.cursor = page.next_cursor ?? undefined
   } catch (cause) {
-    current.error = cause instanceof Error ? cause.message : t('Could not load conversation.', '无法读取对话。')
+    current.error = cleanupConflict(cause) ? cleanupConflictMessage()
+      : cause instanceof Error ? cause.message : t('Could not load conversation.', '无法读取对话。')
   } finally {
     current.loading = false
   }
@@ -149,7 +151,8 @@ async function change(action: () => Promise<void>) {
       preview.value = undefined
     }
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : t('Session update failed.', '会话更新失败。')
+    error.value = cleanupConflict(cause) ? cleanupConflictMessage()
+      : cause instanceof Error ? cause.message : t('Session update failed.', '会话更新失败。')
   } finally {
     busy.value = false
   }

@@ -18,7 +18,7 @@ import SettingsLayout from './SettingsLayout.vue'
 import { configurationError, configurationLoaded, configurationLoading, loadProviderSettings, setupRequired } from './providerSettings'
 import { developmentOnboarding } from './providerForm'
 import { accountProfile, loadAccount } from './account'
-import { activeSession, activeWorkspace, archiveSession, createWorkspace, forkSession, newChat, personalWorkspaceId, removeWorkspace, renameWorkspace, runningSessions, selectSession, sessions, sessionWorkspace, syncWorkspaceData, workspaceName, workspaceDirectory, workspaces, type Session } from './chat'
+import { activeSession, activeWorkspace, archiveSession, cleanupConflict, cleanupConflictMessage, createWorkspace, forkSession, newChat, personalWorkspaceId, removeWorkspace, renameWorkspace, runningSessions, selectSession, sessions, sessionWorkspace, syncWorkspaceData, workspaceName, workspaceDirectory, workspaces, type Session } from './chat'
 import { t, zh } from './preferences'
 import { threadPath, workRequest } from './workApi'
 import { copyText } from './clipboard'
@@ -315,7 +315,8 @@ async function saveWorkspace() {
     }
     workspaceDialog.value?.close()
   } catch (error) {
-    workspaceError.value = error instanceof Error ? error.message : t('Could not save changes.', '无法保存更改。')
+    workspaceError.value = cleanupConflict(error) ? cleanupConflictMessage()
+      : error instanceof Error ? error.message : t('Could not save changes.', '无法保存更改。')
   } finally {
     workspaceBusy.value = false
   }
@@ -391,7 +392,7 @@ async function togglePin(item: Session) {
     await updateSessionMetadata(item, { pinned })
     item.pinnedAt = pinned ? Date.now() : undefined
   } catch (error) {
-    actionNotice.value = error instanceof Error ? error.message : t('Could not update session.', '无法更新会话。')
+    actionNotice.value = cleanupConflict(error) ? cleanupConflictMessage() : error instanceof Error ? error.message : t('Could not update session.', '无法更新会话。')
   }
 }
 /**
@@ -408,7 +409,7 @@ async function toggleArchive(item: Session) {
   try {
     await archiveSession(item.id, !item.archived)
   } catch (error) {
-    actionNotice.value = error instanceof Error ? error.message : t('Could not update session.', '无法更新会话。')
+    actionNotice.value = cleanupConflict(error) ? cleanupConflictMessage() : error instanceof Error ? error.message : t('Could not update session.', '无法更新会话。')
   } finally {
     archiving.value.delete(item.id)
   }
@@ -429,7 +430,7 @@ async function branchSession(item: Session) {
     await forkSession(item, title + t(' (fork)', '（分叉）'))
     navigate('chat')
   } catch (error) {
-    actionNotice.value = error instanceof Error ? error.message : t('Could not fork session.', '无法分叉会话。')
+    actionNotice.value = cleanupConflict(error) ? cleanupConflictMessage() : error instanceof Error ? error.message : t('Could not fork session.', '无法分叉会话。')
   } finally {
     forking.value.delete(item.id)
   }

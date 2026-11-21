@@ -116,6 +116,8 @@ export interface PendingRun {
   checkpoint_id: string
   message: string
   status: 'interrupted' | 'failed' | 'awaiting_approval'
+  /** Stable request identity when the server projects it. / 服务端投影时提供的稳定请求标识。 */
+  client_request_id?: string | null
   attachments: { id: string; filename: string; byte_size: number }[]
   references: ReferenceItem[]
   model_selection: { id?: string; effort?: string }
@@ -214,11 +216,14 @@ export interface UploadedAttachment {
  *
  * @param thread - Thread the file is attached to. / 文件所属的线程。
  * @param file - Browser `File` selected by the user. / 用户选择的浏览器 `File`。
+ * @param signal - Cancels the upload with its owning request. / 随所属请求一起取消上传。
+ * @param fileRequestId - Stable per-file request id so a retry reuses the stored file. /
+ *     稳定的逐文件请求标识，使重试可以复用已存储的文件。
  * @returns Attachment metadata from the server. / 服务端返回的附件元数据。
  */
-export function uploadAttachment(thread: string, file: File, signal?: AbortSignal) {
+export function uploadAttachment(thread: string, file: File, signal?: AbortSignal, fileRequestId?: string) {
   return apiRequest<UploadedAttachment>(threadPath(thread) + '/attachments?filename=' +
-    encodeURIComponent(file.name), {
+    encodeURIComponent(file.name) + (fileRequestId ? '&file_request_id=' + encodeURIComponent(fileRequestId) : ''), {
     method: 'POST', body: file, headers: { 'Content-Type': 'application/octet-stream' }, signal,
   })
 }

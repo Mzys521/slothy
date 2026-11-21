@@ -9,6 +9,111 @@ the four-part Windows version followed by a prerelease suffix.
 > 0.1.0 – 0.3.0). This line continues with the current desktop application and
 > keeps that history for reference.
 
+## [0.1.5] — 2026-11-22
+
+Stable Windows x64 release. This release contains fixes from the architecture and
+defect audit of `0.1.4.2-beta` (branch `explore`, commit `630f8ad`).
+See the [English and Chinese release notes](docs/releases/0.1.5.md).
+
+### Fixed
+
+- **P0: startup no longer deletes existing business databases.** A missing or outdated
+  side marker used to reset the three databases. Startup now probes the existing data
+  read-only (copies with WAL, never opens originals for writing) and adopts data whose
+  schema matches; legacy, future, damaged or undeterminable data raises
+  `StorageRecoveryRequired` and keeps every file. The service then serves only `/health`
+  and `/storage/recovery`, and the desktop asks the user to keep the original directory
+  (verified backup, then in-place upgrade with the existing additive migrations) or to
+  start fresh after a verified backup. The default deletion branch is gone.
+- **P1: a failed new message can no longer resume the previous run.** Desktop turns send
+  a stable `client_request_id`; the server claims exactly one run per request id, returns
+  the same run for a repeated submission and `409 REQUEST_CONFLICT` for different input.
+  `/resume` accepts `run_id` and validates both identity and the saved checkpoint; an
+  unqualified resume of an already completed run now returns `409 NO_PENDING_RUN`. A new
+  read-only `GET /threads/{id}/run-status` reports not started, pending, awaiting
+  approval, completed (with the archived result) or failed.
+- **P1: checkpoint reads no longer depend on a configured model.** A projection graph with
+  the execution topology reads the native checkpoints, and the archive step is shared, so
+  pending runs, approvals and lost-acknowledgement results stay readable after every
+  provider is removed; moving a session always checks pending runs.
+- **P1: diagnostics can no longer fail a successful model call.** Model-call records are
+  queued synchronously and written by a bounded background task; disk errors, a full
+  queue or a missing journal only raise health counters, never replace the provider
+  exception and never re-call the model. Session logs rotate by size, reads are bounded to
+  the newest records, and error records keep only the exception type and structured codes.
+- **P1: attachments are read by purpose.** History and chat validation use one metadata
+  query per page (missing files become invalid markers instead of failing the page),
+  references read bounded SQLite pages, uploads check the session and remaining quota
+  before buffering, spool large bodies to disk, bound document parsing concurrency, and
+  normalize damaged/encrypted PDFs to `422 ATTACHMENT_UNREADABLE`. Repeated
+  `file_request_id` uploads return the stored attachment.
+- **P1: clearing and deleting are retryable business operations.** A durable cleanup task
+  records each step (checkpoint, memory evidence, archive rows, profile snapshot, runtime
+  journal) so an interrupted run resumes at startup or on a repeated request; the API
+  returns `204` when everything finished or `202` with an operation id, and
+  `GET /operations/{id}` reports progress. Sessions being cleaned reject new writes, and a
+  workspace being deleted blocks new or moved sessions.
+- **P1: accepted references that disappear no longer stop a run.** Runtime revalidation
+  reports the missing item with `included: false` and a reason code, keeps resolving the
+  rest, removes the stale body from the next model request, and the run completes with a
+  warning while the approved tool tasks stay in the same run.
+- **P1: artifacts resolve by their generation-time locator.** Produced artifacts are
+  registered with the producing user, session, workspace root and manifest key; downloads
+  use that locator, so moving a session keeps old links working, forks inherit the
+  association and keep working after the source session is deleted, unrelated sessions get
+  `404`, and retention never prunes a manifest a session still references.
+- **P1: the model's context window now bounds each request.** The run carries the window,
+  its source (catalog or conservative default) and an output reserve; before every call,
+  optional references are dropped first and then the oldest complete turns are compressed,
+  keeping the current message and surviving tool call/result pairs. Metrics record the
+  applied budget, and a request whose minimal prompt still exceeds the window fails with
+  `422 CONTEXT_LIMIT_EXCEEDED`; an edited message can start a new turn.
+- **P2: the decision layer's availability matches execution.** The selected decision model
+  reuses the chat provider's protocol adapter (including native Anthropic), settings
+  availability and execution share one resolver, an independent backend loads
+  `DECISION_*` / `DASHSCOPE__*` when nothing was saved, and desktop/backend "unset" is
+  distinct from "explicitly off". Plans now constrain the model-visible tool subset, tool
+  quota, memory count and reference budget in `enforce`; `shadow` stays metric-only with
+  the same model input as `off`, and fallback restores chat-model autonomy.
+- **P2: memory settings distinguish saved from applied.** A save records a pending
+  revision and a capacity plan; protected facts above the requested limit return
+  `409 MEMORY_CAPACITY_PROTECTED` with the protected count and leave the revision
+  unchanged. Application (archive, profile rebuild, scoring) is idempotent and resumes at
+  startup, the API reports saved and applied revisions plus capacity, and the settings UI
+  shows the difference instead of claiming success.
+- **P2: frontend reads are owned by the current request.** Work details, the thread index
+  and per-session history capture a generation/version before reading and discard stale
+  writes; a run that starts and finishes during a read, a clear, or a newer read can no
+  longer overwrite the newer state.
+
+### Changed
+
+- `DELETE /threads/{id}`, `DELETE /threads/{id}/messages` and `DELETE /workspaces/{id}`
+  may now answer `202` with an operation id instead of `204`.
+- `POST /chat` accepts `client_request_id`; `POST /threads/{id}/resume` accepts `run_id`;
+  `POST /threads/{id}/attachments` accepts `file_request_id`.
+- History and pending-run payloads include `client_request_id`; attachments include a
+  `missing` marker; run metrics include the applied input budget.
+- Decision settings return `mode`, `source` and `reason` alongside `model` and
+  `available`; memory settings return `applied_revision`, `pending_application` and
+  `capacity`.
+
+### Documentation
+
+- Both READMEs now show localized PNG architecture diagrams. The architecture, API and
+  getting-started guides document storage recovery, run identity and the Windows build.
+
+### Verification
+
+- Backend: 551 pytest tests passed. Ruff passed.
+- Renderer and desktop: 92 Node tests passed. TypeScript type checking passed.
+- Windows x64 NSIS build and production bundle audit passed. The installer and blockmap
+  have SHA-256 checksums. The installer is unsigned.
+- Packaged-backend acceptance passed with a local test model.
+- Migration rehearsal against a copy of real local V3-era data: detected as legacy,
+  adopted with a verified backup, row counts unchanged (8 turns, 2 threads, 64
+  checkpoints), second startup stable, and history readable with no provider configured.
+
 ## [0.1.4.2-beta] — 2026-11-10
 
 Beta release. This is the first merged release from the `explore` line; back up local data before upgrading.

@@ -128,18 +128,20 @@ Execution properties:
 
 ### 4.1 Model-driven decision layer
 
-One `decide` node runs between `prepare_run` and `load_profile`. The decision model is
-selected in Settings → API from the configured provider catalog; its key and base URL
-come from that provider, and the selection is stored without secrets. It returns a
-structured plan: route (identity/model/tool), tool subset, context budget and recovery
-hints. Deterministic guards clamp the plan against the model catalog, the live tool
-registry, approval requirements and budgets; a proposal can never relax approval or add
-an unknown tool. With no decision model selected, the chat model decides autonomously.
-If a configured decision model times out, returns invalid JSON or exceeds its budget,
-control is handed back to the chat model; the legacy `DECISION_MODE` / `DASHSCOPE__*`
-environment variables remain available for backend-only runs. Plans and reason codes are
-persisted in graph state and metrics and never enter prompt-cache text. The plan and reason codes live in graph state and metrics;
-they never enter L1/L2 prompt text.
+The `decide` node runs between `prepare_run` and `load_profile`. Settings → API
+stores the selected model ID. Availability checks and runtime calls use the same
+provider adapter, including native Anthropic and OpenAI-compatible endpoints.
+
+- `off` skips the decision model, `shadow` records its plan and reasons without
+  changing model input, and `enforce` can narrow the tool set, tool calls, memory
+  count and explicit-reference budget. An empty tool list allows zero tools.
+  A `null` list leaves the tool set unrestricted by the plan.
+- Existing approval requirements, live tool availability and deployment budgets
+  still apply. Recovery hints are advisory. Only versioned decision plans affect execution.
+- A timeout or malformed plan returns control to the chat model. The standalone
+  backend can load `DECISION_MODE` / `DASHSCOPE__*` when no decision setting has
+  been saved. Saving an empty selection explicitly disables the decision layer.
+- Plans and reason codes stay in graph state and metrics, outside L1/L2 prompt text.
 
 ## 5. Memory and user profile V3
 
@@ -314,7 +316,7 @@ scripts.
 
 ## 11. Diagrams
 
-- [`docs/diagrams/architecture-overall.svg`](diagrams/architecture-overall.svg) — process and layer overview
+- Architecture overview PNGs in [English](assets/diagrams/architecture-en.png) and [简体中文](assets/diagrams/architecture-zh-CN.png)
 - [`docs/diagrams/sequence-chat.svg`](diagrams/sequence-chat.svg) — one chat turn, including tool review
 - [`docs/diagrams/sequence-memory-update.svg`](diagrams/sequence-memory-update.svg) — memory learning and profile projection
 - [`docs/diagrams/er-diagram.svg`](diagrams/er-diagram.svg) — persistence relationships
@@ -332,14 +334,22 @@ scripts.
   `off`), but scheduled consolidation, decay, TTL and permanent deletion remain
   reserved settings and are not executed automatically.
 - Memory retrieval is lexical today; embeddings are an explicit future step.
-- Conversation branching is documented but not implemented yet.
+- Conversation forks copy archived turns and the graph checkpoint. Artifact links
+  retain their generation-time locator, and workspace files remain in the original directory.
 
-## V3 data epoch
+## 13. Startup storage protection
 
-Before opening stores, `prepare_storage` resets exactly the three business databases
-under an exclusive lock and writes an atomic `.storage.json` marker. Independent
-configuration files and actual workspace files remain. The marker precedes opening
-new stores, so restart never deletes accepted V3 data. The renderer clears legacy
-conversation caches on `/runtime.data_epoch` change and does not import old messages.
-Every model call and approval resumption revalidates frozen fact IDs, states and
-values; corrected/archived/deleted values leave L1 and new values enter L3.
+`prepare_storage` checks the three databases under an exclusive lock before opening
+them. It inspects copies of the databases and their WAL files to verify the schema.
+An empty data directory can initialize directly. A verified current schema keeps
+its data and can recover from a missing `.storage.json` marker.
+
+When startup finds legacy, newer, damaged or unrecognized storage, the service
+enters recovery mode and exposes `/health` and `/storage/recovery`. The desktop can
+upgrade eligible legacy data in place after verifying a backup, or initialize a
+fresh store after backing up and verifying the old databases. The startup path
+keeps the original databases until a recovery choice is made.
+
+The renderer uses `/runtime.data_epoch` to refresh local session and workspace
+caches after successful startup. Model calls and approval resumption revalidate
+frozen fact IDs, states and values before including them in context.

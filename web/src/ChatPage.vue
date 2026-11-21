@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ChevronDown, ChevronRight, CircleAlert, File as FileIcon, History, LoaderCircle, PanelRight, Plus, Send, ShieldCheck, Square, SquarePlus, Trash2, X } from 'lucide-vue-next'
-import { activeSession, activeWorkspace, clearSession, newChat, runningRequests as requestControllers, runningSessions, runningTurnIds, selectSession, sessions, sessionWorkspace, syncThreadMessages, workspaces, type ChatMode, type Session, type Turn, type WorkOptions } from './chat'
+import { activeSession, activeWorkspace, cleanupConflict, cleanupConflictMessage, clearSession, fileRequestId, newChat, retryPlan, runningRequests as requestControllers, runningSessions, runningTurnIds, selectSession, sessions, sessionWorkspace, syncThreadMessages, workspaces, type ChatMode, type RetryPlan, type Session, type Turn, type WorkOptions } from './chat'
 import { readLocal, settings, t, writeLocal } from './preferences'
 import MarkdownText from './MarkdownText.vue'
 import ReasoningTrace from './ReasoningTrace.vue'
@@ -21,7 +21,8 @@ import ReferenceChip from './composer/ReferenceChip.vue'
 import { useComposerPalette } from './composer/useComposerPalette'
 import { useComposerCommands } from './composer/useComposerCommands'
 import type { PaletteItem } from './composer/types'
-import { beginSessionRequest, finishSessionRequest, liveReplies, liveReasoning, pendingSessionActions } from './sessionRuns'
+import { beginSessionRequest, finishSessionRequest, liveReplies, liveReasoning, pendingSessionActions, sessionVersion } from './sessionRuns'
+import { ReadGuard } from './readGuard'
 import { commandAvailable, filterCommands, findCommand, parseCommand } from './commands/registry'
 import type { CommandName } from './commands/types'
 import { searchReferences } from './references/providers'
@@ -73,6 +74,12 @@ const composer = ref<HTMLTextAreaElement>()
 const fileInput = ref<HTMLInputElement>()
 const workBusy = computed(() => runningSessions.has(activeSession.value) || pendingSessionActions.has(activeSession.value))
 const workError = ref('')
+// Files that still belong to one local turn, so a retry can finish interrupted uploads.
+// 仍属于某个本地轮次的文件，使重试可以完成中断的上传。
+const pendingUploads = new Map<string, File[]>()
+// Only the latest approval read of a session may publish its result.
+// 只有某个会话最新的审批读取可以提交结果。
+const reviewReads = new ReadGuard<string>()
 const selectedReferences = ref<ReferenceItem[]>([])
 const referenceTextConfirm = ref(false)
 const composerArea = ref<HTMLElement>()
@@ -202,6 +209,9 @@ function submit(allowUnresolved?: unknown) {
       ? { work: { ...work.value } }
       : {}),
   }
+  // The local turn id is also the request identity, so retries can never fork a second run.
+  // 本地轮次 ID 同时是请求标识，使重试不会创建第二个运行。
+  turn.clientRequestId = turn.id
   if (!session.value) newChat(mode.value)
   if (!session.value) return
   if (!session.value.title) session.value.title = (text || attachments[0] || '').slice(0, 52)
@@ -221,7 +231,33 @@ function submit(allowUnresolved?: unknown) {
  * @param cause - Value thrown by the failed request. / 请求失败时抛出的值。
  */
 function showWorkError(cause: unknown) {
-  workError.value = cause instanceof Error ? cause.message : t('Work request failed.', '工作请求失败。')
+  workError.value = cleanupConflict(cause) ? cleanupConflictMessage()
+    : cause instanceof Error ? cause.message : t('Work request failed.', '工作请求失败。')
+}
+/**
+ * Finds the turn that owns a run id, matching only stable identity.
+ * 仅按稳定标识查找运行所属的轮次。
+ *
+ * @param target - Session to search. / 待搜索的会话。
+ * @param runId - Run identity to match. / 待匹配的运行标识。
+ * @returns The owning turn, if known. / 所属轮次；未知时返回 undefined。
+ */
+function turnForRun(target: Session, runId: string | undefined | null) {
+  return runId ? target.turns.find(turn => turn.serverRunId === runId) : undefined
+}
+/**
+ * Adds the turn an approval belongs to when only the review was restored.
+ * 仅在只恢复出审批时补充其所属轮次。
+ *
+ * @param target - Session that owns the review. / 审批所属会话。
+ * @param review - Pending tool review. / 待处理的工具审批。
+ * @returns The new turn, or undefined when the review carries no prompt. / 新建轮次；审批不含原文时为 undefined。
+ */
+function reviewTurn(target: Session, review: ToolReview) {
+  if (review.message === undefined) return undefined
+  const turn: Turn = { id: review.run_id, serverRunId: review.run_id, prompt: review.message, time: '', files: [] }
+  target.turns.push(turn)
+  return turn
 }
 /**
  * Reload any pending tool review for a session and merge it into its turn.
@@ -231,29 +267,27 @@ function showWorkError(cause: unknown) {
  */
 async function refreshReview(target: Session) {
   if (!target.apiThreadId) return
+  const version = sessionVersion(target.id)
+  const token = reviewReads.begin(target.id)
   try {
     const review = await workRequest<ToolReview | null>(threadPath(target.apiThreadId) + '/approval')
+    // A newer read, a newer approval or a run started meanwhile owns this session state.
+    // 较新的读取、较新的审批或期间启动的运行拥有该会话状态。
+    if (!reviewReads.owns(token, target.id) || sessionVersion(target.id) !== version) return
     target.pendingReview = review
     if (!review) return
-    const existing = target.turns.find(turn => turn.serverRunId === review.run_id)
-    if (existing) {
-      existing.activity = review.activity
-      existing.metrics = review.metrics
-      existing.memoryTrace = review.memory_trace
-      existing.responseSource = review.response_source
-      existing.usedMemoryIds = review.used_memory_ids
-      existing.references = review.references ?? existing.references
-      existing.usedReferenceIds = review.used_reference_ids ?? existing.usedReferenceIds
-    } else if (review.message !== undefined) {
-      target.turns.push({
-        id: review.run_id, serverRunId: review.run_id, prompt: review.message,
-        time: '', files: [], memory: false, activity: review.activity, metrics: review.metrics,
-        usedMemoryIds: review.used_memory_ids, memoryTrace: review.memory_trace, responseSource: review.response_source,
-        references: review.references, usedReferenceIds: review.used_reference_ids,
-      })
-    }
+    const turn = turnForRun(target, review.run_id) ?? reviewTurn(target, review)
+    if (!turn) return
+    turn.activity = review.activity
+    turn.metrics = review.metrics
+    turn.memoryTrace = review.memory_trace
+    turn.responseSource = review.response_source
+    turn.usedMemoryIds = review.used_memory_ids
+    turn.references = review.references ?? turn.references
+    turn.usedReferenceIds = review.used_reference_ids ?? turn.usedReferenceIds
   } catch (cause) {
-    if (target.id === activeSession.value) showWorkError(cause)
+    if (reviewReads.owns(token, target.id) && sessionVersion(target.id) === version &&
+      target.id === activeSession.value) showWorkError(cause)
   }
 }
 /**
@@ -296,11 +330,10 @@ function applyWorkReply(target: Session, turn: Turn, result: ToolReview | WorkRe
  * @param turn - Turn whose live state is updated while streaming. / 流式过程中持续更新的轮次。
  * @returns The final work reply or approval request. / 最终的回复或审批请求。
  */
-function runStream(owner: string, path: string, body: object, turn: Turn, signal?: AbortSignal, resolveTurn?: (run: string) => Turn) {
+function runStream(owner: string, path: string, body: object, turn: Turn, signal?: AbortSignal) {
   let toolCount = turn.activity?.filter(entry => entry.kind === 'tool').length ?? 0
   return streamWorkRequest(path, body, update => {
     if (update.event === 'activity') {
-      if (resolveTurn) turn = resolveTurn(update.run_id)
       turn.serverRunId = update.run_id
       const count = update.items.filter(entry => entry.kind === 'tool').length
       if (count > toolCount) delete liveReplies.value[turn.id]
@@ -339,19 +372,51 @@ async function loadMemoryReceipts(thread: string, turn: Turn, run: string) {
   }
 }
 /**
+ * Keeps a failed request truthful: only this turn's own pending run is resumable.
+ * 保持失败请求的状态准确：只有该轮次自己的待处理运行可恢复。
+ *
+ * @param target - Session that owns the turn. / 轮次所属会话。
+ * @param turn - Turn that just failed. / 刚失败的轮次。
+ * @param cause - Value the failed send threw. / 发送失败时抛出的值。
+ */
+function markResendable(target: Session, turn: Turn, cause: unknown) {
+  // The archive merge may have replaced the turn object with the live copy.
+  // 归档合并可能已用当前副本替换该轮次对象。
+  const live = turnForRun(target, turn.serverRunId) ?? turn
+  if (live.serverRunId && target.pendingRun?.run_id === live.serverRunId) return
+  // A failure before or outside a run leaves no checkpoint to continue.
+  // 运行之前或之外发生的失败不会留下可继续的检查点。
+  live.checkpointId = undefined
+  // An unfinished cleanup is temporary; the conflict message already says to try again.
+  // 未完成的清理属于临时状态，冲突提示已说明稍后重试。
+  if (cleanupConflict(cause)) return
+  const hint = t('Nothing was saved for this request: use /retry to send it again.',
+    '该请求尚未创建运行：可使用 /retry 重新发送。')
+  if (live.serverError && !live.serverError.includes(hint)) live.serverError = live.serverError + ' ' + hint
+}
+/**
  * Create the thread if needed, upload attachments, stream the run and record its outcome.
  * 按需创建会话、上传附件、流式执行并记录结果。
  *
  * @param target - Session the turn belongs to. / 该轮次所属会话。
  * @param turn - Turn to send and complete. / 要发送并补全的轮次。
  * @param uploads - Files to upload before sending. / 发送前要上传的文件。
+ * @returns Whether a final reply completed the run. / 运行是否以最终回复完成。
  */
 async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
   const agentMode = turn.work ? 'work' : 'chat'
+  // The request identity and original input are recorded before anything is sent.
+  // 请求标识与原始输入在发送之前记录。
+  turn.clientRequestId ??= turn.id
+  turn.attachmentIds ??= []
+  turn.serverError = undefined
+  if (uploads.length) pendingUploads.set(turn.id, uploads)
   const controller = beginSessionRequest(target.id, turn.id)
   workError.value = ''
   const startedAt = performance.now()
   let failed = false
+  let completed = false
+  let failure: unknown
   try {
     if (!target.apiThreadId) {
       const input = { mode: agentMode, title: target.title }
@@ -360,14 +425,24 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
       }, { signal: controller.signal })
       target.apiThreadId = thread.thread_id
     }
-    const attachmentIds = uploads.length ? [] : [...(turn.attachmentIds ?? [])]
-    for (const file of uploads) {
-      const attachment = await uploadAttachment(target.apiThreadId, file, controller.signal)
-      attachmentIds.push(attachment.id)
-    }
+    const attachmentIds = [...turn.attachmentIds]
     turn.attachmentIds = attachmentIds
+    for (const [index, file] of uploads.entries()) {
+      // Ids recorded by an earlier attempt are reused instead of uploaded twice.
+      // 复用此前尝试记录的附件 ID，不重复上传同一文件。
+      if (index < attachmentIds.length) continue
+      const attachment = await uploadAttachment(target.apiThreadId, file, controller.signal, fileRequestId(turn, file, index))
+      attachmentIds.push(attachment.id)
+      // Record each id as soon as its own upload succeeds.
+      // 每个附件上传成功后立即记录其 ID。
+      turn.attachmentIds = [...attachmentIds]
+    }
+    if (attachmentIds.length >= turn.files.length) pendingUploads.delete(turn.id)
     const result = await runStream(target.id, '/chat', {
       stream: true,
+      // The turn's own id is the request identity, so a resend cannot fork a second run.
+      // 轮次自身的 ID 就是请求标识，重发无法创建第二个运行。
+      client_request_id: turn.clientRequestId ?? turn.id,
       attachment_ids: attachmentIds,
       references: (turn.references ?? []).map(referencePayload),
       model: turn.model === 'auto' ? undefined : turn.model,
@@ -378,9 +453,14 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
     }, turn, controller.signal)
     turn.activityMs = performance.now() - startedAt
     applyWorkReply(target, turn, result)
+    completed = !('approval_id' in result)
   } catch (cause) {
     failed = true
-    turn.serverError = controller.signal.aborted ? t('Run stopped. Use /retry to resume.', '已停止运行，可使用 /retry 恢复。') : cause instanceof Error ? cause.message : t('Could not get a reply.', '无法获取回复。')
+    failure = cause
+    turn.serverError = controller.signal.aborted
+      ? t('Run stopped. Use /retry to resume.', '已停止运行，可使用 /retry 恢复。')
+      : cleanupConflict(cause) ? cleanupConflictMessage()
+        : cause instanceof Error ? cause.message : t('Could not get a reply.', '无法获取回复。')
     if (!disposed && target.id === activeSession.value && !draft.value && !files.value.length) {
       draft.value = turn.prompt
       files.value = uploads
@@ -391,6 +471,8 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
     finishSessionRequest(target.id, controller)
     if (failed && target.apiThreadId) await syncThreadMessages(target).catch(() => {})
   }
+  if (failed) markResendable(target, turn, failure)
+  return completed
 }
 /**
  * Approve or reject the pending tool review and continue the same run.
@@ -401,8 +483,14 @@ async function sendToAgent(target: Session, turn: Turn, uploads: File[]) {
 async function resolveReview(approved: boolean) {
   const target = session.value
   const review = target?.pendingReview
-  const turn = target?.turns.find(item => item.serverRunId === review?.run_id) ?? target?.turns.at(-1)
-  if (!target?.apiThreadId || !review || !turn || workBusy.value || runningSessions.has(target.id) || archived.value) return
+  if (!target?.apiThreadId || !review || workBusy.value || runningSessions.has(target.id) || archived.value) return
+  // The review belongs to its own run id; never borrow the last turn by position.
+  // 审批属于其自身的运行标识，绝不按位置借用最后一个轮次。
+  const turn = turnForRun(target, review.run_id) ?? reviewTurn(target, review)
+  if (!turn) {
+    showWorkError(new Error(t('Refresh the conversation before reviewing these actions.', '请先刷新会话，再审查这些操作。')))
+    return
+  }
   activityOpen.value.delete(turn.id)
   const controller = beginSessionRequest(target.id, turn.id)
   workError.value = ''
@@ -416,7 +504,8 @@ async function resolveReview(approved: boolean) {
     turn.activityMs = (turn.activityMs ?? 0) + performance.now() - startedAt
     applyWorkReply(target, turn, result)
   } catch (cause) {
-    turn.serverError = cause instanceof Error ? cause.message : t('Could not resume the Agent.', '无法继续执行 Agent。')
+    turn.serverError = cleanupConflict(cause) ? cleanupConflictMessage()
+      : cause instanceof Error ? cause.message : t('Could not resume the Agent.', '无法继续执行 Agent。')
     await refreshReview(target)
   } finally {
     finishSessionRequest(target.id, controller)
@@ -723,80 +812,136 @@ function stopCurrent() {
   controller.abort()
 }
 
+/**
+ * Rejects a retry whose attachments were not all uploaded.
+ * 拒绝附件未全部上传的重试。
+ *
+ * @param turn - Turn to retry. / 待重试的轮次。
+ * @returns Files recorded for the turn that still need uploading. / 该轮次仍需上传的文件。
+ */
+function retryUploads(turn: Turn) {
+  const uploads = pendingUploads.get(turn.id) ?? []
+  // Recorded ids always cover the first files in order, so the longest list decides.
+  // 已记录的 ID 总按顺序覆盖前面的文件，因此以更长的列表为准。
+  if (Math.max(turn.attachmentIds?.length ?? 0, uploads.length) < turn.files.length) {
+    throw new Error(t('Some attachments were not uploaded. Attach the files again before retrying.',
+      '部分附件尚未上传，请重新添加文件后再重试。'))
+  }
+  return uploads
+}
+/**
+ * Resume the saved run of one failing turn with its own identity.
+ * 用该失败轮次自己的标识恢复其已保存运行。
+ *
+ * @param target - Session that owns the turn. / 轮次所属会话。
+ * @param turn - Turn whose own run is pending. / 自己的运行处于待处理状态的轮次。
+ * @param plan - Resume identity decided from the pending run. / 依据待处理运行确定的恢复标识。
+ * @param clearDraft - Whether a retry-restored draft clears on completion. / 重试恢复的草稿是否在完成后清理。
+ * @param draftAtStart - Draft captured before the retry. / 重试前捕获的草稿。
+ */
+async function resumeTurn(target: Session, turn: Turn, plan: Extract<RetryPlan, { action: 'resume' }>,
+  clearDraft: boolean, draftAtStart: string) {
+  if (!target.apiThreadId) return
+  const controller = beginSessionRequest(target.id, turn.id)
+  workError.value = ''
+  turn.serverError = undefined
+  const startedAt = performance.now()
+  let restored = false
+  try {
+    const query = ['stream=true', 'run_id=' + encodeURIComponent(plan.runId)]
+    if (plan.checkpointId) query.push('checkpoint_id=' + encodeURIComponent(plan.checkpointId))
+    const result = await runStream(target.id,
+      threadPath(target.apiThreadId) + '/resume?' + query.join('&'), {}, turn, controller.signal)
+    turn.activityMs = (turn.activityMs ?? 0) + performance.now() - startedAt
+    applyWorkReply(target, turn, result)
+    restored = true
+    // A draft restored by the retry clears only once the retried run completed.
+    // 重试恢复出的草稿只会在被重试的运行真正完成后清理。
+    if (!('approval_id' in result) && clearDraft && !disposed && target.id === activeSession.value &&
+      draft.value === draftAtStart) resetDraft()
+  } catch (error) {
+    turn.serverError = error instanceof Error ? error.message : t('Retry failed.', '重试失败。')
+    await refreshReview(target)
+    await syncThreadMessages(target).catch(() => {})
+    // The archive merge may have replaced the turn with the completed run.
+    // 归档合并可能已用已完成的运行替换该轮次。
+    const live = turnForRun(target, turn.serverRunId) ?? turn
+    // The run may simply have completed before the response was lost.
+    // 运行可能已在响应丢失前完成。
+    if (live.serverReply) return
+    if (error instanceof ApiError && error.code === 'NO_PENDING_RUN') {
+      throw new Error(t('No recoverable checkpoint exists. Edit and send the request explicitly.',
+        '没有可恢复的检查点，请编辑后明确重新发送请求。'))
+    }
+    // Keep the saved run and say why it cannot continue right now.
+    // 保留已保存的运行，并说明当前无法继续的原因。
+    if (error instanceof ApiError && error.code === 'MODEL_UNAVAILABLE') {
+      throw new Error(t('This run is waiting to continue, but the original model is currently unavailable. The saved run is kept.',
+        '该任务待继续，但原模型当前不可用。已保存的运行仍然保留。'))
+    }
+    throw error
+  } finally {
+    finishSessionRequest(target.id, controller)
+  }
+  // The archive supplies the authoritative prompt, attachment names and references.
+  // 归档提供权威原文、附件名称与引用。
+  if (restored) await syncThreadMessages(target).catch(error => {
+    if (!disposed && target.id === activeSession.value) showWorkError(error)
+  })
+}
+/**
+ * Continue this session from its own saved run, or resend a request that never started one.
+ * 从本会话自己的已保存运行继续，或重发尚未创建运行的请求。
+ *
+ * Identity comes from the saved run, never from matching text: only the failing turn's
+ * own pending run is resumed, and any earlier failure is resent with the same request id.
+ * 身份来自已保存运行而非文本匹配：只恢复失败轮次自己的待处理运行，其余更早的失败复用同一请求标识重发。
+ *
+ * @param message - Optional edited text used for a new logical request. / 可选的新文本，用于新的逻辑请求。
+ */
 async function retryCurrent(message: string) {
   const target = session.value
-  const original = target?.turns.at(-1)
   if (!target || target.pendingReview || runningSessions.has(target.id)) throw new Error(t('No message to retry, or approval is pending.', '没有可重试消息，或当前仍有待审批操作。'))
   const draftAtStart = draft.value
   if (target.apiThreadId) await syncThreadMessages(target)
-  const last = target.turns.find(turn => turn.serverRunId === target.pendingRun?.run_id) ?? target.turns.at(-1) ?? original
+  const last = turnForRun(target, target.pendingRun?.run_id) ?? target.turns.at(-1)
   if (!last) throw new Error(t('No saved request to resume.', '没有可恢复的已保存请求。'))
-  const clearRestoredDraft = draftAtStart === last.prompt || parseCommand(draftAtStart)?.name === 'retry'
-  if (target.pendingRun?.status === 'awaiting_approval') {
+  if (target.pendingReview) {
     await refreshReview(target)
     throw new Error(t('Review the pending tool actions before continuing.', '请先审查待处理的工具操作。'))
   }
-  const unfinished = Boolean(target.pendingRun || last.checkpointId || last.serverError || original?.serverError)
-  if (unfinished && message) throw new Error(t('Resume the original request first. Edited text cannot replace a checkpoint.', '请先从检查点继续原请求，编辑后的内容不能替换检查点。'))
+  const clearRestoredDraft = draftAtStart === last.prompt || parseCommand(draftAtStart)?.name === 'retry'
+  const plan = retryPlan(target, last)
+  if (plan.action === 'blocked') {
+    await refreshReview(target)
+    throw new Error(t('Review the pending tool actions before continuing.', '请先审查待处理的工具操作。'))
+  }
+  if (plan.action === 'resume') {
+    if (message) throw new Error(t('Resume the original request first. Edited text cannot replace a checkpoint.', '请先从检查点继续原请求，编辑后的内容不能替换检查点。'))
+    await resumeTurn(target, last, plan, clearRestoredDraft, draftAtStart)
+    return
+  }
   const retryOptions = { memory: settings.personalizedMemory, model: model.value, reasoningEffort: reasoningEffort.value,
     ...(target.mode === 'work' ? { work: { ...work.value } } : {}) }
-  if (unfinished && target.apiThreadId && !message) {
-    const controller = beginSessionRequest(target.id, last.id)
-    const previousError = last.serverError
-    const previousRun = last.serverRunId
-    let restored = last
-    last.serverError = undefined
-    try {
-      const checkpoint = target.pendingRun?.checkpoint_id ?? last.checkpointId
-      const path = threadPath(target.apiThreadId) + '/resume?stream=true' + (checkpoint ? '&checkpoint_id=' + encodeURIComponent(checkpoint) : '')
-      const result = await runStream(target.id, path, {}, last, controller.signal, run => {
-        restored = target.turns.find(item => item.serverRunId === run) ?? last
-        runningTurnIds[target.id] = restored.id
-        restored.serverError = undefined
-        return restored
-      })
-      restored = target.turns.find(item => item.serverRunId === result.run_id && item.prompt === result.message)
-        ?? target.turns.find(item => item.prompt === result.message && item !== last && item.serverError)
-        ?? restored
-      if (restored !== last) { last.serverError = previousError; last.serverRunId = previousRun }
-      if (result.message != null && restored.prompt !== result.message) {
-        restored.prompt = result.message
-        restored.files = []
-        restored.attachmentIds = []
-      }
-      restored.serverError = undefined
-      applyWorkReply(target, restored, result)
-      if (clearRestoredDraft && !disposed && target.id === activeSession.value && draft.value === draftAtStart) resetDraft()
-      // The archive supplies the authoritative prompt, attachment names and references.
-      // 归档提供权威原文、附件名称与引用，不能用修改后的草稿冒充原始请求。
-      if (finishSessionRequest(target.id, controller)) {
-        delete liveReplies.value[last.id]; delete liveReasoning.value[last.id]
-      }
-      await syncThreadMessages(target).catch(error => { if (!disposed && target.id === activeSession.value) showWorkError(error) })
-      return
-    } catch (error) {
-      if (restored !== last) { last.serverError = previousError; last.serverRunId = previousRun }
-      restored.serverError = error instanceof Error ? error.message : t('Retry failed.', '重试失败。')
-      finishSessionRequest(target.id, controller)
-      await refreshReview(target)
-      await syncThreadMessages(target).catch(() => {})
-      if (target.turns.some(turn => turn.serverRunId === previousRun && turn.serverReply)) return
-      if (error instanceof ApiError && error.code === 'NO_PENDING_RUN') {
-        throw new Error(t('No recoverable checkpoint exists. Edit and send the request explicitly.', '没有可恢复的检查点，请编辑后明确重新发送请求。'))
-      }
-      throw error
-    } finally {
-      if (finishSessionRequest(target.id, controller)) {
-        delete liveReplies.value[last.id]; delete liveReasoning.value[last.id]
-      }
-    }
+  const uploads = retryUploads(last)
+  if (plan.action === 'new' || message) {
+    // A completed turn or edited text starts a new logical request with a fresh identity.
+    // 已完成的轮次或编辑后的文本会以新的请求标识开启新的逻辑请求。
+    const turn: Turn = { id: crypto.randomUUID(), prompt: message || last.prompt, time: '',
+      files: [...last.files], attachmentIds: [...(last.attachmentIds ?? [])], references: last.references,
+      ...retryOptions }
+    turn.clientRequestId = turn.id
+    target.turns.push(turn)
+    if (!disposed && target.id === activeSession.value) resetDraft()
+    await sendToAgent(target, turn, uploads)
+    return
   }
-  const turn: Turn = { id: crypto.randomUUID(), prompt: message || last.prompt, time: '',
-    files: [...last.files], attachmentIds: last.attachmentIds, references: last.references,
-    ...retryOptions }
-  target.turns.push(turn)
-  if (!disposed && target.id === activeSession.value) resetDraft()
-  await sendToAgent(target, turn, [])
+  // The same logical request keeps its identity, so the server returns the same run or a new one.
+  // 同一逻辑请求保留其标识，服务端会返回同一运行或开启新的运行。
+  last.checkpointId = undefined
+  const completed = await sendToAgent(target, last, uploads)
+  if (completed && clearRestoredDraft && !disposed && target.id === activeSession.value &&
+    draft.value === draftAtStart) resetDraft()
 }
 
 async function downloadDocument(artifact: ToolArtifact) {

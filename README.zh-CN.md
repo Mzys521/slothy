@@ -7,7 +7,7 @@
 <p align="center"><em>小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.4.2--beta-60DD06" />
+  <img alt="版本 0.1.5" src="https://img.shields.io/badge/version-0.1.5-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -23,7 +23,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.4.2-beta"><strong>下载 Slothy 0.1.4.2 Beta（Windows x64）</strong></a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.5"><strong>下载 Slothy 0.1.5 正式版（Windows x64）</strong></a> ·
+  <a href="docs/releases/0.1.5.md#简体中文">发布说明</a> ·
   <a href="CHANGELOG.md">更新日志</a>
 </p>
 
@@ -38,17 +39,16 @@
 与当前请求相关的记忆。会改动你机器的工具调用会先暂停、
 由你审批后再恢复同一次运行。
 
-## 长期记忆 V3 — 0.1.4.2-beta
+## 长期记忆 V3
 
 后台模型提炼语义概念与有证据的关系。Python 与新手是两个概念，“新手”绑定 Python，
 不会成为用户整体标签。概念和事实各自按会话去重强化，强度为 `f/(f+4)`；本地 SQLite
 FTS5、别名与一跳关联检索无需 embedding 服务。手动编辑和自动学习写同一事实结构，更正
 撤销旧版本；直接身份问答使用可靠事实直答。上下文面板显示实际提供的证据与未召回原因。
 
-本开发版首次启动 V3 **仅一次重置三份业务数据库**，不迁移或重新学习旧消息。模型密钥、
-连接器配置文件、界面偏好及工作区实际文件保留；数据纪元变化会清理旧浏览器会话缓存。
-不采用 TTL 或时间衰减。上方 GitHub 发布即本 `0.1.4.2-beta` 构建；本源码构建会生成
-相同版本的安装包。
+Slothy 0.1.5 会在打开已有数据库前核验存储结构。兼容数据可直接读取，需要处理时会提示用户
+选择恢复方式。通过该提示升级兼容的旧数据时，应用会先创建并验证备份。
+升级与安装包信息见 [0.1.5 发布说明](docs/releases/0.1.5.md#简体中文)。
 
 ## 为什么是 Slothy
 
@@ -58,12 +58,12 @@ FTS5、别名与一跳关联检索无需 embedding 服务。手动编辑和自�
 | **可审计的智能体** | 每次运行逐步落检查点；工具调用可暂停、查看参数、批准或拒绝，然后从同一断点恢复。 |
 | **有出处的记忆** | 一条记忆 = claim + 证据 + 作用域。可靠信息自动沉淀，用户可审查、编辑、归档或删除；删除会擦除旧快照引用并阻止历史重分析复活。 |
 | **真正的桌面产品** | 无边框窗口、原生目录选择、工作区映射到真实文件夹、NSIS 安装包、离线数据目录、DPAPI 加密的模型密钥。 |
-| **可维护的工程** | 严格分层、确定性的提示词组装、424 个后端 + 43 个前端测试及 3 个桌面目录测试、生产资源审查，以及中英双语的架构与 API 文档。 |
+| **可维护的工程** | 分层架构、确定性的提示词组装、前后端回归测试、生产资源审查，以及中英双语的架构与 API 文档。 |
 
 ## 能力
 
 - **智能体运行时**：LangGraph `StateGraph`，节点为
-  `prepare_run → load_profile → retrieve_memories → build_personalized_context →
+  `prepare_run → decide → load_profile → retrieve_memories → build_personalized_context →
   agent →（tools）→ finalize_response`，同步检查点、有界递归步数。
 - **人在回路工具审批**：高风险工具调用通过 `interrupt()` 暂停运行，批准/拒绝后以
   `Command(resume=…)` 恢复。
@@ -107,29 +107,16 @@ FTS5、别名与一跳关联检索无需 embedding 服务。手动编辑和自�
   统一结果、产物、风险和逐工具度量，清单记录可恢复已完成写入，避免重复副作用。
 - **可选 HTTPS 获取**：默认关闭，需显式配置域名允许列表，拒绝非公网地址及不安全重定向。
 - **工作区即目录**：每个工作区映射真实文件夹，工具实例与产物目录按目录隔离，不改变进程工作目录。
+- **会话分叉**：从已有会话创建分支，保留归档轮次与产物链接。
 - **模型接入**：DeepSeek、MiMo、Anthropic 以及任意 OpenAI 兼容服务；密钥用 Windows DPAPI 加密，
   API 只返回掩码状态。
 
 ## 架构一览
 
-```
-┌──────────────────────────── Electron 桌面端 ──────────────────────────────┐
-│ 主进程                          渲染进程（Vue 3 + TypeScript）            │
-│ 窗口 / IPC / 令牌               聊天 · 记忆 · 画像 · 图谱 · 设置          │
-│ 启动并守护后端                  访问 http://127.0.0.1:<port>/api/v1      │
-└──────────────┬───────────────────────────────────────────────────────────┘
-               │ 仅回环地址，携带 X-Slothy-Token
-┌──────────────▼───────────────────────────────────────────────────────────┐
-│ 本地 FastAPI 服务（uvicorn）                                              │
-│  /api/v1 路由 ──▶ AgentRunner ──▶ LangGraph online_agent                  │
-│                                  ├── ▶ 工具审批 / 恢复                    │
-│                                  └── ▶ 记忆 · 画像 · 工作区              │
-│  SQLite：检查点 · 会话归档 · 记忆与画像                                   │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+![Slothy 架构。Electron 渲染进程访问本地 FastAPI 与 LangGraph 后端，后端对接用户配置的模型服务，并用本地 SQLite 保存数据。](docs/assets/diagrams/architecture-zh-CN.png)
 
 模块地图、图拓扑、提示词分层、数据库结构与安全边界见
-[架构文档](docs/architecture.zh-CN.md)；渲染好的图在 [`docs/diagrams/`](docs/diagrams/)。
+[架构文档](docs/architecture.zh-CN.md)。
 
 ## 快速开始
 
@@ -166,9 +153,9 @@ npm run dev
 core/                  Python 后端（FastAPI + LangGraph）
   app/api.py           HTTP 路由、SSE、生命周期装配
   app/agent/           图、工具、Provider、提示词规划
-  app/personalization/ 记忆抽取与画像投影
+  app/memory/          记忆学习、证据、画像和图谱
   app/infrastructure/  SQLite 存储、LLM 适配、子进程执行
-  tests/               424 个后端自动化测试
+  tests/               后端回归测试
 web/                   Electron + Vue 桌面客户端
   electron/            主进程、preload 桥、后端守护
   src/                 Vue 页面与 TypeScript API 层
@@ -179,12 +166,12 @@ docs/                  公共文档（中英）与图表
 
 ```powershell
 cd core
-.\.venv\Scripts\python.exe -m pytest      # 424 个测试
+.\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe -m ruff check app tests
 
 cd ..\web
 npm run typecheck                         # vue-tsc
-node --test tests/*.test.mjs              # 43 个前端/无服务器测试（另含 3 个桌面目录测试）
+node --test tests/*.test.mjs electron/directory.test.mjs
 npm run production:audit                  # 打包资源白名单审查
 ```
 
@@ -200,7 +187,6 @@ npm run production:audit                  # 打包资源白名单审查
 
 - [ ] 定时记忆整合：衰减与保留期策略（当前仅保留配置，尚未启用自动永久删除）。
 - [ ] 更丰富的记忆检索（可选 embedding、混合排序）。
-- [ ] 对话分支（已有设计文档，尚未实现）。
 - [ ] 更多 Provider 与更完整的缓存分析界面。
 
 ## 文档
@@ -210,6 +196,7 @@ npm run production:audit                  # 打包资源白名单审查
 | 架构 | [architecture.md](docs/architecture.md) | [architecture.zh-CN.md](docs/architecture.zh-CN.md) |
 | 快速开始 | [getting-started.md](docs/getting-started.md) | [getting-started.zh-CN.md](docs/getting-started.zh-CN.md) |
 | API 参考 | [api.md](docs/api.md) | [api.zh-CN.md](docs/api.zh-CN.md) |
+| 0.1.5 发布说明 | [English](docs/releases/0.1.5.md#english) | [简体中文](docs/releases/0.1.5.md#简体中文) |
 | 品牌规范 | [brand.md](docs/brand.md) | [brand.md](docs/brand.md#中文) |
 | 更新日志 | [CHANGELOG.md](CHANGELOG.md) | [CHANGELOG.md](CHANGELOG.md) |
 

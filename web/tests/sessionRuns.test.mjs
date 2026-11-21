@@ -43,3 +43,16 @@ test('a duplicate request in one session does not replace its stop handle', () =
   assert.equal(runs.runningTurnIds.same, 'first')
   runs.finishSessionRequest('same', controller)
 })
+
+test('starting a request raises the session data version so earlier reads go stale', () => {
+  const before = runs.sessionVersion('versioned')
+  const controller = runs.beginSessionRequest('versioned', 'turn')
+  const during = runs.sessionVersion('versioned')
+  assert.ok(during > before)
+  assert.equal(runs.sessionVersion('other-session'), 0)
+  runs.finishSessionRequest('versioned', controller)
+  assert.equal(runs.sessionVersion('versioned'), during)
+  const after = runs.bumpSessionVersion('versioned')
+  assert.ok(after > during)
+  assert.equal(runs.sessionVersion('versioned'), after)
+})

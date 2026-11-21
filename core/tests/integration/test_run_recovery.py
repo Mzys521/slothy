@@ -124,11 +124,19 @@ def test_pending_checkpoint_survives_new_input_and_restart_then_streams_original
         assert page["items"][0]["attachments"] == [attachment]
         # A lost completion acknowledgement is idempotent, never a new model call.
         count = len(selected)
-        again = client.post(path + "/resume").json()
+        again = client.post(path + "/resume?run_id=" + pending["run_id"]).json()
         assert again["run_id"] == pending["run_id"] and again["response"] == "Recovered"
         assert len(selected) == count
         assert models["chosen"].calls == 1
         assert len(client.get(path + "/messages").json()["items"]) == 1
+        # The archived result is also readable through the model-independent run status.
+        status = client.get(path + "/run-status?run_id=" + pending["run_id"]).json()
+        assert status["status"] == "completed" and status["archived"] is True
+        assert status["result"]["response"] == "Recovered"
+        # An unnamed resume must never replay the previous, already completed run.
+        unnamed = client.post(path + "/resume")
+        assert unnamed.status_code == 409 and unnamed.json()["code"] == "NO_PENDING_RUN"
+        assert client.get(path + "/messages").json()["pending_run"] is None
         assert client.delete(path + "/messages").status_code == 204
         assert client.get(path + "/messages").json()["pending_run"] is None
         assert client.post(path + "/resume").json()["code"] == "NO_PENDING_RUN"

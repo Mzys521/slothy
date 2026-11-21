@@ -1,7 +1,8 @@
 """Compile only the online agent graph. / 只编译在线 Agent 图。"""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import partial
+from typing import Literal
 
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -10,7 +11,9 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 
+from app.agent.decision.contracts import DECISION_POLICY_VERSION
 from app.agent.decision.engine import DecisionEngine
+from app.agent.decision.model import DecisionModelClient
 from app.agent.graph.edges import route_after_agent
 from app.agent.graph.nodes import AgentNodes
 from app.agent.graph.review import guarded_tools, review_tools
@@ -18,10 +21,102 @@ from app.agent.graph.services import AgentServices
 from app.agent.graph.state import AgentState
 from app.agent.prompting.plan import digest
 from app.agent.prompts.system import BASE_SYSTEM_PROMPT
+from app.agent.providers import ModelProvider
 from app.agent.tools.gateway import ToolGateway
 from app.agent.tools.registry import ToolRegistry
 from app.agent.tools.results import tool_error_content
 from app.config import AgentSettings, DecisionSettings, PromptSettings
+
+ToolRouting = Literal["none", "direct", "review"]
+# Node names shared by the execution graph and the read-only checkpoint projection. /
+# 执行图与只读检查点投影共用的节点名称。
+GRAPH_NODES = (
+    "prepare_run",
+    "decide",
+    "load_profile",
+    "retrieve_memories",
+    "build_personalized_context",
+    "agent",
+    "finalize_response",
+)
+
+
+def wire_online_graph(
+    builder: StateGraph,
+    nodes: Mapping[str, Callable],
+    *,
+    tool_routing: ToolRouting,
+) -> None:
+    """Wire the node names and edges shared by execution and read-only projection. /
+    连接执行图与只读投影共用的节点名称与边。
+
+    Both graphs must share this topology because LangGraph recomputes pending tasks and
+    interrupts for ``aget_state`` from the saved checkpoint plus the compiled triggers.
+    / 两张图必须共用此拓扑：LangGraph 的 ``aget_state`` 依据已存检查点与编译好的触发通道重算
+    待执行任务与中断。
+
+    Args:
+        builder: Graph builder receiving the nodes and edges. / 接收节点与边的图构建器。
+        nodes: Node name to callable mapping. / 节点名称到可调用对象的映射。
+        tool_routing: Tool wiring mode: none, direct execution or reviewed execution. /
+            工具连接方式：无工具、直接执行或审批后执行。
+
+    Raises:
+        ValueError: When required node names are missing. / 缺少必需节点名称时抛出。
+    """
+    missing = [name for name in GRAPH_NODES if name not in nodes]
+    if missing:
+        raise ValueError(f"Missing graph nodes: {', '.join(missing)}")
+    for name, node in nodes.items():
+        builder.add_node(name, node)
+    builder.add_edge(START, "prepare_run")
+    builder.add_edge("prepare_run", "decide")
+    builder.add_edge("decide", "load_profile")
+    builder.add_edge("load_profile", "retrieve_memories")
+    builder.add_edge("retrieve_memories", "build_personalized_context")
+    builder.add_edge("build_personalized_context", "agent")
+    if tool_routing == "none":
+        builder.add_edge("agent", "finalize_response")
+    else:
+        builder.add_conditional_edges(
+            "agent", route_after_agent, {"tools": "tools", "finalize_response": "finalize_response"}
+        )
+        if tool_routing == "direct":
+            builder.add_edge("tools", "agent")
+    builder.add_edge("finalize_response", END)
+
+
+def build_readonly_graph(
+    *, checkpointer: BaseCheckpointSaver, tool_routing: ToolRouting = "review"
+) -> CompiledStateGraph:
+    """Build a projection graph that reads native checkpoints without binding a model. /
+    构建不绑定模型、仅读取原生检查点的投影图。
+
+    The placeholder nodes are never executed; they exist only so LangGraph can resolve the
+    stored task and interrupt topology exactly as the execution graph does. / 占位节点永不执行，
+    只用于让 LangGraph 按执行图相同的拓扑解析已存任务与中断。
+
+    Args:
+        checkpointer: Caller-owned saver holding the real checkpoints. / 持有真实检查点的快照后端。
+        tool_routing: Tool wiring mode matching the execution graph. / 与执行图一致的工具连接方式。
+
+    Returns:
+        A compiled graph that can only be used for state reads. / 仅用于读取状态的编译图。
+    """
+
+    async def placeholder(_state: AgentState) -> dict:
+        """Never executed; preserves the saved topology for reads.
+        / 永不执行，仅保留读取所需拓扑。"""
+        return {}
+
+    builder = StateGraph(AgentState)
+    names = [*GRAPH_NODES]
+    if tool_routing != "none":
+        names.extend(["tools", "review_tools"] if tool_routing == "review" else ["tools"])
+    wire_online_graph(
+        builder, {name: placeholder for name in names}, tool_routing=tool_routing
+    )
+    return builder.compile(checkpointer=checkpointer, name="online_agent_readonly")
 
 
 def build_agent_graph(
@@ -36,6 +131,8 @@ def build_agent_graph(
     tool_registry: ToolRegistry | None = None,
     mode: str | None = None,
     decision_settings: DecisionSettings | None = None,
+    decision_provider: ModelProvider | None = None,
+    decision_model_client: DecisionModelClient | None = None,
 ) -> CompiledStateGraph:
     """Build the asynchronous online agent graph. / 创建可异步调用的在线 Agent 图。
 
@@ -60,6 +157,11 @@ def build_agent_graph(
             中文：可选工具元数据，省略时从 ``tools`` 适配。
         mode: Optional ``chat``/``work`` mode forwarded to the tool gateway.
             中文：可选的 chat/work 模式，传给工具网关。
+        decision_settings: Decision-layer mode and limits. / 决策层模式与限制。
+        decision_provider: Adapter shared with the chat runner for the decision model.
+            / 中文：决策模型复用聊天运行器的适配器。
+        decision_model_client: Optional injected decision client for tests.
+            / 中文：测试可注入的决策客户端。
 
     Returns:
         English: A compiled graph named ``online_agent`` with the recursion limit preset.
@@ -83,11 +185,10 @@ def build_agent_graph(
     if len({tool.name for tool in selected_tools}) != len(selected_tools):
         raise ValueError("Tool names must be unique")
     model = services.model_provider.get_chat_model()
-    runnable = model.bind_tools(selected_tools) if selected_tools else model
     nodes = AgentNodes(
         services,
         resolved,
-        runnable,
+        model,
         system_prompt,
         tools_enabled=bool(selected_tools) or require_tool_review,
         tools=tuple(selected_tools),
@@ -97,7 +198,11 @@ def build_agent_graph(
     )
     builder = StateGraph(AgentState)
     decision_engine = DecisionEngine(
-        decision_settings or DecisionSettings(), registry, resolved
+        decision_settings or DecisionSettings(),
+        registry,
+        resolved,
+        model_client=decision_model_client,
+        provider=decision_provider,
     )
 
     async def decide(state):
@@ -129,32 +234,31 @@ def build_agent_graph(
 
         Returns:
             English: Updates from ``AgentNodes.prepare_run`` plus the tool contract version,
-            approval waits and per-tool risks. / 中文：``AgentNodes.prepare_run`` 的更新，附加
-            工具契约版本、审批等待与各工具风险映射。
+            approval waits, per-tool risks and the decision policy version. / 中文：
+            ``AgentNodes.prepare_run`` 的更新，附加工具契约版本、审批等待、各工具风险映射与
+            决策策略版本。
         """
         return {
             **await nodes.prepare_run(state),
             "tool_contract_version": 2,
             "tool_approval_wait": {},
+            "decision_policy_version": DECISION_POLICY_VERSION,
             "tool_risks": {
                 tool.name: str(registry.descriptor(tool.name).risk)
                 for tool in registry.execution_tools()
             },
         }
 
-    builder.add_node("prepare_run", prepare_run)
-    builder.add_node("decide", decide)
-    builder.add_node("load_profile", nodes.load_profile)
-    builder.add_node("retrieve_memories", nodes.retrieve_memories)
-    builder.add_node("build_personalized_context", nodes.build_personalized_context)
-    builder.add_node("agent", nodes.agent)
-    builder.add_node("finalize_response", nodes.finalize_response)
-    builder.add_edge(START, "prepare_run")
-    builder.add_edge("prepare_run", "decide")
-    builder.add_edge("decide", "load_profile")
-    builder.add_edge("load_profile", "retrieve_memories")
-    builder.add_edge("retrieve_memories", "build_personalized_context")
-    builder.add_edge("build_personalized_context", "agent")
+    graph_nodes: dict[str, Callable] = {
+        "prepare_run": prepare_run,
+        "decide": decide,
+        "load_profile": nodes.load_profile,
+        "retrieve_memories": nodes.retrieve_memories,
+        "build_personalized_context": nodes.build_personalized_context,
+        "agent": nodes.agent,
+        "finalize_response": nodes.finalize_response,
+    }
+    routing: ToolRouting = "none"
     # Keep approval nodes available to reject/resume a pending call after a connector
     # is disabled. The current ToolNode returns an error for removed capabilities. /
     # 中文：即使连接器被禁用也保留审批节点，用于拒绝或恢复待处理的调用；当前工具节点会为
@@ -164,6 +268,8 @@ def build_agent_graph(
             registry,
             tool_enabled=services.tool_enabled,
             mode=mode,
+            artifact_indexer=services.artifact_indexer,
+            artifact_retainer=services.artifact_retainer,
         )
         tool_node = ToolNode(
             registry.execution_tools(),
@@ -173,19 +279,15 @@ def build_agent_graph(
         if require_tool_review:
             if checkpointer is None:
                 raise ValueError("Tool review requires a checkpointer")
-            builder.add_node("review_tools", partial(review_tools, registry=registry))
-            builder.add_node(
-                "tools", guarded_tools(gateway.execute_batch(tool_node), registry, gateway)
+            graph_nodes["review_tools"] = partial(review_tools, registry=registry)
+            graph_nodes["tools"] = guarded_tools(
+                gateway.execute_batch(tool_node), registry, gateway
             )
+            routing = "review"
         else:
-            builder.add_node("tools", gateway.execute_batch(tool_node))
-            builder.add_edge("tools", "agent")
-        builder.add_conditional_edges(
-            "agent", route_after_agent, {"tools": "tools", "finalize_response": "finalize_response"}
-        )
-    else:
-        builder.add_edge("agent", "finalize_response")
-    builder.add_edge("finalize_response", END)
+            graph_nodes["tools"] = gateway.execute_batch(tool_node)
+            routing = "direct"
+    wire_online_graph(builder, graph_nodes, tool_routing=routing)
     # The step cap is preset here; trusted callers may still override it via RunnableConfig. /
     # 中文：此处预设步数上限，调用方仍可通过标准 RunnableConfig 显式覆盖。
     return builder.compile(checkpointer=checkpointer, name="online_agent").with_config(

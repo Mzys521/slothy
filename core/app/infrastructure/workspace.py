@@ -11,6 +11,7 @@ from uuid import uuid4
 import aiosqlite
 
 from app.agent.graph.services import Snapshot
+from app.infrastructure.storage_version import STORAGE_VERSION
 from app.personalization.context import ContextBuildResult
 
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
@@ -221,6 +222,9 @@ class WorkspaceStore:
                 END;
                 """):
                 pass
+            # Record the storage epoch so a later startup can verify this schema read-only.
+            # 记录存储版本，便于后续启动以只读方式核验结构。
+            await connection.execute(f"PRAGMA user_version = {STORAGE_VERSION}")
             async with connection.execute("PRAGMA table_info(workspace_profiles)") as rows:
                 columns = {row[1] async for row in rows}
             if "attributes_json" not in columns:

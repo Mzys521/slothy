@@ -7,9 +7,11 @@ import pytest
 from app.config import (
     AgentSettings,
     CheckpointSettings,
+    DecisionSettings,
     LLMSettings,
     MemorySettings,
     PromptSettings,
+    ReferenceSettings,
     ToolSettings,
 )
 
@@ -22,9 +24,11 @@ def isolate_llm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         LLMSettings,
         AgentSettings,
         CheckpointSettings,
-        ToolSettings,
+        DecisionSettings,
         MemorySettings,
         PromptSettings,
+        ReferenceSettings,
+        ToolSettings,
     ):
         monkeypatch.setitem(settings_class.model_config, "env_file", None)
     for name in tuple(os.environ):
@@ -36,9 +40,12 @@ def isolate_llm_environment(monkeypatch: pytest.MonkeyPatch) -> None:
                 "TOOLS_",
                 "OPENAI_",
                 "DEEPSEEK_",
+                "DASHSCOPE__",
+                "DECISION_",
                 "MIMO_",
                 "MEMORY_",
                 "PROMPT_",
+                "REFERENCES_",
                 "HISTORY_",
                 "RETRIEVAL_",
             )

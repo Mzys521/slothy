@@ -42,6 +42,11 @@ MAX_PDF_CHARS = 200_000
 def _read_pdf(contents: bytes) -> str:
     """Extract bounded text from a PDF with pypdf. / 使用 pypdf 提取有界 PDF 文本。
 
+    pypdf raises many document-specific exception types for damaged, empty or unsupported
+    files; they are all normalized into ``ValueError`` so the API can answer with one stable
+    error contract. / pypdf 会对损坏、空白或不支持的文件抛出多种文档异常；此处统一归一化为
+    ``ValueError``，使 API 能用同一错误契约回答。
+
     Args:
         contents: Raw PDF bytes, already bounded by the upload limit. / 已限制大小的 PDF 字节。
 
@@ -52,17 +57,24 @@ def _read_pdf(contents: bytes) -> str:
         ValueError: When the PDF is encrypted, malformed or has no text.
             / PDF 加密、损坏或无文本时抛出。
     """
-    from pypdf import PdfReader
+    try:
+        from pypdf import PdfReader
 
-    reader = PdfReader(BytesIO(contents))
-    if reader.is_encrypted:
-        raise ValueError("Encrypted PDF files are unsupported.")
-    parts = []
-    for page in reader.pages[:MAX_PDF_PAGES]:
-        parts.append(page.extract_text() or "")
-        if sum(len(part) for part in parts) >= MAX_PDF_CHARS:
-            break
-    return "\n".join(parts)[:MAX_PDF_CHARS]
+        reader = PdfReader(BytesIO(contents))
+        if reader.is_encrypted:
+            raise ValueError("Encrypted PDF files are unsupported.")
+        parts = []
+        for page in reader.pages[:MAX_PDF_PAGES]:
+            parts.append(page.extract_text() or "")
+            if sum(len(part) for part in parts) >= MAX_PDF_CHARS:
+                break
+        return "\n".join(parts)[:MAX_PDF_CHARS]
+    except ValueError:
+        raise
+    except Exception as error:
+        # Includes PdfReadError, PdfStreamError and malformed-xref failures from pypdf.
+        # 包括 pypdf 的 PdfReadError、PdfStreamError 与损坏的交叉引用表错误。
+        raise ValueError("Could not read the PDF document.") from error
 
 
 def read_attachment(filename: str, contents: bytes) -> str:

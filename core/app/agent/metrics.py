@@ -46,6 +46,16 @@ class RunMetrics(BaseModel):
     summary_tokens: int = 0
     tools: list[ToolMetric] = Field(default_factory=list)
     usage_reported: bool = True
+    # Input budget actually applied before this turn's last model call. /
+    # 本轮最后一次模型调用前实际应用的输入预算。
+    budget_context_window: int | None = None
+    budget_output_reserve: int | None = None
+    budget_input_limit: int | None = None
+    budget_input_estimated: int | None = None
+    budget_window_source: str | None = None
+    budget_estimator: str | None = None
+    budget_trimmed: bool | None = None
+    budget_removed_turns: int | None = None
 
 
 def run_metrics(state: dict) -> RunMetrics | None:
@@ -111,6 +121,14 @@ def run_metrics(state: dict) -> RunMetrics | None:
             "profile_snapshot_version",
             "profile_snapshot_revision",
             "history_segment_version",
+            "budget_context_window",
+            "budget_output_reserve",
+            "budget_input_limit",
+            "budget_input_estimated",
+            "budget_window_source",
+            "budget_estimator",
+            "budget_trimmed",
+            "budget_removed_turns",
         )
     }
     return RunMetrics(

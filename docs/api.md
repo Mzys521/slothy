@@ -18,9 +18,12 @@ the port is assigned at startup.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | liveness, used by the desktop supervisor |
-| GET | `/ready` | readiness; 503 when no model runner is configured |
+| GET | `/ready` | readiness. Returns 503 when no model runner is configured |
 | GET | `/models` | model catalog and default model |
 | GET | `/runtime` | capabilities: ready flag, chat/work tool names, cache stats |
+| GET | `/storage/recovery` | startup storage status and whether the existing store can be kept |
+| POST | `/storage/recovery/adopt` | back up and keep an eligible existing store |
+| POST | `/storage/recovery/reset` | verify a backup before creating a fresh store |
 
 ## 2. Providers and settings
 
@@ -32,7 +35,7 @@ the port is assigned at startup.
 | DELETE | `/settings/providers/{id}` | delete a provider |
 | POST | `/settings/providers/discover` | query `{base_url}/models` for the given credentials |
 | POST | `/settings/providers/test-models` | test selected models with tiny real requests; partial results |
-| GET | `/settings/decision` | selected decision model and available model IDs |
+| GET | `/settings/decision` | model selection, available IDs, mode, source and availability reason |
 | PUT | `/settings/decision` | select/clear the decision model and rebuild runners |
 | GET | `/settings/search` | DeepSeek Search credential status (no secret) |
 | PUT | `/settings/search` | save an independent Search key |
@@ -40,7 +43,7 @@ the port is assigned at startup.
 | POST | `/settings/search/test` | run one real Search request |
 | GET | `/settings` | global personalization switch |
 | PATCH | `/settings` | set the global personalization switch |
-| GET | `/settings/memory` | memory planner configuration (14 fields, revision) |
+| GET | `/settings/memory` | saved and applied revisions, pending application and capacity |
 | PATCH | `/settings/memory` | update configuration with revision check |
 
 ## 3. Account
@@ -123,10 +126,11 @@ paths and reason codes without fact bodies. Direct self-identity questions bypas
 generation, use valid global identity facts and report missing/pending/conflicting/
 disabled/unavailable states explicitly.
 
-`/runtime` adds `storage_version=3` and `data_epoch`. First V3 startup resets all
-three business databases once, without replaying old messages. Provider/connector
-configuration files, UI preferences and workspace files remain. The renderer clears
-its old conversation cache on epoch change; it never imports it into the new store.
+`/runtime` returns `storage_version` and `data_epoch`. Slothy 0.1.5 verifies existing
+business databases before opening them. When storage recovery is required, regular
+routes return `503 STORAGE_RECOVERY_REQUIRED` and the recovery endpoints remain
+available. A successful recovery action with `restart_required: true` takes effect
+when the backend restarts.
 
 ## 5. Workspaces, threads, attachments
 
@@ -138,10 +142,20 @@ its old conversation cache on epoch change; it never imports it into the new sto
 | GET/PATCH/DELETE | `/threads/{id}` | read / archive / delete a conversation |
 | GET | `/threads/{id}/messages` | archived turns with activity, metrics, provenance |
 | DELETE | `/threads/{id}/messages` | clear archived messages and pending checkpoints |
-| POST | `/threads/{id}/attachments` | upload a file (raw body, `filename` query) |
+| POST | `/threads/{id}/attachments` | upload raw bytes with `filename` and optional `file_request_id` query parameters |
 | GET | `/attachments` | attachment library |
-| POST | `/threads/{id}/fork` | fork a conversation (copies history and profile snapshot) |
+| POST | `/threads/{id}/fork` | fork a conversation with history, profile snapshot and artifact links |
 | GET | `/threads/{id}/memory-receipts` | memories/claims produced by one run |
+| GET | `/operations/{id}` | status and completed steps of a cleanup operation |
+
+Clearing messages, deleting a conversation and deleting a workspace return `204` when
+cleanup finishes. A `202` response contains `operation_id`, `state` and `error`. Poll
+`/operations/{id}` until `state` becomes `done` or `failed`. The cleanup task persists
+across restarts.
+
+Reusing a `file_request_id` within its conversation returns the saved attachment.
+Unreadable documents return `422 ATTACHMENT_UNREADABLE`. History can mark a missing
+attachment with `missing: true`.
 
 ## 6. Chat and run control
 
@@ -149,6 +163,7 @@ its old conversation cache on epoch change; it never imports it into the new sto
 |---|---|---|
 | POST | `/chat` | send a message; returns `ChatResult` (JSON) or an SSE stream |
 | POST | `/threads/{id}/resume` | resume a paused or interrupted run |
+| GET | `/threads/{id}/run-status` | reconcile the latest run by `client_request_id` or `run_id` |
 | GET | `/threads/{id}/approval` | pending tool review for a thread |
 | POST | `/threads/{id}/approval/{approval_id}` | approve or reject the pending batch |
 
@@ -157,6 +172,7 @@ its old conversation cache on epoch change; it never imports it into the new sto
 ```json
 {
   "thread_id": "uuid-or-null",
+  "client_request_id": "stable-id-for-this-submission",
   "message": "帮我把方案整理成文档",
   "mode": "work",
   "model": "provider/model-id",
@@ -175,6 +191,10 @@ its old conversation cache on epoch change; it never imports it into the new sto
   instead of a `ChatResult`.
 - If a thread has an unfinished run, new messages are rejected with
   `409 RUN_PENDING`; resume or clear it first.
+- Use a stable `client_request_id` on repeated delivery of the same submission to
+  an existing conversation. An already completed request returns its saved result.
+  Reusing the ID for different message, attachment or reference input returns
+  `409 REQUEST_CONFLICT`.
 
 ### Checkpoint recovery
 
@@ -184,13 +204,18 @@ attachment metadata, references and activity. It restores unfinished turns after
 restart without relying on browser caches. Completed checkpoint replies repair a
 missing archive entry idempotently.
 
-Use `POST /threads/{id}/resume?stream=true&checkpoint_id=<expected-id>` with an empty
-body to continue. The optional checkpoint ID is a concurrency check; a changed
-checkpoint returns `409 CHECKPOINT_STALE`. It does not select a historical replay.
-Recovery uses LangGraph's latest checkpoint and keeps the original inputs;
-approval interrupts still require the existing explicit approval endpoint.
-A completed latest checkpoint returns its saved result without a new model call.
-No saved run returns `409 NO_PENDING_RUN`.
+Use `GET /threads/{id}/run-status` to reconcile the latest run. It returns
+`not_started`, `pending`, `awaiting_approval`, `completed` or `failed`. A completed run
+includes its saved result. Checkpoint and approval reads remain available when no model
+is configured.
+
+To continue a saved run, post an empty body to
+`/threads/{id}/resume?stream=true&run_id=<run-id>&checkpoint_id=<expected-id>`.
+The optional query checks return `409 RUN_MISMATCH` for a different run or
+`409 CHECKPOINT_STALE` for a changed checkpoint. Recovery keeps the original inputs.
+Approval interrupts still use the explicit approval endpoint. With no pending run,
+an unqualified resume returns `409 NO_PENDING_RUN`. Naming the matching completed
+run can recover its result after a lost acknowledgement.
 
 Completed tool calls inside a batch are native LangGraph tasks and are restored
 without execution on resume. An interrupted model node generates again from its

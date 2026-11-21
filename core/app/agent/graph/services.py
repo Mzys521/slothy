@@ -180,3 +180,7 @@ class AgentServices:
     reference_metadata_reader: Callable | None = None
     memory_status_reader: Callable | None = None
     runtime_journal: object | None = None
+    # Generated artifacts are registered under the producing session so a moved or forked
+    # session keeps a downloadable link. / 生成的产物按生成会话登记，移动或分叉后链接仍可下载。
+    artifact_indexer: Callable | None = None
+    artifact_retainer: Callable | None = None
