@@ -1,0 +1,216 @@
+.connectors-page {
+  min-height: 0;
+  min-width: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 32px clamp(16px, 5vw, 64px) 44px;
+  background: var(--canvas);
+  color: var(--ink);
+}
+.connector-layout { max-width: 900px; margin-inline: auto; container: connectors / inline-size; }
+.connectors-heading h1 { font-size: var(--type-section); font-weight: 650; }
+.connector-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  max-width: 100%;
+  margin-block: 14px 24px;
+  padding: 3px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.connector-tabs button {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 5px 12px;
+  border-radius: calc(var(--radius) - 4px);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.connector-tabs button:hover { color: var(--ink); }
+.connector-tabs button:focus-visible { outline-offset: -2px; }
+.connector-tabs button[aria-pressed="true"] { color: var(--accent-ink); background: var(--accent-wash); font-weight: 650; }
+.connector-tabs svg, .connector-add svg, .connector-dialog svg { width: 16px; height: 16px; }
+.connector-section-heading h2 { font-size: var(--type-title); line-height: 1.3; }
+.connector-section-heading p { margin-top: 6px; color: var(--muted); }
+.connector-add { display: flex; flex-wrap: wrap; gap: 8px; margin-block: 16px 26px; }
+.connector-add .connector-secondary, .connector-dialog .connector-secondary { border: 1px solid var(--line); }
+.connector-inventory { display: grid; gap: 10px; }
+.connector-inventory > header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; }
+.connector-inventory > header h3 { font-size: var(--type-reading); }
+.connector-inventory > header span { font-size: var(--type-sm); font-variant-numeric: tabular-nums; }
+.connector-card, .connector-empty, .connector-help {
+  min-width: 0;
+  padding: 15px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-surface);
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+.connector-card { transition: border-color 150ms; }
+.connector-card:hover { border-color: var(--strong-line); }
+.connector-card-header {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+}
+.connector-card-icon {
+  width: 36px;
+  height: 36px;
+  padding: 9px;
+  border-radius: 10px;
+  background: var(--neutral);
+  color: var(--muted);
+}
+.connector-card-name h3 { font-size: var(--type-reading); line-height: 1.4; }
+.connector-card-header .settings-switch { align-self: center; }
+.connector-card-meta { display: flex; flex-wrap: wrap; gap: 4px 9px; align-items: baseline; color: var(--muted); font-size: var(--type-sm); margin-top: 3px; }
+.connector-state { display: inline-block; padding: 1px 6px; border-radius: 5px; background: var(--neutral); color: var(--muted); font-weight: 550; }
+.connector-state[data-state="connected"], .connector-result[data-result="ok"] strong { color: var(--success); }
+.connector-state[data-state="connecting"] { color: var(--pending); }
+.connector-state[data-state="failed"],
+.connector-result[data-result="error"] strong,
+.connector-feedback[data-result="error"], .connector-field-error { color: var(--danger); }
+.connector-card-description { color: var(--muted); margin: 9px 0 0 46px; white-space: pre-line; }
+.connector-card-actions { display: flex; flex-wrap: wrap; gap: 3px 7px; margin: 10px 0 0 38px; }
+.connector-card-actions .quiet-button { padding-inline: 8px; min-height: 32px; }
+.connector-delete { color: var(--danger); }
+.connector-card :is(.connector-result, .connector-feedback) { margin-block: 12px 0; }
+.connector-empty { display: flex; gap: 10px; align-items: start; padding-block: 20px; }
+.connector-empty svg { color: var(--muted); margin-top: 2px; }
+.connector-empty p { color: var(--muted); margin-top: 3px; }
+.connector-feedback, .connector-result { padding: 10px 12px; border-radius: var(--radius); background: var(--neutral); }
+.connector-feedback { overflow-wrap: anywhere; color: var(--ink); }
+.connector-feedback .text-link { margin-inline-start: 6px; }
+.connector-result { min-width: 0; overflow-wrap: anywhere; }
+.connector-result-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 5px 10px; }
+.connector-result p { margin-top: 4px; }
+.connector-probe-tools { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: var(--type-sm); }
+.connector-details { margin-top: 12px; padding-top: 6px; border-top: 1px solid var(--line); }
+.connector-help { margin-top: 24px; color: var(--muted); }
+.connectors-page :is(.connector-help, .connector-details, .connector-schema) > summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  width: fit-content;
+  list-style: none;
+}
+.connectors-page :is(.connector-help, .connector-details, .connector-schema) > summary::-webkit-details-marker { display: none; }
+.connectors-page details > summary svg { height: 14px; width: 14px; transform: rotate(-90deg); color: var(--muted); }
+.connectors-page details[open] > summary svg { transform: rotate(0); }
+.connector-details > summary, .connector-schema > summary { color: var(--accent-ink); }
+.connector-detail-body { display: grid; gap: 10px; padding: 6px 0 2px; }
+.connector-detail-body h4 { margin: 0; font-size: var(--type-body); font-weight: 630; }
+.connector-tool-detail + .connector-tool-detail { border-top: 1px solid var(--line); padding-top: 12px; }
+.connector-tool-detail > p, .connector-parameters, .connector-permissions { color: var(--muted); }
+.connector-parameters { display: grid; gap: 6px; margin: 8px 0; }
+.connector-parameters > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 8px; }
+.connector-parameters dt { color: var(--ink); }
+.connector-parameters dd { margin: 0; }
+.connector-help > p, .connector-help > pre { margin-top: 10px; }
+.connector-help pre, .connector-detail-body pre {
+  max-height: 320px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--canvas);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: var(--type-sm)/1.6 var(--mono);
+}
+.connector-help > pre { margin-top: 10px; }
+.modal.connector-dialog {
+  container: connector-dialog / inline-size;
+  width: min(680px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-surface);
+}
+.modal.connector-dialog-compact { width: min(460px, calc(100vw - 28px)); }
+.connector-dialog .connector-dialog-header {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+.connector-form, .connector-confirm { display: grid; gap: 14px; padding: 16px 18px; }
+.connector-fields, .connector-field-list { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
+.connector-fields { display: grid; gap: 14px; }
+.connector-dialog label { display: grid; gap: 4px; min-inline-size: 0; font-weight: 550; }
+.connector-dialog small { font-weight: 400; }
+.connector-dialog :is(input:not([type="checkbox"], [type="file"]), select, textarea) {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--canvas);
+  font-weight: 400;
+  outline-offset: 1px;
+}
+.connector-dialog :is(input:not([type="checkbox"], [type="file"]), select) { min-height: 39px; }
+.connector-dialog textarea { resize: vertical; }
+.connector-dialog [aria-invalid="true"] { border-color: var(--danger); }
+.connector-form-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.connector-web-fields { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.connector-inline-field, .connector-secret-value { display: flex; align-items: center; gap: 5px; }
+.connector-field-list { display: grid; gap: 6px; padding-top: 4px; }
+.connector-field-list legend { font-weight: 550; }
+.connector-field-add { justify-self: start; color: var(--accent-ink); padding-inline: 5px; }
+.connector-secret-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) 36px;
+  align-items: end;
+  gap: 6px;
+}
+.connector-secret-row label { font-size: var(--type-sm); }
+.connector-secret-input { display: grid; gap: 4px; min-width: 0; }
+.connector-dialog .check-line { display: flex; align-items: center; gap: 7px; width: fit-content; min-height: 32px; }
+.modal .connector-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.connector-dialog .connector-confirm { overflow-wrap: anywhere; }
+.skill-instructions, .skill-files { display: grid; gap: 6px; min-width: 0; }
+.skill-editor-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.skill-editor-heading label { display: flex; align-items: baseline; }
+.skill-preview-toggle { display: flex; gap: 2px; border-radius: 8px; padding: 2px; background: var(--neutral); }
+.skill-preview-toggle button { min-height: 30px; padding: 2px 8px; border-radius: 6px; color: var(--muted); }
+.skill-preview-toggle button[aria-pressed="true"] { background: var(--surface); color: var(--accent-ink); }
+.skill-preview { min-height: 152px; max-height: 260px; padding: 10px 12px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--canvas); }
+.skill-file-list li { display: flex; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.skill-file-list button { flex: none; }
+.skill-file-list .file-removed code { color: var(--muted); text-decoration: line-through; }
+@container connectors (width < 460px) {
+  .connector-tabs button { padding-inline: 7px; }
+  .connector-card-description, .connector-card-actions { margin-inline-start: 0; }
+}
+@container connectors (width < 335px) {
+  .connector-tabs svg { display: none; }
+  .connector-parameters > div { grid-template-columns: 1fr; gap: 2px; }
+}
+@container connector-dialog (width < 440px) {
+  .connector-form-pair { grid-template-columns: 1fr; }
+  .connector-secret-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 36px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .connectors-page *, .connector-dialog * { transition: none !important; }
+}

@@ -34,7 +34,7 @@ from app.agent.prompting.telemetry import cache_write_tokens
 from app.config import AgentSettings, PromptSettings
 from app.memory.context import memory_trace
 from app.memory.semantics import identity_intent
-from app.tools.read_attachment import attachment_references
+from app.tools.read_attachment import MAX_CONTEXT_CHARS, attachment_references
 
 
 def _accepts_keyword(target: Any, name: str) -> bool:
@@ -824,19 +824,27 @@ class AgentNodes:
             if skills:
                 messages.append(reference("skill_reference", {"skills": skills}))
                 context_sources["skill_reference"] = [digest(item) for item in skills]
+        budget = self.prompt_budget(state)
         if state.get("attachment_ids"):
+            # The prompt estimator uses four characters per token. Allow half for previews.
+            preview_chars = min(MAX_CONTEXT_CHARS, budget.input_limit * 2)
             if self.services.attachment_reader is None:
                 raise ValueError("Attachment reader is unavailable")
             reader = self.services.attachment_reader
             if hasattr(reader, "read_attachment_previews"):
                 attachments = await reader.read_attachment_previews(
-                    state["user_id"], state["thread_id"], state["attachment_ids"], 60_000
+                    state["user_id"], state["thread_id"], state["attachment_ids"], preview_chars
                 )
             else:
                 attachments = await reader.read_attachments(
                     state["user_id"], state["thread_id"], state["attachment_ids"]
                 )
-            messages.append(reference("attachment_reference", attachment_references(attachments)))
+            messages.append(
+                reference(
+                    "attachment_reference",
+                    attachment_references(attachments, max_chars=preview_chars),
+                )
+            )
             context_sources["attachment_reference"] = [str(item["id"]) for item in attachments]
         context_by_anchor = None
         runtime_metadata = {}
@@ -894,7 +902,6 @@ class AgentNodes:
         # Enforce the selected model's window before every call, including a resumed tool
         # round: optional references are dropped first, then the oldest complete turns.
         # 每次调用前落实所选模型窗口，包括恢复的工具轮：先丢弃可选参考，再压缩最旧完整轮次。
-        budget = self.prompt_budget(state)
         # The plan also narrows the visible tool schemas and therefore the schema reserve. /
         # 计划同时收窄模型可见工具 schema，因此也影响 schema 预留。
         runnable = self._runnable(state)

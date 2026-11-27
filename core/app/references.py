@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.tools.contracts import ToolOperationError
+from app.tools.read_attachment import DOCUMENT_EXTENSIONS
 from app.tools.workspace import WorkspaceFiles
 
 
@@ -295,7 +296,9 @@ class ReferenceResolver:
                             "application/json",
                             "application/xml",
                         }
-                        if textual and "\0" not in result["data"]["text"]:
+                        if (textual or target.suffix.lower() in DOCUMENT_EXTENSIONS) and (
+                            "\0" not in result["data"]["text"]
+                        ):
                             data.update(result["data"])
                             data["next_offset"] = result.get("next_offset")
                             source_truncated = result.get("next_offset") is not None

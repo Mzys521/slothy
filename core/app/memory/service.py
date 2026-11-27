@@ -536,7 +536,7 @@ class MemoryService(MemoryEvolution):
                 same = {"id": archived["id"]}
         if same:
             memory_id = same["id"]
-            await self._concepts(user, semantics, scope, reference)
+            resolved = await self._concepts(user, semantics, scope, reference)
         else:
             # A correction retires the old fact before creating a different immutable version.
             # 更正先使旧事实退出 active，再建立不可混淆的新版本。
@@ -589,16 +589,17 @@ class MemoryService(MemoryEvolution):
                     protected,
                 ),
             )
-            for cid in set(resolved.values()):
-                await self.db.execute(
-                    "INSERT OR IGNORE INTO memory_fact_concepts VALUES(?,?)", (memory_id, cid)
-                )
             for previous in slots:
                 await self.db.execute(
                     "UPDATE workspace_memories SET superseded_by=? WHERE id=?",
                     (memory_id, previous["id"]),
                 )
             await self.audit(user, "created", memory_id)
+        if resolved:
+            await self.db.executemany(
+                "INSERT OR IGNORE INTO memory_fact_concepts VALUES(?,?)",
+                [(memory_id, cid) for cid in sorted(set(resolved.values()))],
+            )
         await self.db.execute(
             """UPDATE memory_claims SET status='confirmed',memory_id=?,value=?,
             profile_key=?,dimension=?,scope=?,scope_ref=?,pending_reason=NULL,

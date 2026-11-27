@@ -12,6 +12,7 @@ declare global {
       isMaximized(): Promise<boolean>
       close(): Promise<void>
       selectDirectory(): Promise<string | null>
+      openArtifact?(threadId: string, artifactId: string): Promise<'opened' | 'revealed' | 'missing'>
       writeClipboard(text: string): Promise<void>
       purgeLocalData(confirmation: string): Promise<{ ok: boolean; removed: string[]; failed: { path: string; error: string }[]; remaining: string[] }>
       openLogs(): Promise<void>

@@ -1,5 +1,5 @@
-"""Bounded UTF-8 workspace file operations with no shell or external search binary. /
-有界的 UTF-8 工作区文件操作，不使用 Shell 或外部搜索程序。"""
+"""Bounded workspace file operations with no shell or external search binary. /
+有界的工作区文件操作，不使用 Shell 或外部搜索程序。"""
 
 import asyncio
 import os
@@ -11,6 +11,12 @@ from pathlib import Path
 from app.config import ToolSettings
 from app.tools.context import execution_context
 from app.tools.contracts import ToolOperationError, ToolResult, artifact_for
+from app.tools.read_attachment import (
+    DOCUMENT_EXTENSIONS,
+    LEGACY_OFFICE_EXTENSIONS,
+    MAX_UPLOAD_BYTES,
+    read_attachment,
+)
 
 
 class WorkspaceFiles:
@@ -84,8 +90,8 @@ class WorkspaceFiles:
 
     async def read(self, action: str, path=".", depth=1, offset=0, limit=8000, pattern=None):
         """
-        List, page-read or literal-search workspace text files. /
-        列出、分页读取或按字面搜索工作区文本文件。
+        List workspace files, page through extracted text or search literal text. /
+        列出工作区文件、分页读取正文，或按字面搜索文本。
 
         Args:
             action: list, read or search. / list、read 或 search。
@@ -110,15 +116,27 @@ class WorkspaceFiles:
         target = self.resolve(path)
         if action == "read":
             if not target.is_file():
-                raise ToolOperationError("INVALID_ARGS", "Choose an existing text file.")
-            if target.stat().st_size > self.settings.max_workspace_read_bytes:
-                raise ToolOperationError("OUTPUT_TOO_LARGE", "File exceeds the read byte limit.")
-            try:
-                with target.open(encoding="utf-8-sig") as stream:
-                    stream.read(offset)
-                    text = stream.read(limit + 1)
-            except UnicodeError as error:
-                raise ToolOperationError("INVALID_ARGS", "Only UTF-8 text can be read.") from error
+                raise ToolOperationError("INVALID_ARGS", "Choose an existing file.")
+            extension = target.suffix.lower()
+            if extension in LEGACY_OFFICE_EXTENSIONS:
+                raise ToolOperationError(
+                    "DOCUMENT_UNREADABLE", "Save legacy .doc or .ppt files as .docx or .pptx first."
+                )
+            if extension in DOCUMENT_EXTENSIONS:
+                text = await asyncio.to_thread(self._read_document, target, offset, limit)
+            else:
+                if target.stat().st_size > self.settings.max_workspace_read_bytes:
+                    raise ToolOperationError(
+                        "OUTPUT_TOO_LARGE", "File exceeds the read byte limit."
+                    )
+                try:
+                    with target.open(encoding="utf-8-sig") as stream:
+                        stream.read(offset)
+                        text = stream.read(limit + 1)
+                except UnicodeError as error:
+                    raise ToolOperationError(
+                        "INVALID_ARGS", "Only UTF-8 text can be read."
+                    ) from error
             return ToolResult(
                 ok=True,
                 summary="Read a page of workspace text.",
@@ -218,6 +236,17 @@ class WorkspaceFiles:
             summary=f"Found {len(matches)} fixed-string matches.",
             data={"matches": matches, "truncated": truncated},
         ).model_dump()
+
+    @staticmethod
+    def _read_document(target: Path, offset: int, limit: int) -> str:
+        with target.open("rb") as stream:
+            contents = stream.read(MAX_UPLOAD_BYTES + 1)
+        if len(contents) > MAX_UPLOAD_BYTES:
+            raise ToolOperationError("OUTPUT_TOO_LARGE", "Documents must be no larger than 32 MiB.")
+        try:
+            return read_attachment(target.name, contents)[offset : offset + limit + 1]
+        except ValueError as error:
+            raise ToolOperationError("DOCUMENT_UNREADABLE", str(error)) from error
 
     async def delete(self, path: str, recursive: bool = False):
         """

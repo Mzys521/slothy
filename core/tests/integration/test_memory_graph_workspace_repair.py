@@ -36,6 +36,73 @@ def application(tmp_path, inputs=None):
     )
 
 
+def test_reconfirmed_fact_projects_its_saved_concept_membership(tmp_path):
+    with TestClient(application(tmp_path)) as client:
+        memory = {"title": "Release checklist", "content": "Keep the release checklist up to date."}
+        original = client.post(BASE + "/memories", json=memory)
+        assert original.status_code == 201, original.text
+        assert client.get(BASE + "/graph").json()["edges"] == []
+        repeated = client.post(
+            BASE + "/memories",
+            json={
+                **memory,
+                "concepts": [{"key": "release", "kind": "skill", "label": "Release planning"}],
+            },
+        )
+        assert repeated.status_code == 201, repeated.text
+        fact_id = original.json()["id"]
+        assert repeated.json()["id"] == fact_id
+        graph = client.get(BASE + "/graph").json()
+        concept = next(node for node in graph["nodes"] if node["node_kind"] == "concept")
+        assert concept["label"] == "Release planning"
+        assert [
+            (edge["source"], edge["target"], edge["origin"], edge["directed"])
+            for edge in graph["edges"]
+        ] == [(fact_id, concept["id"], "membership", False)]
+
+
+def test_manual_concept_links_survive_restart_and_can_be_removed(tmp_path):
+    with TestClient(application(tmp_path)) as client:
+        for skill, importance in (("python", 0.5), ("vue", 0.95)):
+            created = client.post(
+                BASE + "/memories",
+                json={
+                    "title": f"Learn {skill}",
+                    "content": f"I am learning {skill}.",
+                    "value": True,
+                    "profile_key": f"skills.{skill}.learning",
+                    "profile_dimension": "skill",
+                    "importance": importance,
+                },
+            )
+            assert created.status_code == 201, created.text
+        graph = client.get(BASE + "/graph").json()
+        concepts = {
+            node["label"]: node["id"] for node in graph["nodes"] if node["node_kind"] == "concept"
+        }
+        endpoints = {
+            "source_id": concepts["python"],
+            "target_id": concepts["vue"],
+            "directed": True,
+        }
+        added = client.put(BASE + "/graph/links", json={**endpoints, "relation": "used_together"})
+        assert added.status_code == 200, added.text
+        assert added.json()["origin"] == "manual"
+        focused = client.get(
+            BASE + "/graph", params={"focus_id": concepts["python"], "limit": 2}
+        ).json()
+        assert [node["id"] for node in focused["nodes"]] == [concepts["python"], concepts["vue"]]
+        assert [edge["relation"] for edge in focused["edges"]] == ["used_together"]
+
+    with TestClient(application(tmp_path)) as client:
+        graph = client.get(BASE + "/graph").json()
+        assert {edge["origin"] for edge in graph["edges"]} == {"membership", "manual"}
+        assert client.delete(BASE + "/graph/links", params=endpoints).status_code == 204
+        graph = client.get(BASE + "/graph").json()
+        assert len(graph["edges"]) == 2
+        assert all(edge["origin"] == "membership" for edge in graph["edges"])
+
+
 def test_multiline_learning_profile_injection_trace_and_reanalysis(tmp_path):
     inputs = []
     app = application(tmp_path, inputs)

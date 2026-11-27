@@ -7,7 +7,7 @@
 <p align="center"><em>Small Steps Toward A Better Future · 小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="version 0.1.5" src="https://img.shields.io/badge/version-0.1.5-60DD06" />
+  <img alt="version 0.1.6" src="https://img.shields.io/badge/version-0.1.6-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -23,8 +23,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.5"><strong>Download Slothy 0.1.5 for Windows x64</strong></a> ·
-  <a href="docs/releases/0.1.5.md#english">Release notes</a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.6"><strong>Download Slothy 0.1.6 for Windows x64</strong></a> ·
+  <a href="docs/releases/0.1.6.md#english">Release notes</a> ·
   <a href="CHANGELOG.md">Changelog</a>
 </p>
 
@@ -52,10 +52,10 @@ need no embedding service. Manual profile edits and automatic learning share the
 same facts; corrections retire old versions, and identity questions use reliable
 facts directly. The context panel shows what was actually provided and why.
 
-Slothy 0.1.5 checks existing databases before opening them. It opens compatible data
+Slothy 0.1.6 checks existing databases before opening them. It opens compatible data
 and prompts for a recovery decision when the storage format needs attention. Upgrading
 a compatible legacy store through that prompt creates a verified backup first.
-See the [0.1.5 release notes](docs/releases/0.1.5.md#english) for upgrade and installer details.
+See the [0.1.6 release notes](docs/releases/0.1.6.md#english) for upgrade and installer details.
 
 ## Why Slothy
 
@@ -88,8 +88,8 @@ See the [0.1.5 release notes](docs/releases/0.1.5.md#english) for upgrade and in
   never overwritten by a refresh.
 - **Observability** — rotating application logs and per-session JSONL model-call records
   capture prompt/context composition, tool schemas, provider usage, cache hits, duration,
-  status and redacted parameters. The right-side Work Details tab renders horizontal context bars
-  and call hierarchy; About Slothy opens the managed log directory.
+  status and redacted parameters. Work Details shows an estimated input donut chart,
+  provider-reported usage, and details by model call. About Slothy opens the log directory.
 - **DeepSeek web search** — the `deepseek_search` tool calls DeepSeek's official
   `POST /v1/tools/search` API (title, URL, summaries, content, source, publication time).
   Configure an independent Search key in Settings → API; otherwise the DeepSeek model
@@ -101,9 +101,11 @@ See the [0.1.5 release notes](docs/releases/0.1.5.md#english) for upgrade and in
   dialog; the model never asks for confirmation in prose. Denials are returned as
   `USER_DENIED` tool results, recorded as rejected in audit/activity, and cannot be
   retried or bypassed in the same run.
-- **Drag-and-drop attachments** — drop TXT, Markdown, PDF, DOCX, JSON, CSV and similar
-  documents onto the conversation; validation reports count/size/type errors without
-  breaking the turn, and PDF text is extracted with a bounded parser.
+- **Work artifacts** — completed replies list the files written or generated
+  during the turn. Click a card in the desktop app to open the original file.
+- **Document reading** — drop PDF, DOCX, PPTX or UTF-8 files into a conversation, or use `@`
+  to reference a file in the workspace. Apply OCR to scanned PDFs and save legacy `.doc` or
+  `.ppt` files as `.docx` or `.pptx` before sharing them with the Agent.
 - **Reviewed deletion** — `workspace_delete` is a Chat/Work high-risk tool: paths are
   normalized and confined to the workspace, symlinks/roots/private paths are rejected,
   recursive deletion requires explicit approval, and the target is revalidated at
@@ -124,10 +126,9 @@ See the [0.1.5 release notes](docs/releases/0.1.5.md#english) for upgrade and in
   or Qwen) or connect a custom endpoint, then drop into the workspace. It only
   appears while no provider is configured; failures offer retry instead of
   pretending the app is unconfigured.
-- **Connectors** — import local tools (JSON/ZIP), MCP servers (stdio, Streamable
-  HTTP or legacy SSE) and Skills (ZIP with `SKILL.md`). Enabling discovers tools
-  through the real connection; imported tools require approval, and disabling
-  revokes execution immediately.
+- **Connectors** — configure and test MCP servers over stdio, Streamable HTTP,
+  or SSE. Create Skills with Markdown and reference files. Import existing JSON
+  and ZIP files and inspect tool definitions. Agent calls to imported tools require approval.
 - **Message previews & copy** — SVG/HTML previews fill the conversation width with
   content-driven height and follow the live theme; per-message copy uses the
   native clipboard bridge with browser fallback.
@@ -256,7 +257,7 @@ npm run production:audit                  # packaged-asset allowlist audit
 | Architecture | [architecture.md](docs/architecture.md) | [architecture.zh-CN.md](docs/architecture.zh-CN.md) |
 | Getting started | [getting-started.md](docs/getting-started.md) | [getting-started.zh-CN.md](docs/getting-started.zh-CN.md) |
 | API reference | [api.md](docs/api.md) | [api.zh-CN.md](docs/api.zh-CN.md) |
-| 0.1.5 release notes | [English](docs/releases/0.1.5.md#english) | [简体中文](docs/releases/0.1.5.md#简体中文) |
+| 0.1.6 release notes | [English](docs/releases/0.1.6.md#english) | [简体中文](docs/releases/0.1.6.md#简体中文) |
 | Brand guidelines | [brand.md](docs/brand.md) | [brand.md](docs/brand.md#中文) |
 | Changelog | [CHANGELOG.md](CHANGELOG.md) | [CHANGELOG.md](CHANGELOG.md) |
 

@@ -10,6 +10,7 @@ import SessionHistory from './SessionHistory.vue'
 import AgentContextPanel from './AgentContextPanel.vue'
 import { ApiError, memoryScope, streamWorkRequest, threadPath, uploadAttachment, workRequest, type MemoryReceipt, type ModelItem, type ToolReview, type WorkReply, type ToolArtifact } from './workApi'
 import RunActivityTrace from './RunActivityTrace.vue'
+import ChangedFiles from './ChangedFiles.vue'
 import ModelPicker from './ModelPicker.vue'
 import ConversationRail from './ConversationRail.vue'
 import ConversationStats from './ConversationStats.vue'
@@ -29,7 +30,7 @@ import { searchReferences } from './references/providers'
 import { referenceKey, referencePayload, type ReferenceItem, type ReferenceKind } from './references/types'
 import { replaceToken, unresolvedMentions, type ComposerTrigger } from './references/parser'
 
-const emit = defineEmits<{ memory: [id: string]; evidence: [thread: string, run: string]; memoryReview: []; closeContext: [] }>()
+const emit = defineEmits<{ memory: [id: string]; graph: [id: string]; evidence: [thread: string, run: string]; memoryReview: []; closeContext: [] }>()
 const props = defineProps<{ memoryId?: string }>()
 const session = computed(() => sessions.value.find(item => item.id === activeSession.value))
 const mode = ref<ChatMode>(session.value?.mode ?? readLocal('adaptive.chatMode', 'chat'))
@@ -654,7 +655,7 @@ let dragDepth = 0
 const SUPPORTED_UPLOAD_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.csv', '.tsv', '.json', '.jsonl', '.yaml', '.yml',
   '.xml', '.log', '.py', '.js', '.ts', '.html', '.css', '.sql', '.toml', '.ini',
-  '.docx', '.pdf',
+  '.docx', '.pdf', '.pptx',
 ])
 
 /**
@@ -680,8 +681,8 @@ function addFileList(selected: File[]) {
   })
   if (unsupported) {
     workError.value = t(
-      `Unsupported file type: ${unsupported.name}. Attach TXT, Markdown, PDF, DOCX, JSON, CSV or similar documents.`,
-      `不支持的文件类型：${unsupported.name}。请添加 TXT、Markdown、PDF、DOCX、JSON、CSV 等文档。`,
+      `Unsupported file type: ${unsupported.name}. Use PDF, DOCX, PPTX or UTF-8 text. Save legacy .doc and .ppt files in the newer formats first.`,
+      `不支持的文件类型：${unsupported.name}。请添加 PDF、DOCX、PPTX 或 UTF-8 文本。旧版 .doc 和 .ppt 请先另存为新版格式。`,
     )
     return
   }
@@ -1039,6 +1040,8 @@ function onComposerKey(event: KeyboardEvent) {
               <button v-if="turn.checkpointId && !workRunning(turn) && !pendingReview && turn.serverRunId === session?.pendingRun?.run_id" type="button" class="outline-button checkpoint-resume" :disabled="archived || workBusy || command.busy.value" @click="command.run('retry')">{{ t('Continue from checkpoint', '从检查点继续') }}</button>
               <MarkdownText v-else-if="turn.serverReply" class="answer" :text="turn.serverReply" previews />
               <MarkdownText v-else-if="liveReplies[turn.id]" class="answer" :text="liveReplies[turn.id] ?? ''" />
+              <ChangedFiles v-if="turn.serverReply && !turn.serverError && session?.apiThreadId"
+                :thread-id="session.apiThreadId" :activity="turn.activity" />
               <footer v-if="turn.serverReply && !turn.serverError" class="answer-footer">
                 <span v-if="turn.memoryReceiptError" role="alert">{{ turn.memoryReceiptError }}</span>
                 <button v-for="memory in turn.savedMemories" :key="memory.id" class="text-link" @click="emit('memory', memory.id)">
@@ -1124,9 +1127,7 @@ function onComposerKey(event: KeyboardEvent) {
     </section>
     <p v-else class="conversation-empty">{{ t('Select a session or start a new one.', '选择一个会话或新建') }}</p>
     <AgentContextPanel v-if="panelOpen && (session || memoryId)" :session="session" :memory-id="memoryId"
-      @evidence="(thread, run) => emit('evidence', thread, run)" @close="closePanel">
-      <template #memory-actions><slot name="memory-actions" /></template>
-    </AgentContextPanel>
+      @graph="id => emit('graph', id)" @evidence="(thread, run) => emit('evidence', thread, run)" @close="closePanel" />
   </main>
 </template>
 

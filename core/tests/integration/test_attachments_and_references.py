@@ -4,15 +4,20 @@
 """
 
 import json
+from io import BytesIO
 from types import SimpleNamespace
 
+import pytest
+from docx import Document
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from pypdf import PdfWriter
 
 from app import api
 from app.agent.tools import create_builtin_tools
 from app.config import CheckpointSettings, ToolSettings
+from app.tools.workspace import WorkspaceFiles
 from tests.support.legacy_app import create_app
 
 BASE = "/api/v1"
@@ -42,6 +47,103 @@ def chat_app(tmp_path, model, **overrides):
     )
 
 
+@pytest.fixture(params=["pdf", "docx", "pptx"])
+def office_document(request):
+    stream = BytesIO()
+    if request.param == "pdf":
+        canvas = pytest.importorskip("reportlab.pdfgen.canvas").Canvas(stream)
+        canvas.drawString(40, 770, "First document marker")
+        canvas.showPage()
+        canvas.drawString(40, 770, "Second document marker")
+        canvas.save()
+    elif request.param == "docx":
+        document = Document()
+        document.add_paragraph("First document marker")
+        document.add_table(1, 1).cell(0, 0).text = "Second document marker"
+        document.save(stream)
+    else:
+        pptx = pytest.importorskip("pptx")
+        deck = pptx.Presentation()
+        slide = deck.slides.add_slide(deck.slide_layouts[5])
+        slide.shapes.title.text = "First document marker"
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        table = slide.shapes.add_table(1, 1, 900000, 900000, 4000000, 800000).table
+        table.cell(0, 0).text = "Second document marker"
+        deck.save(stream)
+    return f"document.{request.param}", stream.getvalue()
+
+
+def test_document_text_reaches_agent_from_upload_and_workspace(tmp_path, office_document):
+    filename, content = office_document
+    workspace = tmp_path / "artifacts"
+    workspace.mkdir()
+    (workspace / filename).write_bytes(content)
+    settings = ToolSettings(_env_file=None, workspace_path=workspace)
+    model = RecordingModel(
+        responses=[
+            AIMessage(content="Read the attachment"),
+            AIMessage(content="Read the reference"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "workspace_read",
+                        "args": {"action": "read", "path": filename},
+                        "id": "read-document",
+                    }
+                ],
+            ),
+            AIMessage(content="Read the workspace file"),
+        ]
+    )
+    app = chat_app(tmp_path, model, work_tools=create_builtin_tools(settings))
+    with TestClient(app) as client:
+        thread = client.post(BASE + "/threads", json={"mode": "work"}).json()["thread_id"]
+        uploaded = client.post(
+            BASE + f"/threads/{thread}/attachments", params={"filename": filename}, content=content
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        result = client.post(
+            BASE + "/chat",
+            json={
+                "thread_id": thread,
+                "message": "Read the attachment",
+                "attachment_ids": [uploaded.json()["id"]],
+            },
+        )
+        assert result.status_code == 200, result.text
+        attachment = next(m.text for m in model.inputs[-1] if m.name == "attachment_reference")
+        assert attachment.index("First document marker") < attachment.index(
+            "Second document marker"
+        )
+
+        referenced = client.post(
+            BASE + "/chat",
+            json={
+                "thread_id": thread,
+                "message": "Read the workspace reference",
+                "references": [{"kind": "file", "source": "workspace", "id": filename}],
+            },
+        )
+        assert referenced.status_code == 200, referenced.text
+        reference = next(m.text for m in model.inputs[-1] if m.name == "explicit_reference")
+        assert "First document marker" in reference and "Second document marker" in reference
+
+        tool_reply = client.post(
+            BASE + "/chat", json={"thread_id": thread, "message": f"Read {filename}"}
+        )
+        assert tool_reply.status_code == 200, tool_reply.text
+        tool_text = next(m.text for m in model.inputs[-1] if m.type == "tool")
+        assert "First document marker" in tool_text and "Second document marker" in tool_text
+
+        files = WorkspaceFiles(settings)
+        first = client.portal.call(files.read, "read", filename, 1, 0, 10)
+        assert first["next_offset"] == 10
+        second = client.portal.call(files.read, "read", filename, 1, first["next_offset"], 8000)
+        assert second["next_offset"] is None
+        assert "First document marker" in first["data"]["text"] + second["data"]["text"]
+
+
 def test_upload_rejects_an_unknown_thread_before_parsing(tmp_path):
     model = RecordingModel(responses=[AIMessage(content="unused")])
     app = chat_app(tmp_path, model)
@@ -63,6 +165,48 @@ def test_corrupt_pdf_uses_the_documented_422_contract(tmp_path):
         )
         assert response.status_code == 422
         assert response.json()["code"] == "ATTACHMENT_UNREADABLE"
+
+
+def test_pdf_without_extractable_text_reports_ocr_requirement(tmp_path):
+    stream = BytesIO()
+    document = PdfWriter()
+    document.add_blank_page(width=612, height=792)
+    document.write(stream)
+    model = RecordingModel(responses=[AIMessage(content="unused")])
+    with TestClient(chat_app(tmp_path, model)) as client:
+        thread = client.post(BASE + "/threads", json={"mode": "chat"}).json()["thread_id"]
+        response = client.post(
+            BASE + f"/threads/{thread}/attachments?filename=scan.pdf", content=stream.getvalue()
+        )
+        assert response.status_code == 422
+        assert response.json()["code"] == "ATTACHMENT_UNREADABLE"
+        assert "OCR" in response.json()["message"]
+
+
+def test_large_upload_keeps_a_preview_in_a_smaller_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTEXT_WINDOW_DEFAULT", "8000")
+    monkeypatch.setenv("AGENT_OUTPUT_TOKEN_RESERVE", "1024")
+    model = RecordingModel(responses=[AIMessage(content="Read the beginning")])
+    content = b"Opening paragraph\n" + b"Continuation.\n" * 5000
+    with TestClient(chat_app(tmp_path, model)) as client:
+        thread = client.post(BASE + "/threads", json={"mode": "chat"}).json()["thread_id"]
+        response = client.post(
+            BASE + f"/threads/{thread}/attachments?filename=long.txt", content=content
+        )
+        assert response.status_code == 201, response.text
+        result = client.post(
+            BASE + "/chat",
+            json={
+                "thread_id": thread,
+                "message": "Read this file",
+                "attachment_ids": [response.json()["id"]],
+            },
+        )
+        assert result.status_code == 200, result.text
+        reference = next(m for m in model.inputs[-1] if m.name == "attachment_reference")
+        (preview,) = json.loads(reference.text)
+        assert preview["text"].startswith("Opening paragraph")
+        assert len(preview["text"]) == preview["next_offset"] < preview["total_chars"]
 
 
 def test_quota_is_checked_before_buffering_the_body(tmp_path, monkeypatch):

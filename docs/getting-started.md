@@ -121,7 +121,7 @@ First run checklist:
 - **Memory V3**: state a preference, habit, goal or fact. The background model
   extracts typed concepts and evidence-backed directed facts; identity questions
   answer from reliable facts, and the context panel shows the provided evidence.
-  Slothy 0.1.5 checks existing stores on startup. If a compatible legacy store needs
+  Slothy 0.1.6 checks existing stores on startup. If a compatible legacy store needs
   migration, choose **继续使用原目录 (Keep existing data)** in the recovery dialog
   to back it up before upgrading.
 
@@ -149,7 +149,7 @@ The desktop data directory contains `checkpoints.sqlite`, `checkpoints.sessions.
 copying its data directory so SQLite files and their journals stay together. If Slothy
 opens the recovery dialog, **继续使用原目录 (Keep existing data)** upgrades an
 eligible store after verifying a backup. **备份后重新开始 (Back up and start fresh)**
-creates a new store after verifying the backup. See the [0.1.5 release notes](releases/0.1.5.md#english).
+creates a new store after verifying the backup. See the [0.1.6 release notes](releases/0.1.6.md#english).
 
 ## 6. Build a Windows installer
 
@@ -165,8 +165,8 @@ npm run production:audit
 
 The build runs four steps: renderer build (`vite build` + `vue-tsc`), backend
 freeze (PyInstaller, `core/desktop/service.spec`), release preparation, and
-NSIS packaging (`electron-builder`). The 0.1.5 Windows x64 installer is
-`web/release/slothy/0.1.5/slothy-0.1.5-x64-Setup.exe`. This folder also holds the
+NSIS packaging (`electron-builder`). The 0.1.6 Windows x64 installer is
+`web/release/slothy/0.1.6/slothy-0.1.6-x64-Setup.exe`. This folder also holds the
 blockmap and unpacked app. The build output is local.
 
 Useful variants:

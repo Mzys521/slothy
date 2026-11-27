@@ -9,6 +9,16 @@ the four-part Windows version followed by a prerelease suffix.
 > 0.1.0 – 0.3.0). This line continues with the current desktop application and
 > keeps that history for reference.
 
+## [0.1.6] — 2026-11-27
+
+Stable Windows x64 release. [简体中文 / English release notes](docs/releases/0.1.6.md)
+
+- Add MCP and Skill forms with editing, live MCP discovery, and reference file management.
+- Extract text from PDF, DOCX, and PPTX through uploads, workspace tools, and `@` references.
+- Show memory node labels and persisted relationships, and let users link nodes in the graph.
+- Use cards across all context monitor views and plot estimated input by model call.
+- Show changed-file cards below completed replies and open original files from the desktop.
+
 ## [0.1.5] — 2026-11-22
 
 Stable Windows x64 release. This release contains fixes from the architecture and

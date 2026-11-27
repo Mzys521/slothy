@@ -228,17 +228,17 @@ Python 审计是策略级约束，不是操作系统沙箱。
 
 连接器让工具面可扩展且无需重启应用。
 
-| 类型 | 导入格式 | 执行模型 |
+| 类型 | 配置方式 | 执行模型 |
 |---|---|---|
 | 本地工具 | JSON，或含 `tool.json` 的 ZIP | argv 命令、JSON stdin/stdout、工作区为 cwd、`${plugin}` 指向包目录 |
-| MCP 服务 | `mcpServers` JSON（stdio `command,args,env`；HTTP `url,type,headers`） | 通过真实连接发现（`streamable-http` 或兼容 `sse`）；调用需审批 |
-| Skills | 含唯一 `SKILL.md` 与引用文件的 ZIP | 低信任 L3 指令；`read_skill_file` 分页读取 UTF-8 引用 |
+| MCP 服务 | 表单或 `mcpServers` JSON | 通过 stdio、Streamable HTTP 或 SSE 握手并发现工具，Agent 调用须经审批 |
+| Skills | 带参考文件的 Markdown 表单，或含唯一 `SKILL.md` 的 ZIP | 低信任 L3 指令，`read_skill_file` 分页读取 UTF-8 引用 |
 
-导入项默认停用；启用时通过真实连接发现工具，失败保留原状态。导入执行工具仅在 Work 模式可见且
-需要审批，停用立即撤销执行权限，定义变化会改变工具标识。配置、凭据、环境变量与解压路径永远不会
-由 API 返回；Windows 下连接器配置使用 DPAPI 保护。限制：单次导入 10 MiB、解压后 20 MiB / 512
-项、最多 64 个导入项与 64 个启用的导入工具、8 个启用 Skills（指令合计 64,000 字符）。本地工具
-与 MCP 命令所需的解释器和依赖必须已安装；导入或启用不会执行包内脚本。
+导入和表单创建默认停用。MCP 连接测试需要确认，启用和刷新会通过实际连接发现并更新注册的工具。
+导入的执行工具须在工作模式下经审批后调用。编辑 MCP 设置会更新工具标识，待处理的审批仍对应原目标。
+Windows 使用 DPAPI 保护连接器配置，已认证的详情接口隐藏已保存的环境变量值和请求头值。
+Skill 表单生成 YAML Front Matter，并以既有的包格式保存参考文件。本地工具和 MCP 使用已安装的程序。
+[连接器 API](api.zh-CN.md#9-连接器)
 
 ## 10. 安全模型
 

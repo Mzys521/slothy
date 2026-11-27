@@ -21,6 +21,7 @@ if (process.isMainFrame) {
     isMaximized: () => ipcRenderer.invoke('desktop:is-maximized'),
     close: () => ipcRenderer.invoke('desktop:close'),
     selectDirectory: () => ipcRenderer.invoke('desktop:select-directory'),
+    openArtifact: (threadId, artifactId) => ipcRenderer.invoke('desktop:open-artifact', threadId, artifactId),
     writeClipboard: text => ipcRenderer.invoke('desktop:write-clipboard', text),
     purgeLocalData: confirmation => ipcRenderer.invoke('desktop:purge-local-data', confirmation),
     openLogs: () => ipcRenderer.invoke('desktop:open-logs'),

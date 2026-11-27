@@ -108,12 +108,15 @@ const edges = computed(() => {
     if (!source || !target) return []
     const distance = Math.hypot(target.x - source.x, target.y - source.y) || 1
     const dx = (target.x - source.x) / distance, dy = (target.y - source.y) / distance
-    return [{ ...edge, source, target, x1: source.x + dx * radius(source.importance), y1: source.y + dy * radius(source.importance),
+    return [{ ...edge, key: edgeKey(edge), source, target, x1: source.x + dx * radius(source.importance), y1: source.y + dy * radius(source.importance),
       x2: target.x - dx * (radius(target.importance) + 4), y2: target.y - dy * (radius(target.importance) + 4) }]
   })
 })
 const neighbors = computed(() => new Set(edges.value.flatMap(({ source, target }) => source.id === selected.value ? [target.id] : target.id === selected.value ? [source.id] : [])))
 const selectedPoint = computed(() => available.value.find(point => point.id === selected.value))
+const labelPoints = computed(() => selectedPoint.value
+  ? [...available.value.filter(point => point.id !== selected.value), selectedPoint.value]
+  : available.value)
 const connected = computed(() => (live.value?.edges ?? []).filter(edge => edge.source === selected.value || edge.target === selected.value))
 // Reload when a focus id asks for a memory that is not inside the current graph window.
 // 当请求定位的记忆不在当前图谱窗口内时重新加载。
@@ -163,14 +166,21 @@ async function loadGraph() {
   loadError.value = ''
   try {
     const query = '/graph?limit=' + limit.value + (activeWorkspace.value !== personalWorkspaceId ? '&project_id=' + encodeURIComponent(activeWorkspace.value) : '')
+    const requestedFocus = selected.value
+    let graph: MemoryGraphResponse
     try {
-      const graph = await workRequest<MemoryGraphResponse>(query + (selected.value ? '&focus_id=' + encodeURIComponent(selected.value) : ''))
-      if (revision === graphRevision) live.value = graph
+      graph = await workRequest<MemoryGraphResponse>(query + (requestedFocus ? '&focus_id=' + encodeURIComponent(requestedFocus) : ''))
     } catch (error) {
       if (!(error instanceof ApiError && error.code === 'GRAPH_FOCUS_UNAVAILABLE')) throw error
+      if (revision !== graphRevision) return
       focusWarning.value = t('The requested memory is archived or no longer available in the active graph.', '要定位的记忆已归档或不在有效图谱中。')
-      const graph = await workRequest<MemoryGraphResponse>(query)
-      if (revision === graphRevision) live.value = graph
+      graph = await workRequest<MemoryGraphResponse>(query)
+    }
+    if (revision !== graphRevision) return
+    live.value = graph
+    if (requestedFocus && selected.value === requestedFocus && !graph.nodes.some(node => node.id === requestedFocus)) {
+      const concept = graph.nodes.find(node => node.fact_ids?.includes(requestedFocus))
+      if (concept) selected.value = concept.id
     }
   } catch (error) {
     if (revision === graphRevision) loadError.value = error instanceof Error ? error.message : t('Could not load the memory graph.', '无法加载记忆图谱。')
@@ -185,7 +195,9 @@ async function loadGraph() {
  * @param edge - Graph edge from the API response. / 接口返回的图谱连线。
  * @returns "source:target" key. / "source:target" 键。
  */
-function edgeKey(edge: MemoryGraphResponse['edges'][number]) { return edge.id ?? edge.source + ':' + edge.target + ':' + edge.relation }
+function edgeKey(edge: MemoryGraphResponse['edges'][number]) {
+  return edge.id ?? JSON.stringify([edge.source, edge.target, edge.directed, edge.relation])
+}
 /**
  * Describe an edge from the selected node's point of view, including its direction.
  * 从当前选中节点的视角描述一条连线及其方向。
@@ -195,11 +207,16 @@ function edgeKey(edge: MemoryGraphResponse['edges'][number]) { return edge.id ??
  */
 function linkedLabel(edge: MemoryGraphResponse['edges'][number]) {
   const other = available.value.find(point => point.id === (edge.source === selected.value ? edge.target : edge.source))
-  return (edge.directed ? (edge.source === selected.value ? '→ ' : '← ') : '↔ ') + (other?.title ?? other?.id ?? '')
+  return (edge.directed ? (edge.source === selected.value ? '→ ' : '← ') : '↔ ') + (other ? nodeLabel(other) : '')
 }
-/** Persist a new manual relationship between the selected and target memories. / 保存当前记忆与目标记忆之间的手动关联。 */
+function relationshipLabel(edge: Pick<MemoryGraphResponse['edges'][number], 'origin' | 'relation'>) {
+  if (edge.origin === 'membership') return t('Fact contains concept', '事实涉及概念')
+  const relation = edge.relation === 'proficiency' ? t('Proficiency in', '熟练度对应技能') : edge.relation
+  return relation + ' · ' + (edge.origin === 'semantic' ? t('Semantic fact', '语义事实') : t('Manual', '手动关联'))
+}
+/** Persist a new manual relationship between two graph nodes. / 保存两个节点之间的手动关联。 */
 async function saveRelationship() {
-  if (!selected.value || !target.value || !relation.value.trim() || saving.value) return
+  if (!selected.value || !target.value || !relation.value.trim() || saving.value || loading.value) return
   saving.value = true; relationError.value = ''
   try {
     await workRequest('/graph/links', 'PUT', { source_id: selected.value, target_id: target.value, relation: relation.value.trim(), relevance: .7, directed: directed.value })
@@ -214,6 +231,7 @@ async function saveRelationship() {
  * @param edge - Edge to remove. / 要解除的连线。
  */
 async function removeRelationship(edge: MemoryGraphResponse['edges'][number]) {
+  if (saving.value || loading.value) return
   saving.value = true; relationError.value = ''
   try {
     await workRequest('/graph/links?source_id=' + encodeURIComponent(edge.source) + '&target_id=' + encodeURIComponent(edge.target) + '&directed=' + edge.directed, 'DELETE')
@@ -340,7 +358,7 @@ function openMemory() {
         <button class="icon-button" :disabled="reducedMotion || !available.length" :aria-pressed="motionEnabled && !reducedMotion"
           :title="reducedMotion ? t('Motion reduced by system preference', '系统已启用减少动态效果') : motionEnabled ? t('Pause motion', '暂停动态') : t('Resume motion', '恢复动态')"
           :aria-label="reducedMotion ? t('Motion reduced by system preference', '系统已启用减少动态效果') : motionEnabled ? t('Pause motion', '暂停动态') : t('Resume motion', '恢复动态')" @click="motionEnabled = !motionEnabled"><Pause v-if="motionEnabled && !reducedMotion" /><Play v-else /></button>
-        <button class="icon-button" :disabled="loading" :aria-label="t('Refresh graph', '刷新图谱')" @click="loadGraph"><RefreshCw /></button>
+        <button class="icon-button" :disabled="loading || saving" :aria-label="t('Refresh graph', '刷新图谱')" @click="loadGraph"><RefreshCw /></button>
         <button class="icon-button" :disabled="scale <= .55" :title="t('Zoom out', '缩小')" :aria-label="t('Zoom out', '缩小')" @click="zoomBy(.8)"><Minus /></button>
         <button class="icon-button" :disabled="scale >= 3.5" :title="t('Zoom in', '放大')" :aria-label="t('Zoom in', '放大')" @click="zoomBy(1.25)"><Plus /></button>
         <button class="icon-button" :aria-pressed="pan" :title="t('Pan canvas', '平移画布')" :aria-label="t('Pan canvas', '平移画布')" @click="pan = !pan"><Hand /></button>
@@ -357,10 +375,10 @@ function openMemory() {
       viewBox="36 9 1235 738" :aria-label="t('Memory relationship graph', '记忆关系图谱')" tabindex="0" @click="clearFromCanvas">
       <defs><marker :id="arrowId" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L8 4L0 8Z" fill="context-stroke" /></marker></defs>
       <g ref="graphLayer" :transform="transform">
-        <line v-for="edge in edges" :key="edge.id ?? edge.source.id + ':' + edge.target.id + ':' + edge.relation"
+        <line v-for="edge in edges" :key="edge.key"
           :x1="edge.x1" :y1="edge.y1" :x2="edge.x2" :y2="edge.y2" :marker-end="edge.directed ? `url(#${arrowId})` : undefined"
           vector-effect="non-scaling-stroke" :class="{ 'edge-active': edge.source.id === selected || edge.target.id === selected,
-            'edge-dim': selectedPoint && edge.source.id !== selected && edge.target.id !== selected }"><title>{{ edge.relation }}</title></line>
+            'edge-dim': selectedPoint && edge.source.id !== selected && edge.target.id !== selected }"><title>{{ relationshipLabel(edge) }}</title></line>
         <g v-for="point in available" :key="point.id" class="graph-node" :data-memory-type="point.type"
           :class="{ 'node-selected': selected === point.id, 'node-related': neighbors.has(point.id),
             'node-dim': selectedPoint && selected !== point.id && !neighbors.has(point.id) }"
@@ -372,10 +390,11 @@ function openMemory() {
           <circle v-if="selected === point.id" class="node-halo" :r="radius(point.importance) + 7" />
           <circle v-if="selected === point.id" class="node-selection-ring" :r="radius(point.importance) + 4" vector-effect="non-scaling-stroke" />
           <circle class="node-dot" :r="radius(point.importance)" />
-          <text v-if="hovered === point.id || selected === point.id || (point.title && neighbors.has(point.id))"
-            :x="selected === point.id ? 0 : radius(point.importance) + 4"
-            :y="selected === point.id ? radius(point.importance) + 22 : 13"
-            :text-anchor="selected === point.id ? 'middle' : 'start'">{{ nodeLabel(point) }}</text>
+        </g>
+        <g class="graph-labels" aria-hidden="true">
+          <text v-for="point in labelPoints" :key="point.id" text-anchor="middle"
+            :x="point.x" :y="point.y + radius(point.importance) + 17"
+            :class="{ 'label-selected': selected === point.id }">{{ nodeLabel(point) }}</text>
         </g>
       </g>
     </svg>
@@ -385,18 +404,18 @@ function openMemory() {
       <p v-if="selectedPoint.scope" class="muted">{{ memoryScope(selectedPoint.scope, t) }}</p><p v-if="selectedPoint.effective_frequency != null" class="muted">{{ t('Concept confirmations', '概念确认会话') }} {{ selectedPoint.effective_frequency }} · {{ t('Frequency strength', '频次强度') }} {{ (selectedPoint.strength ?? 0).toFixed(2) }}</p>
       <p v-if="!connected.length" class="muted">{{ t('No relationships yet.', '暂无关联。') }}</p>
       <div v-for="edge in connected" :key="edgeKey(edge)" class="graph-relationship">
-        <p>{{ linkedLabel(edge) }}</p><small class="muted">{{ edge.relation === 'proficiency' ? t('Proficiency in', '熟练度对应技能') : edge.relation }} · {{ edge.origin === 'semantic' ? t('Semantic fact', '语义事实') : t('Manual', '手动关联') }}</small><small v-if="edge.effective_frequency != null">{{ t('Confirmed sessions', '有效确认会话') }} {{ edge.effective_frequency }} · {{ t('Frequency strength', '频次强度') }} {{ (edge.strength ?? 0).toFixed(2) }}</small>
-        <button v-if="edge.origin === 'semantic' && edge.fact_id" class="text-link" @click="emit('detail', edge.fact_id)">{{ t('Open source fact', '查看来源事实') }}</button>
-        <template v-else-if="deleting === edgeKey(edge)"><p>{{ t('Remove this relationship?', '解除这条关联？') }}</p><button class="quiet-button" :disabled="saving" @click="deleting = ''">{{ t('Cancel', '取消') }}</button><button class="quiet-button" :disabled="saving" @click="removeRelationship(edge)">{{ t('Confirm removal', '确认解除') }}</button></template>
+        <p>{{ linkedLabel(edge) }}</p><small class="muted">{{ relationshipLabel(edge) }}</small><small v-if="edge.origin === 'semantic' && edge.effective_frequency != null">{{ t('Confirmed sessions', '有效确认会话') }} {{ edge.effective_frequency }} · {{ t('Frequency strength', '频次强度') }} {{ (edge.strength ?? 0).toFixed(2) }}</small>
+        <button v-if="edge.fact_id" class="text-link" @click="emit('detail', edge.fact_id)">{{ t('Open source fact', '查看来源事实') }}</button>
+        <template v-else-if="deleting === edgeKey(edge)"><p>{{ t('Remove this relationship?', '解除这条关联？') }}</p><button class="quiet-button" :disabled="saving" @click="deleting = ''">{{ t('Cancel', '取消') }}</button><button class="quiet-button" :disabled="saving || loading" @click="removeRelationship(edge)">{{ t('Confirm removal', '确认解除') }}</button></template>
         <button v-else class="text-link" :disabled="saving" @click="deleting = edgeKey(edge)">{{ t('Remove relationship', '解除关联') }}</button>
       </div>
-      <form v-if="selectedPoint?.node_kind !== 'concept'" class="graph-link-form" @submit.prevent="saveRelationship">
-        <label for="graph-target">{{ t('Link another memory', '关联另一条记忆') }}</label>
-        <select id="graph-target" v-model="target" required><option value="" disabled>{{ t('Choose a memory', '选择记忆') }}</option><option v-for="point in available.filter(point => point.id !== selected && point.node_kind !== 'concept')" :key="point.id" :value="point.id">{{ point.title }}</option></select>
+      <form class="graph-link-form" @submit.prevent="saveRelationship">
+        <label for="graph-target">{{ t('Link another node', '关联另一个节点') }}</label>
+        <select id="graph-target" v-model="target" required><option value="" disabled>{{ t('Choose a node', '选择节点') }}</option><option v-for="point in available.filter(point => point.id !== selected)" :key="point.id" :value="point.id">{{ nodeLabel(point) }}</option></select>
         <label for="graph-relation">{{ t('Relationship', '关联说明') }}</label><input id="graph-relation" v-model="relation" required maxlength="100">
-        <label class="check-line"><input v-model="directed" type="checkbox">{{ t('Directed: current → selected memory', '有向关系：当前记忆 → 所选记忆') }}</label>
+        <label class="check-line"><input v-model="directed" type="checkbox">{{ t('Directed: current → target node', '有向关系：当前节点 → 目标节点') }}</label>
         <p v-if="relationError" role="alert">{{ relationError }}</p>
-        <button class="accent-button" :disabled="saving || !target || !relation.trim()">{{ t('Save relationship', '保存关联') }}</button>
+        <button class="accent-button" :disabled="saving || loading || !target || !relation.trim()">{{ t('Save relationship', '保存关联') }}</button>
       </form>
     </aside>
     <footer class="graph-footer">

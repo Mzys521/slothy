@@ -20,6 +20,29 @@ export function safeArtifactUrl(value?: string | null): string | undefined {
   return value && /^\/api\/v1\/threads\/[^/?#]+\/artifacts\/[a-f0-9]{64}$/.test(value) ? value : undefined
 }
 
+/** Collect the files that still exist after the recorded effects of this turn. */
+export function changedFiles(activity: RunActivity[] = []): ToolArtifact[] {
+  const files = new Map<string, ToolArtifact>()
+  for (const entry of activity) {
+    if (entry.kind !== 'tool' || entry.status !== 'done' || entry.error_code || entry.risk === 'read') continue
+    if (entry.name === 'workspace_delete') {
+      const data = parseToolResult(entry.result)?.data
+      if (data && !Array.isArray(data) && typeof data.path === 'string') {
+        files.delete(data.path)
+        if (data.kind === 'directory') {
+          for (const name of files.keys()) if (name.startsWith(data.path + '/')) files.delete(name)
+        }
+      }
+      continue
+    }
+    const artifacts = entry.artifacts?.length ? entry.artifacts : parseToolResult(entry.result)?.artifacts
+    for (const file of artifacts ?? []) {
+      if (file?.rel_path && file.name && /^[a-f0-9]{64}$/.test(file.id)) files.set(file.rel_path, file)
+    }
+  }
+  return [...files.values()]
+}
+
 /** Fetch through the existing authenticated desktop transport. / 通过既有桌面认证通道获取产物。 */
 export async function fetchArtifact(artifact: ToolArtifact, request: typeof fetch = fetch): Promise<Blob> {
   const path = safeArtifactUrl(artifact.url)

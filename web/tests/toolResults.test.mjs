@@ -6,7 +6,7 @@ import ts from 'typescript'
 const code = ts.transpileModule(readFileSync(new URL('../src/toolResults.ts', import.meta.url), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText
-const { parseToolResult, safeArtifactUrl, fetchArtifact, riskLabel, callRisk, irreversibleCall, metricSummary } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'))
+const { parseToolResult, safeArtifactUrl, changedFiles, fetchArtifact, riskLabel, callRisk, irreversibleCall, metricSummary } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'))
 
 test('new results expose status, error hints and artifacts while historical text remains readable', () => {
   assert.equal(parseToolResult('historical tool text'), null)
@@ -31,6 +31,27 @@ test('artifact bytes use the authenticated fetch transport and failures never be
   assert.equal(await blob.text(), 'report')
   await assert.rejects(fetchArtifact(artifact, async () => new Response('missing', { status: 404 })), /download failed/)
   await assert.rejects(fetchArtifact({ ...artifact, url: 'https://example.com/private' }, () => assert.fail('must not request external URL')), /Invalid artifact URL/)
+})
+
+test('changed files use the last successful write and omit reads, failures and deleted output', () => {
+  const artifact = (id, relPath) => ({ id: id.repeat(64), name: relPath.split('/').at(-1), rel_path: relPath })
+  const completed = (...artifacts) => ({ kind: 'tool', status: 'done', name: 'workspace_write', artifacts })
+  const finalFile = artifact('b', 'notes.md')
+  const otherFolder = artifact('c', 'docs/notes.md')
+  const discarded = artifact('d', 'draft/report.pdf')
+  const prior = [
+    completed(artifact('a', 'notes.md'), otherFolder, discarded),
+    { ...completed(artifact('e', 'failed.txt')), status: 'error' },
+    { ...completed(artifact('f', 'read.txt')), risk: 'read' },
+    { ...completed(artifact('7', 'rejected.txt')), status: 'rejected' },
+    { ...completed(artifact('8', 'pending.txt')), status: 'approval' },
+    { ...completed(), name: 'workspace_delete', result: JSON.stringify({
+      ok: true, summary: 'Deleted directory', artifacts: [], data: { path: 'draft', kind: 'directory' },
+    }) },
+    completed(finalFile),
+  ]
+  assert.deepEqual(changedFiles(prior), [finalFile, otherFolder])
+  assert.deepEqual(changedFiles(), [])
 })
 
 test('risk and tool measurements use the selected language and real values', () => {

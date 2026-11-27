@@ -286,22 +286,21 @@ is omitted. This setting is separate from imported MCP connection URLs.
 
 Connectors extend the tool surface without restarting the app.
 
-| Kind | Import format | Execution model |
+| Kind | Setup | Execution model |
 |---|---|---|
 | Local tool | JSON or ZIP with `tool.json` | argv command, JSON stdin/stdout, workspace as cwd, `${plugin}` for the bundle directory |
-| MCP server | `mcpServers` JSON (stdio `command,args,env`; HTTP `url,type,headers`) | real connection discovery (`streamable-http` or legacy `sse`); tool calls reviewed |
-| Skill | ZIP with exactly one `SKILL.md` plus reference files | low-trust L3 instructions; `read_skill_file` pages UTF-8 references |
+| MCP server | Form or `mcpServers` JSON | stdio, Streamable HTTP, or SSE handshake and tool discovery; Agent calls require approval |
+| Skill | Markdown form with references, or ZIP with one `SKILL.md` | low-trust L3 instructions; `read_skill_file` pages UTF-8 references |
 
-Imported items start disabled. Enabling discovers tools through the real
-connection; failure preserves the previous state. Imported tools require approval
-in both chat and work modes, disabling revokes execution immediately, and changed
-definitions change their tool identifiers. Configuration, credentials, environment
-variables and extracted paths are never returned by the API; Windows stores
-connector configuration with DPAPI. Limits: 10 MiB import, 20 MiB / 512 extracted
-entries, 64 imported items, 64 enabled imported tools, 8 enabled skills with 64,000
-instruction characters combined. Interpreters and dependencies for local/MCP
-commands must already be installed; importing or enabling never runs bundled
-scripts.
+Imports and new forms start disabled by default. MCP connection tests require
+confirmation. Discovery updates the registered definitions on enable or refresh.
+Imported executable tools require approval in Work mode. Edits to MCP settings
+update tool identifiers so pending approvals apply only to the original target.
+Windows stores connector configuration with DPAPI. The authenticated details API
+provides editable fields with saved header and environment values masked.
+Skill forms generate YAML front matter and write references in the existing
+bundle format. Local and MCP commands use already installed programs.
+[Connector API](api.md#9-connectors)
 
 ## 10. Security model
 

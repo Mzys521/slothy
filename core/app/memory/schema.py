@@ -22,6 +22,26 @@ async def install_schema(connection):
             PRIMARY KEY(memory_id,concept_id)
         );
         CREATE INDEX IF NOT EXISTS fact_concept_reverse ON memory_fact_concepts(concept_id);
+        CREATE TABLE IF NOT EXISTS memory_graph_links (
+            user_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            relevance REAL NOT NULL,
+            directed INTEGER NOT NULL CHECK(directed IN (0, 1)),
+            CHECK(source_id <> target_id),
+            PRIMARY KEY(user_id,source_id,target_id,directed)
+        );
+        CREATE TRIGGER IF NOT EXISTS graph_links_delete_fact
+            AFTER DELETE ON workspace_memories BEGIN
+                DELETE FROM memory_graph_links WHERE user_id=OLD.user_id
+                    AND (source_id=OLD.id OR target_id=OLD.id);
+            END;
+        CREATE TRIGGER IF NOT EXISTS graph_links_delete_concept
+            AFTER DELETE ON memory_concepts BEGIN
+                DELETE FROM memory_graph_links WHERE user_id=OLD.user_id
+                    AND (source_id=OLD.id OR target_id=OLD.id);
+            END;
         CREATE TABLE IF NOT EXISTS concept_reinforcements (
             concept_id TEXT NOT NULL REFERENCES memory_concepts(id) ON DELETE CASCADE,
             scope TEXT NOT NULL, scope_ref TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL,

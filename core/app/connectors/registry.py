@@ -7,29 +7,60 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
+import logging
 import os
 import re
 import shutil
-import stat
 import subprocess
 import tempfile
-import zipfile
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 from uuid import uuid4
 
+import httpx
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 from langchain_core.tools import BaseTool, StructuredTool, ToolException
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from app.agent.tools.descriptor import Risk, ToolDescriptor, describe_builtin_tool
+from app.connectors.bundles import bundle_path, extract_bundle
+from app.connectors.skills import (
+    MAX_SKILL_TEXT,
+    SkillInput,
+    bundle_files,
+    references_from_paths,
+    split_skill,
+    stage_skill,
+)
 from app.providers import protect_secret
 from app.tools.contracts import ToolOperationError
 
 MAX_IMPORT = 10 * 1024 * 1024
 NAME = r"^[a-zA-Z][a-zA-Z0-9_-]{0,47}$"
+_MCP_PRIVATE = ContextVar("mcp_private_logs", default=False)
+
+
+def allow_sdk_log(_record: logging.LogRecord) -> bool:
+    return not _MCP_PRIVATE.get()
+
+
+# SDK diagnostics can include URLs or response bodies. Report safe error codes instead.
+# SDK 诊断可能包含地址或原始响应，连接器界面使用已脱敏错误码。
+for _logger in ("httpx", "mcp.client.sse", "mcp.client.streamable_http", "mcp.client.stdio"):
+    logging.getLogger(_logger).addFilter(allow_sdk_log)
+
+
+@contextmanager
+def private_mcp_logs():
+    token = _MCP_PRIVATE.set(True)
+    try:
+        yield
+    finally:
+        _MCP_PRIVATE.reset(token)
 
 
 class LocalTool(BaseModel):
@@ -57,6 +88,8 @@ class MCPConnection(BaseModel):
     url: str | None = Field(default=None, max_length=2048)
     headers: dict[str, str] = Field(default_factory=dict, max_length=16)
     type: str | None = None
+    cwd: str | None = Field(default=None, min_length=1, max_length=2048)
+    timeout: StrictInt | None = Field(default=None, ge=1, le=30)
 
     @model_validator(mode="after")
     def transport(self):
@@ -71,8 +104,6 @@ class MCPConnection(BaseModel):
             ValueError: If command/URL, transport or transport-specific fields conflict. /
             命令/URL、传输类型或传输专属字段冲突时抛出。
         """
-        from urllib.parse import urlsplit
-
         if bool(self.command) == bool(self.url):
             raise ValueError("Provide exactly one MCP command or URL.")
         if self.type not in (None, "stdio", "http", "streamable-http", "sse"):
@@ -86,11 +117,97 @@ class MCPConnection(BaseModel):
                 or url.password
             ):
                 raise ValueError("Use an HTTP(S) MCP URL without embedded credentials.")
-            if self.type == "stdio" or self.args or self.env:
+            if self.type == "stdio" or self.args or self.env or self.cwd:
                 raise ValueError("HTTP MCP connections cannot contain process settings.")
         elif self.type not in (None, "stdio") or self.headers:
             raise ValueError("Stdio MCP connections cannot contain HTTP settings.")
+        if self.cwd and (not Path(self.cwd).is_absolute() or "\0" in self.cwd):
+            raise ValueError("Provide an absolute MCP working directory.")
         return self
+
+
+class MCPFormConnection(MCPConnection):
+    """Null values keep a secret already saved under the same key."""
+
+    env: dict[str, str | None] = Field(default_factory=dict, max_length=32)
+    headers: dict[str, str | None] = Field(default_factory=dict, max_length=16)
+
+    def resolve(self, previous: dict) -> dict:
+        config = self.model_dump()
+        for group in ("env", "headers"):
+            old = previous.get(group, {})
+            if group == "headers":
+                old = {key.lower(): value for key, value in old.items()}
+            resolved = {}
+            used = set()
+            for key, value in config[group].items():
+                lookup = key.lower() if group == "headers" else key
+                valid_key = (
+                    re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key)
+                    if group == "headers"
+                    else key and "=" not in key and "\0" not in key
+                )
+                if not valid_key or lookup in used:
+                    raise ValueError("Configuration keys must be valid and unique.")
+                if value is None:
+                    if lookup not in old:
+                        raise ValueError(
+                            "Enter a value for each new environment variable or header."
+                        )
+                    value = old[lookup]
+                if "\0" in value or (group == "headers" and any(c in value for c in "\r\n")):
+                    raise ValueError("Environment values and headers cannot contain control bytes.")
+                resolved[key] = value
+                used.add(lookup)
+            config[group] = resolved
+        if any("\0" in item for item in [config["command"] or "", *config["args"]]):
+            raise ValueError("Commands and arguments cannot contain NUL bytes.")
+        return MCPConnection.model_validate(config).model_dump()
+
+
+class ConnectorChangedError(Exception):
+    """The form was opened against a different saved configuration."""
+
+
+class MCPConnectionError(Exception):
+    """Safe connection diagnostics, without the command, credentials or response body."""
+
+    def __init__(self, code: str, message: str, http_status: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+
+
+def discovery_failure(error: Exception) -> MCPConnectionError:
+    pending = [error]
+    while pending:
+        failure = pending.pop()
+        if isinstance(failure, BaseExceptionGroup):
+            pending.extend(failure.exceptions)
+        elif isinstance(failure, httpx.HTTPStatusError):
+            return MCPConnectionError(
+                "MCP_HTTP_STATUS",
+                "The MCP endpoint rejected the request.",
+                failure.response.status_code,
+            )
+        elif isinstance(failure, (FileNotFoundError, NotADirectoryError)):
+            return MCPConnectionError(
+                "MCP_PROGRAM_MISSING", "Command or working directory not found."
+            )
+        elif isinstance(failure, PermissionError):
+            return MCPConnectionError("MCP_PERMISSION_DENIED", "The command could not be started.")
+        elif isinstance(failure, (TimeoutError, httpx.TimeoutException)):
+            return MCPConnectionError("MCP_TIMEOUT", "MCP discovery timed out.")
+        elif isinstance(failure, httpx.ConnectError):
+            return MCPConnectionError("MCP_UNREACHABLE", "Could not reach the MCP endpoint.")
+        elif isinstance(failure, SchemaError):
+            return MCPConnectionError("MCP_INVALID_TOOLS", "MCP returned an invalid tool schema.")
+        elif isinstance(failure, ValueError):
+            return MCPConnectionError("MCP_INVALID_RESPONSE", "MCP returned an invalid response.")
+    return MCPConnectionError(
+        "MCP_HANDSHAKE_FAILED",
+        "The MCP handshake or tool discovery did not finish. Check the server and credentials.",
+    )
 
 
 def schema_valid(schema: dict):
@@ -135,71 +252,6 @@ def schema_valid(schema: dict):
     Draft202012Validator.check_schema(schema)
 
 
-def extract_bundle(data: bytes, destination: Path):
-    """
-    Validate the whole archive before writing. No links, devices or path traversal. /
-    写入前校验整个归档；不允许链接、设备文件或路径穿越。
-
-    Args:
-        data: Raw ZIP bytes supplied by the import request. / 导入请求提供的原始 ZIP 字节。
-        destination: Staging directory that receives extracted files. /
-        接收解压文件的暂存目录。
-
-    Raises:
-        ValueError: If the archive is unsafe, oversized or unreadable. /
-        归档不安全、超限或无法读取时抛出。
-    """
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            entries = archive.infolist()
-            if len(entries) > 512 or sum(item.file_size for item in entries) > 20 * 1024 * 1024:
-                raise ValueError("ZIP exceeds the 512-file / 20 MiB extracted limit.")
-            names = set()
-            for item in entries:
-                path = PurePosixPath(item.filename.replace("\\", "/"))
-                mode = item.external_attr >> 16
-                if (
-                    path.is_absolute()
-                    or not path.parts
-                    or any(
-                        part in (".", "..")
-                        or ":" in part
-                        or part.rstrip(". ") != part
-                        or any(ord(char) < 32 for char in part)
-                        or part.split(".")[0].upper()
-                        in {
-                            "CON",
-                            "PRN",
-                            "AUX",
-                            "NUL",
-                            *(f"{prefix}{n}" for prefix in ("COM", "LPT") for n in range(1, 10)),
-                        }
-                        for part in path.parts
-                    )
-                    or stat.S_ISLNK(mode)
-                    or (stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR))
-                ):
-                    raise ValueError("ZIP contains an unsafe path or special file.")
-                key = str(path).casefold()
-                if key in names:
-                    raise ValueError("ZIP contains duplicate paths.")
-                names.add(key)
-                target = destination.joinpath(*path.parts)
-                if not target.resolve().is_relative_to(destination.resolve()):
-                    raise ValueError("ZIP path escapes its destination.")
-            for item in entries:
-                target = destination.joinpath(
-                    *PurePosixPath(item.filename.replace("\\", "/")).parts
-                )
-                if item.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(archive.read(item))
-    except (zipfile.BadZipFile, RuntimeError, OSError) as exc:
-        raise ValueError("The ZIP archive could not be read.") from exc
-
-
 @asynccontextmanager
 async def mcp_session(config: dict, directory: str | None = None):
     """Open one initialized MCP client session for the declared transport. /
@@ -212,30 +264,34 @@ async def mcp_session(config: dict, directory: str | None = None):
     Yields:
         Initialized MCP ClientSession. / 已初始化的 MCP ClientSession。
     """
-    import httpx
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
     from mcp.client.streamable_http import streamable_http_client
 
     async with AsyncExitStack() as stack:
+        stack.enter_context(private_mcp_logs())
         if config.get("command"):
             transport = stdio_client(
                 StdioServerParameters(
                     command=config["command"],
                     args=config.get("args", []),
                     env=config.get("env", {}),
-                    cwd=directory,
+                    cwd=config.get("cwd") or directory,
                 ),
                 errlog=stack.enter_context(open(os.devnull, "w")),
             )
         elif config.get("type") == "sse":
-            transport = sse_client(config["url"], headers=config.get("headers", {}), timeout=15)
+            transport = sse_client(
+                config["url"],
+                headers=config.get("headers", {}),
+                timeout=config.get("timeout") or 15,
+            )
         else:
             client = await stack.enter_async_context(
                 httpx.AsyncClient(
                     headers=config.get("headers", {}),
-                    timeout=15,
+                    timeout=config.get("timeout") or 15,
                     follow_redirects=False,
                 )
             )
@@ -263,8 +319,11 @@ async def discover(config: dict) -> list[dict]:
         ValueError: If discovery exceeds the timeout or violates tool limits. /
         发现超时或违反工具限制时抛出。
     """
-    async with asyncio.timeout(30), mcp_session(config) as session:
-        return await list_mcp_tools(session)
+    try:
+        async with asyncio.timeout(config.get("timeout") or 30), mcp_session(config) as session:
+            return await list_mcp_tools(session)
+    except Exception as exc:
+        raise discovery_failure(exc) from None
 
 
 async def list_mcp_tools(session) -> list[dict]:
@@ -332,6 +391,7 @@ class ConnectorRegistry:
         self.builtin = {tool.name: tool for tool in builtin_tools}
         self.records = {}
         self.disabled = set()
+        self.connections: dict[str, str] = {}
         if self.path.exists():
             saved = json.loads(self.path.read_text(encoding="utf-8"))
             if saved.get("version") != 1:
@@ -344,6 +404,21 @@ class ConnectorRegistry:
                 if descriptor and descriptor.deprecated:
                     self.disabled.remove(name)
                     self.disabled.update(descriptor.replacements or {descriptor.alias_for})
+            for record in self.records.values():
+                if record["kind"] == "skill" and "reference_count" not in record:
+                    try:
+                        config = self.config(record)
+                        root = self.bundle_root(record)
+                        record["reference_count"] = len(
+                            references_from_paths(bundle_files(root), config["entry"])
+                        )
+                        metadata, _ = split_skill(config["text"])
+                        description = metadata.get("description")
+                        if not record["description"] and isinstance(description, str):
+                            record["description"] = description[:2000]
+                    except (ValueError, OSError):
+                        # A damaged bundle can still be listed and removed.
+                        record["reference_count"] = max(0, record.get("file_count", 0) - 1)
 
     def write(self, records: dict, disabled: set | None = None):
         """
@@ -379,6 +454,86 @@ class ConnectorRegistry:
         """
         return json.loads(protect_secret(record["config"], decrypt=True))
 
+    def bundle_root(self, record: dict) -> Path:
+        key = record.get("bundle")
+        if not key or not re.fullmatch(r"[0-9a-f]{32}", key):
+            raise ValueError("The connector bundle is unavailable.")
+        root = self.directory / key
+        if not root.is_dir() or root.resolve() != self.directory.resolve() / key:
+            raise ValueError("The connector bundle is unavailable.")
+        return root
+
+    def get(self, key: str, kind: str, revision: str | None = None) -> dict:
+        record = self.records[key]
+        if record["kind"] != kind:
+            raise KeyError(key)
+        if revision is not None and revision != record.get("revision", key):
+            raise ConnectorChangedError("The connector changed. Reopen it and try again.")
+        return record
+
+    def details(self, key: str) -> dict:
+        if key.startswith("builtin-") and key[8:] in self.builtin:
+            item = next((item for item in self.list() if item["id"] == key), None)
+            if item is None:
+                raise KeyError(key)
+            tool = self.builtin[key[8:]]
+            schema = tool.get_input_schema()
+            if not isinstance(schema, dict):
+                schema = schema.model_json_schema()
+            return {
+                "item": item,
+                "tools": [
+                    {"name": tool.name, "description": tool.description, "input_schema": schema}
+                ],
+            }
+        record = self.records[key]
+        detail = {"item": self.public(key, record), "tools": record["tools"]}
+        if record["kind"] == "mcp":
+            config = self.config(record)
+            detail["mcp"] = {
+                **config,
+                "env": dict.fromkeys(config.get("env", {})),
+                "headers": dict.fromkeys(config.get("headers", {})),
+            }
+        elif record["kind"] == "skill":
+            config = self.config(record)
+            root = self.bundle_root(record)
+            detail["skill"] = {
+                "markdown": config["text"],
+                "instructions": split_skill(config["text"])[1].lstrip("\r\n"),
+                "references": references_from_paths(bundle_files(root), config["entry"]),
+            }
+        return detail
+
+    def make_record(
+        self,
+        kind: str,
+        name: str,
+        description: str,
+        config: dict,
+        tools: list[dict],
+        *,
+        fingerprint: str,
+        bundle: str | None = None,
+        file_count: int = 0,
+    ) -> dict:
+        return {
+            "kind": kind,
+            "name": name,
+            "description": description,
+            "enabled": False,
+            "config": protect_secret(json.dumps(config)),
+            "tools": tools,
+            "bundle": bundle,
+            "fingerprint": fingerprint,
+            "file_count": file_count,
+            "transport": (
+                "stdio" if config.get("command") else config.get("type") or "streamable-http"
+            )
+            if kind == "mcp"
+            else None,
+        }
+
     def public(self, key: str, record: dict):
         """
         Project one imported connector without secrets. /
@@ -406,15 +561,24 @@ class ConnectorRegistry:
             "description": record["description"],
             "enabled": record["enabled"],
             "builtin": False,
-            "tools": [self.tool_name(key, spec) for spec in record.get("tools", [])],
+            "tools": [
+                self.tool_name(key, spec, record.get("revision")) for spec in record["tools"]
+            ],
             "transport": record.get("transport"),
             "file_count": record.get("file_count", 0),
+            "reference_count": record.get("reference_count"),
+            "revision": record.get("revision", key),
+            "connection_status": (
+                "disabled" if not record["enabled"] else self.connections.get(key, "unchecked")
+            )
+            if record["kind"] == "mcp"
+            else None,
             "risk": str(risk),
             "platforms": ["desktop"],
             "available": record["enabled"],
             "capabilities": [
                 {
-                    "name": self.tool_name(key, spec),
+                    "name": self.tool_name(key, spec, record.get("revision")),
                     "risk": str(risk),
                     "platforms": ["desktop"],
                     "requires_approval": risk != Risk.READ,
@@ -485,6 +649,7 @@ class ConnectorRegistry:
         self.directory.mkdir(parents=True, exist_ok=True)
         staged = Path(tempfile.mkdtemp(prefix="import-", dir=self.directory))
         moved = None
+        reference_count = None
         try:
             bundle = filename.lower().endswith(".zip")
             if bundle:
@@ -496,7 +661,7 @@ class ConnectorRegistry:
                 if len(files) != 1:
                     raise ValueError("The ZIP must contain exactly one SKILL.md.")
                 text = files[0].read_text(encoding="utf-8-sig")
-                if not text.strip() or len(text) > 32000:
+                if not text.strip() or len(text) > MAX_SKILL_TEXT:
                     raise ValueError("SKILL.md must contain 1–32,000 characters.")
                 name = re.search(r"(?m)^name:\s*['\"]?([^\n'\"]+)", text)
                 name = (
@@ -506,19 +671,35 @@ class ConnectorRegistry:
                         Path(filename).stem if files[0].parent == staged else files[0].parent.name
                     )
                 )
-                config = {"entry": str(files[0].relative_to(staged)), "text": text}
-                records = [(name[:120], "", config, [])]
+                metadata, _ = split_skill(text)
+                if isinstance(metadata.get("name"), str) and metadata["name"].strip():
+                    name = metadata["name"].strip()
+                description = metadata.get("description")
+                config = {"entry": files[0].relative_to(staged).as_posix(), "text": text}
+                reference_count = len(references_from_paths(bundle_files(staged), config["entry"]))
+                records = [
+                    (
+                        name[:120],
+                        description[:2000] if isinstance(description, str) else "",
+                        config,
+                        [],
+                    )
+                ]
             else:
                 if bundle:
                     manifests = list(staged.rglob("tool.json"))
                     if kind != "local" or len(manifests) != 1:
                         raise ValueError("A local tool ZIP must contain one tool.json.")
                     document = json.loads(manifests[0].read_text(encoding="utf-8-sig"))
-                    document["bundle_root"] = str(manifests[0].parent.relative_to(staged))
+                    root = str(manifests[0].parent.relative_to(staged))
                 else:
                     document = json.loads(data.decode("utf-8-sig"))
+                    root = "."
+                if not isinstance(document, dict):
+                    raise ValueError("Import a JSON object.")
                 if kind == "local":
-                    root = document.pop("bundle_root", ".") if bundle else "."
+                    if bundle:
+                        document.pop("bundle_root", None)
                     config = LocalTool.model_validate(document).model_dump()
                     schema_valid(config["input_schema"])
                     records = [
@@ -547,33 +728,34 @@ class ConnectorRegistry:
             fingerprint = hashlib.sha256(data).hexdigest()
             if any(item.get("fingerprint") == fingerprint for item in self.records.values()):
                 raise FileExistsError("This file has already been imported.")
+            if kind in {"mcp", "skill"}:
+                names = set()
+                for name, *_ in records:
+                    self.check_name(kind, name)
+                    if name.casefold() in names:
+                        raise FileExistsError("Connector names must be unique.")
+                    names.add(name.casefold())
             updated, imported = dict(self.records), []
             bundle_id = uuid4().hex
             if bundle:
-                moved = self.directory / bundle_id
-                staged.rename(moved)
+                destination = self.directory / bundle_id
+                staged.rename(destination)
+                moved = destination
+            total_files = sum(1 for file in moved.rglob("*") if file.is_file()) if moved else 0
             for name, description, config, tools in records:
                 key = uuid4().hex
-                record = {
-                    "kind": kind,
-                    "name": name,
-                    "description": description,
-                    "enabled": False,
-                    "config": protect_secret(json.dumps(config)),
-                    "tools": tools,
-                    "bundle": bundle_id if bundle else None,
-                    "fingerprint": fingerprint,
-                    "file_count": sum(1 for file in moved.rglob("*") if file.is_file())
-                    if moved
-                    else 0,
-                    "transport": (
-                        "stdio"
-                        if config.get("command")
-                        else config.get("type") or "streamable-http"
-                    )
-                    if kind == "mcp"
-                    else None,
-                }
+                record = self.make_record(
+                    kind,
+                    name,
+                    description,
+                    config,
+                    tools,
+                    fingerprint=fingerprint,
+                    bundle=bundle_id if bundle else None,
+                    file_count=total_files,
+                )
+                if reference_count is not None:
+                    record["reference_count"] = reference_count
                 updated[key] = record
                 imported.append(self.public(key, record))
             self.write(updated)
@@ -588,7 +770,129 @@ class ConnectorRegistry:
                 ):
                     shutil.rmtree(path)
 
-    async def toggle(self, key: str, enabled: bool):
+    def check_name(self, kind: str, name: str, key: str | None = None) -> None:
+        if key and self.records[key]["name"] == name:
+            return
+        if any(
+            ident != key and item["kind"] == kind and item["name"].casefold() == name.casefold()
+            for ident, item in self.records.items()
+        ):
+            raise FileExistsError("A connector of this type already uses that name.")
+
+    async def probe(self, key: str, config: dict) -> list[dict]:
+        previous = self.connections.get(key, "unchecked")
+        self.connections[key] = "connecting"
+        try:
+            tools = await discover(config)
+        except asyncio.CancelledError:
+            self.connections[key] = previous
+            raise
+        except Exception:
+            self.connections[key] = "failed"
+            raise
+        self.connections[key] = "connected"
+        return tools
+
+    async def refresh_mcp(self, key: str, revision: str | None) -> tuple[list[dict], dict]:
+        previous = self.get(key, "mcp", revision)
+        tools = await self.probe(key, self.config(previous))
+        record = {**previous, "tools": tools}
+        self.validate_enabled(key, record)
+        self.write({**self.records, key: record})
+        return tools, self.public(key, record)
+
+    async def save_mcp(
+        self,
+        key: str | None,
+        *,
+        name: str,
+        description: str,
+        enabled: bool,
+        config: MCPFormConnection,
+        revision: str | None,
+    ) -> dict:
+        previous = self.get(key, "mcp", revision) if key else None
+        self.check_name("mcp", name, key)
+        if previous is None and len(self.records) >= 64:
+            raise ValueError("At most 64 imported connectors are supported.")
+        previous_config = self.config(previous) if previous is not None else {}
+        # Validate old stored defaults for comparison without losing the legacy tool identity.
+        if previous_config:
+            previous_config = MCPConnection.model_validate(previous_config).model_dump()
+        settings = config.resolve(previous_config)
+        identifier = key or uuid4().hex
+        changed = previous is None or (previous_config, previous["name"]) != (settings, name)
+        tools = [] if changed else previous["tools"]
+        if enabled:
+            tools = await discover(settings)
+        record = self.make_record(
+            "mcp",
+            name,
+            description,
+            settings,
+            tools,
+            fingerprint=previous["fingerprint"] if previous else uuid4().hex,
+        )
+        # A saved edit changes the identity of calls that have not been approved yet.
+        record["revision"] = uuid4().hex
+        record["enabled"] = enabled
+        self.validate_enabled(identifier, record)
+        self.write({**self.records, identifier: record})
+        if enabled:
+            self.connections[identifier] = "connected"
+        elif changed:
+            self.connections.pop(identifier, None)
+        return self.public(identifier, record)
+
+    def save_skill(self, key: str | None, body: SkillInput) -> dict:
+        previous = self.get(key, "skill", body.revision) if key else None
+        self.check_name("skill", body.name, key)
+        if previous is None and len(self.records) >= 64:
+            raise ValueError("At most 64 imported connectors are supported.")
+        config = self.config(previous) if previous else {"entry": "SKILL.md", "text": ""}
+        entry = bundle_path(config["entry"]).as_posix()
+        source = self.bundle_root(previous) if previous else None
+        identifier, bundle = key or uuid4().hex, uuid4().hex
+        self.directory.mkdir(parents=True, exist_ok=True)
+        destination = self.directory / bundle
+        moved = None
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="skill-",
+                dir=self.directory,
+                ignore_cleanup_errors=True,
+            ) as temporary:
+                stage = Path(temporary) / "bundle"
+                stage.mkdir()
+                text, total, references = stage_skill(stage, source, entry, body, config["text"])
+                record = self.make_record(
+                    "skill",
+                    body.name,
+                    body.description.strip(),
+                    {"entry": entry, "text": text},
+                    [],
+                    fingerprint=previous["fingerprint"] if previous else uuid4().hex,
+                    bundle=bundle,
+                    file_count=total,
+                )
+                record.update(
+                    enabled=body.enabled,
+                    reference_count=references,
+                    revision=uuid4().hex,
+                )
+                self.validate_enabled(identifier, record)
+                stage.rename(destination)
+                moved = destination
+                self.write({**self.records, identifier: record})
+                moved = None
+        finally:
+            if moved:
+                shutil.rmtree(moved, ignore_errors=True)
+        if source:
+            shutil.rmtree(source, ignore_errors=True)
+        return self.public(identifier, record)
+
+    async def toggle(self, key: str, enabled: bool, revision: str | None = None):
         """
         Enable or disable one built-in or imported connector. /
         启用或停用单个内置或导入连接器。
@@ -630,10 +934,18 @@ class ConnectorRegistry:
             self.write(self.records, self.disabled - {name} if enabled else self.disabled | {name})
             return next(item for item in self.list() if item["id"] == key)
         previous = self.records[key]
+        self.get(key, previous["kind"], revision)
         record = {**previous, "enabled": enabled}
         if enabled and previous["kind"] == "mcp":
-            record["tools"] = await discover(self.config(previous))
-        if enabled and previous["kind"] == "skill":
+            record["tools"] = await self.probe(key, self.config(previous))
+        self.validate_enabled(key, record)
+        self.write({**self.records, key: record})
+        return self.public(key, record)
+
+    def validate_enabled(self, key: str, record: dict) -> None:
+        if not record["enabled"]:
+            return
+        if record["kind"] == "skill":
             references = [item for item in self.skill_references() if item["id"] != key]
             if (
                 len(references) >= 8
@@ -643,8 +955,7 @@ class ConnectorRegistry:
             ):
                 raise ValueError("Enabled skills exceed the 8-skill / 64,000-character budget.")
         if (
-            enabled
-            and sum(
+            sum(
                 len(item["tools"])
                 for ident, item in self.records.items()
                 if ident != key and item["enabled"]
@@ -653,14 +964,11 @@ class ConnectorRegistry:
             > 64
         ):
             raise ValueError("At most 64 imported tools can be enabled at once.")
-        if enabled:
-            names = [self.tool_name(key, spec) for spec in record.get("tools", [])]
-            if record["kind"] == "skill":
-                names = ["read_skill_file"]
-            if len(set(names)) != len(names) or any(name in self.builtin for name in names):
-                raise ValueError("Connector tool names conflict with registered tools.")
-        self.write({**self.records, key: record})
-        return self.public(key, record)
+        names = [self.tool_name(key, spec, record.get("revision")) for spec in record["tools"]]
+        if record["kind"] == "skill":
+            names = ["read_skill_file"]
+        if len(set(names)) != len(names) or any(name in self.builtin for name in names):
+            raise ValueError("Connector tool names conflict with registered tools.")
 
     def delete(self, key):
         """Delete one imported connector and its bundle directory. / 删除单个导入连接器及其包目录。
@@ -673,6 +981,7 @@ class ConnectorRegistry:
         """
         record = self.records[key]
         self.write({k: v for k, v in self.records.items() if k != key})
+        self.connections.pop(key, None)
         if record.get("bundle"):
             path = self.directory / record["bundle"]
             if path.resolve().is_relative_to(self.directory.resolve()) and path.is_dir():
@@ -691,7 +1000,7 @@ class ConnectorRegistry:
         ]
 
     @staticmethod
-    def tool_name(key, spec):
+    def tool_name(key, spec, revision=None):
         """
         Derive a stable model-visible tool name for one connector spec. /
         为连接器规格派生稳定的模型可见工具名。
@@ -705,11 +1014,12 @@ class ConnectorRegistry:
             Namespaced tool name containing key prefix and schema fingerprint. /
             含键前缀与 schema 指纹的命名空间工具名。
         """
-        signature = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
+        identity = spec if revision is None else {"spec": spec, "revision": revision}
+        signature = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
         readable = re.sub(r"[^a-zA-Z0-9_-]", "_", spec["name"])[:24] or "tool"
         return f"ext_{readable}_{key[:8]}_{signature}"
 
-    def guard(self, key, fingerprint):
+    def guard(self, key, fingerprint, revision=None):
         """
         Refuse disabled or changed connectors before a call. /
         调用前拒绝已停用或已更改的连接器。
@@ -727,7 +1037,12 @@ class ConnectorRegistry:
             连接器缺失、停用或更改时抛出。
         """
         item = self.records.get(key)
-        if not item or not item["enabled"] or item["fingerprint"] != fingerprint:
+        if (
+            not item
+            or not item["enabled"]
+            or item["fingerprint"] != fingerprint
+            or item.get("revision") != revision
+        ):
             raise ToolOperationError(
                 "CONNECTOR_DISABLED",
                 "This connector was disabled or changed.",
@@ -802,7 +1117,7 @@ class ConnectorRegistry:
                     return invoke
 
                 tool = StructuredTool(
-                    name=self.tool_name(key, spec),
+                    name=self.tool_name(key, spec, record.get("revision")),
                     description=f"{record['name']} / {spec['name']}: {spec['description']}",
                     args_schema=spec["input_schema"],
                     coroutine=build_invoke(key, record, spec),
@@ -895,7 +1210,8 @@ class ConnectorRegistry:
             ToolException: If the connector changed, schema validation or execution fails. /
                 连接器变化、schema 校验或执行失败时抛出。
         """
-        self.guard(_key, _record["fingerprint"])
+        revision = _record.get("revision")
+        self.guard(_key, _record["fingerprint"], revision)
         try:
             Draft202012Validator(_spec["input_schema"]).validate(arguments)
             if _record["kind"] == "mcp":
@@ -909,7 +1225,7 @@ class ConnectorRegistry:
                     current = next((tool for tool in listed if tool["name"] == _spec["name"]), None)
                     if current != _spec:
                         raise ToolException("MCP tools changed. Re-enable the connection.")
-                    current_record = self.guard(_key, _record["fingerprint"])
+                    current_record = self.guard(_key, _record["fingerprint"], revision)
                     if current_record["tools"] != _record["tools"]:
                         raise ToolException("MCP tools changed. Start a new request.")
                     result = await session.call_tool(_spec["name"], arguments)

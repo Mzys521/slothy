@@ -113,12 +113,14 @@ class ArtifactStore:
             raise ToolOperationError("OUT_OF_WORKSPACE", "Artifact root is linked.")
         return path
 
-    def validate_artifact(self, artifact: Artifact) -> Path:
+    def validate_artifact(self, artifact: Artifact, *, verify_contents: bool = True) -> Path:
         """Validate a recorded artifact before reusing it. / 复用前校验已记录的产物。
 
         Args:
             artifact: Recorded artifact metadata including size and optional digest. /
                 含大小与可选摘要的已记录产物元数据。
+            verify_contents: Match the recorded revision when downloading or replaying. /
+                下载或重放时核对文件是否仍为记录的版本。
 
         Returns:
             Absolute path of the validated artifact. / 校验通过的产物绝对路径。
@@ -127,12 +129,23 @@ class ArtifactStore:
             ToolOperationError: If the file is missing, changed, linked or over the limit. /
                 文件缺失、变化、为链接或超限时抛出。
         """
-        path = self.workspace / artifact.rel_path
+        relative = Path(artifact.rel_path)
+        path = self.workspace / relative
+        resolved = path.resolve()
         if (
-            not path.resolve().is_relative_to(self.workspace)
-            or path.resolve() != path.absolute()
+            relative.anchor
+            or ".." in relative.parts
+            or not resolved.is_relative_to(self.workspace)
+            or resolved != path.absolute()
             or not path.is_file()
-            or path.stat().st_size != artifact.bytes
+        ):
+            raise ToolOperationError(
+                "RECOVERY_REQUIRED", "A recorded artifact is missing or changed."
+            )
+        if not verify_contents:
+            return path
+        if (
+            path.stat().st_size != artifact.bytes
             or artifact.bytes > self.settings.max_artifact_bytes
         ):
             raise ToolOperationError(
@@ -318,7 +331,7 @@ class ArtifactStore:
                 shutil.rmtree(checked)
 
     def lookup_manifest(
-        self, artifact_id: str, key: str, user: str, thread: str
+        self, artifact_id: str, key: str, user: str, thread: str, *, verify_contents: bool = True
     ) -> tuple[Artifact, Path]:
         """
         Find an artifact inside one known invocation journal. / 在已知调用日志中查找产物。
@@ -359,7 +372,9 @@ class ArtifactStore:
                 raise LookupError("Artifact is unavailable in this conversation.")
             for artifact in ToolResult.model_validate(record["result"]).artifacts:
                 if artifact.id == artifact_id:
-                    return artifact, self.validate_artifact(artifact)
+                    return artifact, self.validate_artifact(
+                        artifact, verify_contents=verify_contents
+                    )
         except (ValueError, KeyError, OSError) as error:
             raise LookupError("Artifact is unavailable in this conversation.") from error
         raise LookupError("Artifact is unavailable in this conversation.")
@@ -389,7 +404,7 @@ class ArtifactStore:
         return artifact, path
 
     def locate(
-        self, artifact_id: str, user: str, thread: str
+        self, artifact_id: str, user: str, thread: str, *, verify_contents: bool = True
     ) -> tuple[Artifact, Path, str] | None:
         """
         Find an artifact and the journal key that produced it. / 查找产物及其生成它的日志标识。
@@ -422,7 +437,8 @@ class ArtifactStore:
                         continue
                     for artifact in ToolResult.model_validate(record["result"]).artifacts:
                         if artifact.id == artifact_id:
-                            return artifact, self.validate_artifact(artifact), directory.name
+                            path = self.validate_artifact(artifact, verify_contents=verify_contents)
+                            return artifact, path, directory.name
                 except (ValueError, KeyError, OSError):
                     continue
         return None

@@ -110,7 +110,7 @@ npm run dev
 - **新建会话**：发一条消息，确认回复以流式返回。
 - **工具审批**：请求生成文档或执行命令时，运行会暂停并展示完整调用参数，批准后继续。
 - **记忆 V3**：陈述偏好、习惯、目标或事实后，后台模型会提炼语义概念与有证据的有向事实；
-  身份问答直接使用可靠事实，上下文面板展示实际提供的证据。Slothy 0.1.5 会在启动时核验已有
+  身份问答直接使用可靠事实，上下文面板展示实际提供的证据。Slothy 0.1.6 会在启动时核验已有
   数据库。兼容的旧库需要迁移时，可在恢复提示中选择「继续使用原目录」，确认备份后再升级。
 
 ### 输入区命令与引用
@@ -132,7 +132,7 @@ npm run dev
 桌面数据目录包含 `checkpoints.sqlite`、`checkpoints.sessions.sqlite`、
 `checkpoints.workspace.sqlite`、`providers.json` 与 `artifacts/`。复制数据目录前先退出 Slothy，
 以同时保留 SQLite 数据库及其日志。出现恢复提示时，「继续使用原目录」会先验证备份，再升级符合条件
-的旧库。「备份后重新开始」会在验证备份后初始化新库。详见 [0.1.5 发布说明](releases/0.1.5.md#简体中文)。
+的旧库。「备份后重新开始」会在验证备份后初始化新库。详见 [0.1.6 发布说明](releases/0.1.6.md#简体中文)。
 
 ## 6. 构建 Windows 安装包
 
@@ -148,7 +148,7 @@ npm run production:audit
 
 构建分四步：渲染层构建（`vite build` + `vue-tsc`）、后端冻结（PyInstaller，
 `core/desktop/service.spec`）、发布准备、NSIS 打包（`electron-builder`）。
-0.1.5 Windows x64 安装包输出为 `web/release/slothy/0.1.5/slothy-0.1.5-x64-Setup.exe`。
+0.1.6 Windows x64 安装包输出为 `web/release/slothy/0.1.6/slothy-0.1.6-x64-Setup.exe`。
 同目录还包含差分映射和解包版应用。构建产物位于本机。
 
 常用子命令：

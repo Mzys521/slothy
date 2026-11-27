@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import socket
@@ -9,6 +10,7 @@ import zipfile
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
@@ -407,6 +409,369 @@ def test_streamable_http_mcp_can_be_imported_and_invoked(tmp_path):
         worker.join(10)
         listener.close()
         assert not worker.is_alive()
+
+
+def test_mcp_form_uses_real_stdio_and_revokes_an_old_approval_after_edit(tmp_path, caplog):
+    server = tmp_path / "server.py"
+    server.write_text(
+        "from mcp.server.fastmcp import FastMCP\n"
+        "from pathlib import Path\n"
+        "import os\n"
+        "assert os.environ['FORM_SECRET'] == 'fixture-private-stdio'\n"
+        "Path('started').touch()\n"
+        "app = FastMCP('document-helper')\n"
+        "@app.tool()\n"
+        "def echo(text: str) -> str:\n"
+        "    Path('called').touch()\n"
+        "    return text\n"
+        "if Path('add-tool').exists():\n"
+        "    @app.tool()\n"
+        "    def word_count(text: str) -> int:\n"
+        "        return len(text.split())\n"
+        "app.run(transport='stdio')\n",
+        encoding="utf-8",
+    )
+    working = tmp_path / "working"
+    working.mkdir()
+    body = {
+        "name": "document-helper",
+        "description": "Local document utility",
+        "config": {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [str(server)],
+            "cwd": str(working),
+            "env": {"FORM_SECRET": "fixture-private-stdio"},
+        },
+    }
+    app, model = make_app(tmp_path)
+    with TestClient(app) as client:
+        caplog.set_level("DEBUG", logger="mcp.client.stdio")
+        test_url = BASE + "/connectors/mcp/test"
+        assert client.post(test_url, json={"config": body["config"]}).status_code == 409
+        assert not (working / "started").exists()
+        result = client.post(test_url, json={"config": body["config"], "confirmed": True})
+        assert result.json()["response_status"] == "tools_listed", result.text
+        assert result.json()["tools"][0]["name"] == "echo"
+        assert (working / "started").exists()
+        assert client.get(BASE + "/connectors").json()["items"] == []
+        (working / "started").unlink()
+        created = client.post(BASE + "/connectors/mcp", json=body)
+        assert created.status_code == 201, created.text
+        item = created.json()
+        path = f"{BASE}/connectors/{item['id']}"
+        assert item["connection_status"] == "disabled"
+        assert not (working / "started").exists()
+        detail = client.get(path)
+        assert detail.headers["cache-control"] == "no-store"
+        assert detail.json()["mcp"]["env"] == {"FORM_SECRET": None}
+        assert "fixture-private-stdio" not in detail.text
+        assert client.post(BASE + "/connectors/mcp", json=body).status_code == 409
+        saved_test = client.post(path + "/test", json={"confirmed": True})
+        assert saved_test.json()["ok"], saved_test.text
+        assert client.get(path).json()["item"]["tools"] == []
+        refreshed = client.post(path + "/refresh", json={"confirmed": True})
+        assert refreshed.json()["tool_count"] == 1, refreshed.text
+        assert not refreshed.json()["connector"]["enabled"]
+        assert client.get(path).json()["tools"][0]["input_schema"]["required"] == ["text"]
+        enabled = client.patch(path, json={"enabled": True, "revision": item["revision"]})
+        assert enabled.status_code == 200, enabled.text
+        (old_tool,) = enabled.json()["tools"]
+        model.responses[:] = [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": old_tool, "args": {"text": "a pending call"}, "id": "old"}],
+            ),
+            AIMessage(content="Done"),
+        ]
+        paused = client.post(BASE + "/chat", json={"mode": "work", "message": "Use the connector"})
+        assert paused.status_code == 202, paused.text
+        assert not (working / "called").exists()
+        review = paused.json()
+        edited = {
+            **body,
+            "enabled": True,
+            "revision": item["revision"],
+            "config": {
+                **body["config"],
+                "args": [str(server), "edited"],
+                "env": {"FORM_SECRET": None},
+            },
+        }
+        assert client.put(path + "/mcp", json=edited).status_code == 409
+        edited["confirmed"] = True
+        changed = client.put(path + "/mcp", json=edited)
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["connection_status"] == "connected"
+        assert changed.json()["tools"] != [old_tool]
+        assert changed.json()["id"] == item["id"]
+        assert client.put(path + "/mcp", json=edited).status_code == 409
+        failed = client.put(
+            path + "/mcp",
+            json={
+                **edited,
+                "revision": changed.json()["revision"],
+                "config": {**edited["config"], "command": "missing-slothy-mcp-executable"},
+            },
+        )
+        assert failed.status_code == 502, failed.text
+        assert failed.json()["code"] == "MCP_PROGRAM_MISSING"
+        assert client.get(path).json()["item"]["tools"] == changed.json()["tools"]
+        finished = client.post(
+            f"{BASE}/threads/{review['thread_id']}/approval/{review['approval_id']}",
+            json={"approved": True},
+        )
+        assert finished.status_code == 200, finished.text
+        assert not (working / "called").exists()
+        assert "fixture-private-stdio" not in caplog.text
+        assert (
+            "fixture-private-stdio" not in (tmp_path / "connectors" / "connectors.json").read_text()
+        )
+    restarted, _ = make_app(tmp_path)
+    with TestClient(restarted) as client:
+        item = client.get(path).json()["item"]
+        assert item["enabled"] and item["connection_status"] == "unchecked"
+        assert item["tools"] == changed.json()["tools"]
+        assert client.post(path + "/test", json={"confirmed": True}).json()["ok"]
+        (working / "add-tool").touch()
+        refreshed = client.post(path + "/refresh", json={"confirmed": True})
+        assert refreshed.json()["tool_count"] == 2, refreshed.text
+        assert set(client.get(BASE + "/runtime").json()["work_tools"]) >= set(
+            refreshed.json()["connector"]["tools"]
+        )
+        assert client.delete(path).status_code == 204
+
+
+@pytest.mark.parametrize("transport,route", [("streamable-http", "mcp"), ("sse", "sse")])
+def test_mcp_form_http_transports_report_real_auth_errors_and_retain_headers(
+    tmp_path, caplog, transport, route
+):
+    import uvicorn
+    from mcp.server.fastmcp import FastMCP
+    from starlette.responses import PlainTextResponse
+
+    service = FastMCP("form-web", stateless_http=True, json_response=True)
+
+    @service.tool()
+    def lookup(term: str) -> str:
+        """Look up a term in the fixture."""
+        return term
+
+    endpoint = service.sse_app() if transport == "sse" else service.streamable_http_app()
+    credential = b"Bearer fixture-private-header"
+
+    async def authorized(scope, receive, send):
+        if scope["type"] != "http" or dict(scope["headers"]).get(b"authorization") == credential:
+            await endpoint(scope, receive, send)
+        else:
+            await PlainTextResponse("Private upstream text", status_code=401)(scope, receive, send)
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        server = uvicorn.Server(
+            uvicorn.Config(authorized, log_level="critical", timeout_graceful_shutdown=2)
+        )
+        worker = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
+        worker.start()
+        try:
+            for _ in range(500):
+                if server.started:
+                    break
+                time.sleep(0.01)
+            assert server.started
+            app, _ = make_app(tmp_path)
+            config = {
+                "url": f"http://127.0.0.1:{port}/{route}?token=fixture-private-query",
+                "type": transport,
+                "timeout": 5,
+            }
+            with TestClient(app) as client:
+                caplog.set_level("INFO", logger="httpx")
+                failed = client.post(
+                    BASE + "/connectors/mcp/test",
+                    json={
+                        "config": config,
+                        "confirmed": True,
+                    },
+                )
+                assert failed.status_code == 200, failed.text
+                assert failed.json()["http_status"] == 401, failed.text
+                assert not failed.json()["ok"]
+                assert "Private upstream text" not in failed.text
+                config["headers"] = {"Authorization": credential.decode()}
+                created = client.post(
+                    BASE + "/connectors/mcp",
+                    json={
+                        "name": "web-helper",
+                        "config": config,
+                        "enabled": True,
+                        "confirmed": True,
+                    },
+                )
+                assert created.status_code == 201, created.text
+                item = created.json()
+                path = f"{BASE}/connectors/{item['id']}"
+                detail = client.get(path)
+                assert detail.json()["mcp"]["headers"] == {"Authorization": None}
+                assert credential.decode() not in detail.text
+                assert detail.json()["tools"][0]["description"] == "Look up a term in the fixture."
+                test = client.post(
+                    BASE + "/connectors/mcp/test",
+                    json={
+                        "confirmed": True,
+                        "connector_id": item["id"],
+                        "revision": item["revision"],
+                        "config": detail.json()["mcp"],
+                    },
+                )
+                assert test.json()["ok"], test.text
+                assert test.json()["tools"][0]["input_schema"]["required"] == ["term"]
+                assert "fixture-private-query" not in caplog.text
+                credential = b"rotated-fixture-credential"
+                refused = client.post(path + "/refresh", json={"confirmed": True}).json()
+                assert not refused["ok"] and refused["http_status"] == 401
+                after = client.get(path).json()["item"]
+                assert after["enabled"] and after["connection_status"] == "failed"
+                assert after["tools"] == item["tools"]
+        finally:
+            server.should_exit = True
+            worker.join(10)
+            assert not worker.is_alive()
+
+
+def reference(name, text):
+    return {"name": name, "data": base64.b64encode(text.encode()).decode()}
+
+
+def test_skill_form_stages_yaml_and_references_edits_revokes_and_restores(tmp_path):
+    marker = tmp_path / "never-run"
+    body = {
+        "name": "写作指引",
+        "description": "Guide: bilingual\n---\n描述仍是 YAML 值",
+        "instructions": "# Review\nUse the writing guide.",
+        "files": [
+            reference("style.txt", "Keep sentences short."),
+            reference("example.py", f"from pathlib import Path\nPath({str(marker)!r}).touch()"),
+        ],
+    }
+    app, model = make_app(tmp_path)
+    with TestClient(app) as client:
+        created = client.post(BASE + "/connectors/skills", json=body)
+        assert created.status_code == 201, created.text
+        item = created.json()
+        path = f"{BASE}/connectors/{item['id']}"
+        assert not item["enabled"] and item["reference_count"] == 2
+        assert "read_skill_file" not in client.get(BASE + "/runtime").json()["work_tools"]
+        detail = client.get(path).json()["skill"]
+        header, _, instructions = detail["markdown"].removeprefix("---\n").partition("\n---\n")
+        assert yaml.safe_load(header) == {key: body[key] for key in ("name", "description")}
+        assert instructions.lstrip() == body["instructions"] + "\n"
+        assert detail["references"] == ["references/example.py", "references/style.txt"]
+        assert not marker.exists()
+        record = app.state.connectors.records[item["id"]]
+        assert (tmp_path / "connectors" / record["bundle"] / "SKILL.md").exists()
+        edit = {
+            **body,
+            "revision": item["revision"],
+            "instructions": "Use the updated writing guide.",
+            "enabled": True,
+            "remove_files": ["references/style.txt"],
+            "files": [reference("style.txt", "Updated reference")],
+        }
+        illegal = client.put(
+            path + "/skill", json={**edit, "files": [reference("../outside", "x")]}
+        )
+        assert illegal.status_code == 422, illegal.text
+        assert client.get(path).json()["skill"] == detail
+        updated = client.put(path + "/skill", json=edit)
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["enabled"]
+        assert client.put(path + "/skill", json=edit).status_code == 409
+        assert not (tmp_path / "connectors" / record["bundle"]).exists()
+        assert "read_skill_file" in client.get(BASE + "/runtime").json()["chat_tools"]
+        model.responses[:] = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_skill_file",
+                        "id": "read",
+                        "args": {"skill_id": item["id"], "path": "references/style.txt"},
+                    }
+                ],
+            ),
+            AIMessage(content="Done"),
+        ]
+        response = client.post(BASE + "/chat", json={"message": "Use the guide"})
+        assert response.status_code == 200, response.text
+        assert any(
+            "Updated reference" in (row.get("result") or "") for row in response.json()["activity"]
+        )
+        assert any(
+            message.name == "skill_reference" and edit["instructions"] in message.content
+            for message in model.seen[0]
+        )
+        assert not marker.exists()
+    restarted, _ = make_app(tmp_path)
+    with TestClient(restarted) as client:
+        detail = client.get(path).json()
+        assert detail["item"]["enabled"] and detail["item"]["reference_count"] == 2
+        assert detail["skill"]["instructions"].strip() == edit["instructions"]
+        assert client.patch(path, json={"enabled": False}).status_code == 200
+        assert "read_skill_file" not in client.get(BASE + "/runtime").json()["chat_tools"]
+        assert client.delete(path).status_code == 204
+        assert not marker.exists()
+
+
+def test_imported_skill_can_be_edited_with_nested_paths_and_metadata(tmp_path):
+    app, _ = make_app(tmp_path)
+    with TestClient(app) as client:
+        data = archive(
+            {
+                "notes.txt": "Outside the skill root, preserved on edit.",
+                "writing/SKILL.md": "---\nname: writer\nlicense: MIT\n---\nOriginal instructions",
+                "writing/references/style.md": "Original guide",
+                "writing/examples/sample.md": "Original example",
+            }
+        )
+        item = upload(client, "skill", data, "writing.zip").json()["items"][0]
+        path = f"{BASE}/connectors/{item['id']}"
+        assert client.get(path).json()["skill"]["references"] == [
+            "examples/sample.md",
+            "references/style.md",
+        ]
+        updated = client.put(
+            path + "/skill",
+            json={
+                "name": "writer",
+                "instructions": "Revised instructions",
+                "revision": item["revision"],
+                "remove_files": ["references/style.md"],
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        detail = client.get(path).json()["skill"]
+        assert "license: MIT" in detail["markdown"]
+        assert detail["references"] == ["examples/sample.md"]
+        assert upload(client, "skill", data, "writing.zip").status_code == 409
+
+
+@pytest.mark.parametrize("name", ["CON.txt", "bad.txt:stream", "reference/../outside", r"a\file"])
+def test_skill_form_rejects_invalid_upload_names(tmp_path, name):
+    app, _ = make_app(tmp_path)
+    with TestClient(app) as client:
+        response = client.post(
+            BASE + "/connectors/skills",
+            json={
+                "name": "portable",
+                "instructions": "Read the references.",
+                "files": [reference(name, "Contents")],
+            },
+        )
+        assert response.status_code == 422, response.text
+        assert not app.state.connectors.records
 
 
 @pytest.mark.parametrize(

@@ -124,7 +124,7 @@ from app.services import AgentRunner
 from app.services.recovery import CheckpointReader, ConversationArchiver, run_status
 from app.services.thread_lifecycle import ThreadLifecycle
 from app.tools.artifacts import ArtifactStore
-from app.tools.contracts import ToolOperationError
+from app.tools.contracts import Artifact, ToolOperationError
 from app.tools.read_attachment import (
     MAX_ATTACHMENTS,
     MAX_THREAD_UPLOAD_BYTES,
@@ -662,7 +662,7 @@ class MemoryFeedback(BaseModel):
 
 
 class MemoryLink(BaseModel):
-    """Memory-to-memory link. / 记忆之间的关联。"""
+    """Manual link between graph nodes. / 图谱节点之间的手动关联。"""
 
     source_id: str
     target_id: str
@@ -2066,7 +2066,7 @@ async def get_concept(
 
 @router.put("/graph/links", response_model=MemoryLink)
 async def set_graph_link(request: Request, body: LinkInput) -> dict:
-    """Create or replace a link between two active memories. / 在两个活跃记忆间创建或替换关联。
+    """Create or replace a link between two active graph nodes. / 创建或替换两个有效节点间的关联。
 
     Args:
         request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
@@ -2081,12 +2081,12 @@ async def set_graph_link(request: Request, body: LinkInput) -> dict:
     """
 
     if body.source_id == body.target_id:
-        raise problem(422, "INVALID_LINK", "A link needs two different memories.")
+        raise problem(422, "INVALID_LINK", "A link needs two different nodes.")
     link = await workspace(request).set_link(
         LOCAL_USER, body.source_id, body.target_id, body.relation, body.relevance, body.directed
     )
     if link is None:
-        raise problem(404, "NOT_FOUND", "Both linked memories must exist and be active.")
+        raise problem(404, "NOT_FOUND", "Both linked nodes must exist and be active.")
     return link
 
 
@@ -2813,20 +2813,24 @@ async def list_attachments(
 
 @router.get("/threads/{thread_id}/artifacts/{artifact_id}")
 async def download_artifact(request: Request, thread_id: Identifier, artifact_id: Identifier):
-    """Stream a stored artifact file to the client. / 把已存储的产物文件流式返回客户端。
+    """Stream the recorded file revision. / 下载与产物记录一致的文件。"""
+    artifact, path = await resolve_thread_artifact(request, thread_id, artifact_id)
+    return artifact_response(artifact, path)
 
-    Args:
-        request: The incoming request; gives access to app state. / 传入请求，用于访问应用状态。
-        thread_id: Session that owns the artifact. / 产物所属会话。
-        artifact_id: Identifier of the artifact. / 产物标识。
 
-    Returns:
-        A binary file response for the artifact. / 产物的二进制文件响应。
+@router.get("/threads/{thread_id}/artifacts/{artifact_id}/location", include_in_schema=False)
+async def artifact_location(request: Request, thread_id: Identifier, artifact_id: Identifier):
+    """Resolve the current file for the desktop main process. / 为桌面主进程定位当前文件。"""
+    if "origin" in request.headers or "sec-fetch-site" in request.headers:
+        raise problem(403, "DESKTOP_ONLY", "Use the desktop app to open workspace files.")
+    _, path = await resolve_thread_artifact(request, thread_id, artifact_id, verify_contents=False)
+    return JSONResponse({"path": str(path)}, headers={"Cache-Control": "no-store"})
 
-    Raises:
-        HTTPException: 404 when the artifact is unavailable in this session. /
-            产物在该会话中不可用时返回 404。
-    """
+
+async def resolve_thread_artifact(
+    request: Request, thread_id: str, artifact_id: str, *, verify_contents: bool = True
+) -> tuple[Artifact, Path]:
+    """Find a conversation's artifact in its original workspace. / 按生成时的工作区定位产物。"""
 
     thread = await require_thread(request, thread_id)
     locator = await store(request).get_artifact_locator(LOCAL_USER, thread_id, artifact_id)
@@ -2835,18 +2839,21 @@ async def download_artifact(request: Request, thread_id: Identifier, artifact_id
         # generated, so moving the session never breaks an existing link.
         # 按生成时记录的工作区根与清单解析，移动会话不会使既有链接失效。
         try:
-            settings = ToolSettings(_env_file=None, workspace_path=Path(locator["workspace_root"]))
-            artifact, path = ArtifactStore(settings).lookup_manifest(
+            root = Path(locator["workspace_root"])
+            if not verify_contents and root.resolve() != root.absolute():
+                raise ValueError("The recorded workspace has moved.")
+            settings = ToolSettings(_env_file=None, workspace_path=root)
+            return ArtifactStore(settings).lookup_manifest(
                 artifact_id,
                 locator["manifest_key"],
                 LOCAL_USER,
                 locator["owner_thread_id"],
+                verify_contents=verify_contents,
             )
         except (LookupError, ValueError, OSError):
             raise problem(
                 404, "ARTIFACT_UNAVAILABLE", "Artifact is unavailable in this conversation."
             ) from None
-        return artifact_response(artifact, path)
     record = await store(request).get_workspace(
         LOCAL_USER, thread.get("workspace_id") or "personal"
     )
@@ -2869,7 +2876,9 @@ async def download_artifact(request: Request, thread_id: Identifier, artifact_id
         pass
     for settings in candidates:
         try:
-            located = ArtifactStore(settings).locate(artifact_id, LOCAL_USER, thread_id)
+            located = ArtifactStore(settings).locate(
+                artifact_id, LOCAL_USER, thread_id, verify_contents=verify_contents
+            )
         except (LookupError, ValueError, OSError):
             continue
         if located is None:
@@ -2884,7 +2893,7 @@ async def download_artifact(request: Request, thread_id: Identifier, artifact_id
                 workspace_root=str(Path(settings.workspace_path).resolve()),
                 manifest_key=manifest_key,
             )
-        return artifact_response(artifact, path)
+        return artifact, path
     raise problem(404, "ARTIFACT_UNAVAILABLE", "Artifact is unavailable in this conversation.")
 
 

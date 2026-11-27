@@ -3,8 +3,9 @@ import { computed, onMounted, ref } from 'vue'
 import { Archive, ArchiveRestore, BriefcaseBusiness, MessageSquare, Trash2 } from 'lucide-vue-next'
 import { activeWorkspace, archiveSession, cleanupConflict, cleanupConflictMessage, deleteSession, runningSessions, sessions, sessionWorkspace, syncArchivedSessions, workspaceName, workspaces, type Session, type Turn } from './chat'
 import { t } from './preferences'
-import { threadPath, workRequest } from './workApi'
+import { threadPath, workRequest, type RunActivity } from './workApi'
 import MarkdownText from './MarkdownText.vue'
+import ChangedFiles from './ChangedFiles.vue'
 
 const props = defineProps<{ archived?: boolean }>()
 const emit = defineEmits<{ open: [id: string] }>()
@@ -13,7 +14,7 @@ const busy = ref(false)
 const error = ref('')
 const archiveLoading = ref(false)
 const archiveLoadError = ref('')
-type HistoryTurn = { message: string; response?: string; run_id?: string; attachments?: { filename: string }[] }
+type HistoryTurn = { message: string; response?: string; run_id?: string; attachments?: { filename: string }[]; activity?: RunActivity[] }
 const preview = ref<{ session: Session; items: HistoryTurn[]; cursor?: number; loading: boolean; error?: string }>()
 /** Sessions shown for this view: archived groups by workspace, or the active workspace's live sessions. / 当前视图的会话：归档视图按工作区分组，否则显示当前工作区的会话。 */
 const groups = computed(() => {
@@ -77,7 +78,8 @@ async function restore(session: Session) {
     const page: Awaited<ReturnType<typeof messagePage>> = await messagePage(session.apiThreadId, cursor)
     history.push(...page.items.map(turn => ({
       id: turn.run_id ?? crypto.randomUUID(), prompt: turn.message, serverReply: turn.response,
-      serverRunId: turn.run_id, time: '', files: (turn.attachments ?? []).map(file => file.filename), memory: false,
+      serverRunId: turn.run_id, time: '', files: (turn.attachments ?? []).map(file => file.filename),
+      activity: turn.activity, memory: false,
     })))
     cursor = page.next_cursor
   }
@@ -192,7 +194,10 @@ async function change(action: () => Promise<void>) {
       <article v-for="(turn, index) in preview.items" :key="index">
         <strong>{{ t('You', '你') }}</strong><MarkdownText :text="turn.message" />
         <p v-if="turn.attachments?.length" class="muted">{{ turn.attachments.map(file => file.filename).join(', ') }}</p>
-        <template v-if="turn.response"><strong>Agent</strong><MarkdownText :text="turn.response" previews /></template>
+        <template v-if="turn.response">
+          <strong>Agent</strong><MarkdownText :text="turn.response" previews />
+          <ChangedFiles v-if="preview.session.apiThreadId" :thread-id="preview.session.apiThreadId" :activity="turn.activity" />
+        </template>
       </article>
       <p v-if="preview.loading" role="status">{{ t('Loading…', '加载中…') }}</p>
       <p v-else-if="!preview.items.length && !preview.error">{{ t('No messages.', '暂无消息。') }}</p>

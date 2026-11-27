@@ -126,7 +126,7 @@ paths and reason codes without fact bodies. Direct self-identity questions bypas
 generation, use valid global identity facts and report missing/pending/conflicting/
 disabled/unavailable states explicitly.
 
-`/runtime` returns `storage_version` and `data_epoch`. Slothy 0.1.5 verifies existing
+`/runtime` returns `storage_version` and `data_epoch`. Slothy 0.1.6 verifies existing
 business databases before opening them. When storage recovery is required, regular
 routes return `503 STORAGE_RECOVERY_REQUIRED` and the recovery endpoints remain
 available. A successful recovery action with `restart_required: true` takes effect
@@ -296,20 +296,34 @@ process.
 
 ## 9. Connectors
 
+Paths in this table are relative to `/api/v1`.
+
 | Method | Path | Request | Success |
 | --- | --- | --- | --- |
 | GET | `/connectors` | None | `200 {items: Connector[]}` |
+| GET | `/connectors/{id}` | None | `200 {item, tools, mcp, skill}` |
 | POST | `/connectors/import?kind=local\|mcp\|skill&filename=...` | Binary `application/octet-stream` | `201 {items: Connector[]}`, initially disabled |
-| PATCH | `/connectors/{id}` | Strict `{enabled: boolean}` | `200 Connector` |
-| DELETE | `/connectors/{id}` | Imported items only | `204` |
+| PATCH | `/connectors/{id}` | Strict `{enabled: boolean, revision?: string}` | `200 Connector` |
+| DELETE | `/connectors/{id}` | Imported or form-created items | `204` |
+| POST | `/connectors/mcp` | MCP form | `201 Connector` |
+| PUT | `/connectors/{id}/mcp` | MCP form | `200 Connector` |
+| POST | `/connectors/mcp/test` | `{config, confirmed, connector_id?, revision?}` | `200 MCPResult` |
+| POST | `/connectors/{id}/test` | `{confirmed, revision?}` | `200 MCPResult` |
+| POST | `/connectors/{id}/refresh` | `{confirmed, revision?}` | `200 MCPResult` with updated `connector` on success |
+| POST | `/connectors/skills` | Skill form | `201 Connector` |
+| PUT | `/connectors/{id}/skill` | Skill form | `200 Connector` |
 
-Public fields: `id, kind, name, description, enabled, builtin, tools, transport, file_count`. Configuration, credentials, environment variables, headers and extracted paths are never included.
+List items include `id, kind, name, description, enabled, builtin, tools, transport, file_count, risk, platforms, available, capabilities`. The additive fields are `revision`, `reference_count` for Skills and `connection_status` for MCP. A detail response uses `Cache-Control: no-store`. Tool definitions contain `name, description, input_schema`. MCP details provide editable fields and return stored environment/header keys with `null` values. Skill details include the full `markdown`, editable `instructions` and reference paths relative to `SKILL.md`.
 
-Local tools accept JSON, or ZIP with `tool.json`: `{name,description,command,args,input_schema}`. The command uses JSON stdin/stdout, the active workspace as cwd and `${plugin}` for its bundle directory; interpreters and dependencies must already be installed. MCP accepts standard `mcpServers` JSON with stdio `command,args,env` or HTTP `url,type,headers` (`streamable-http` / legacy `sse`). Enabling discovers tools through the real connection; failure preserves the previous state. Toggle off/on to refresh definitions.
+An MCP form accepts `{name, description?, enabled?, revision?, config, confirmed?}`. For stdio set `config.type: "stdio"`, `command` and optional `args, cwd, env`. A configured absolute `cwd` applies to discovery and invocation. For HTTP or SSE set `config.type: "streamable-http" | "sse"`, `url` and optional `headers, timeout`. `timeout` is an integer from 1 to 30 seconds. Resubmit a stored secret as `null` to retain it, supply a value to replace it, or omit the key to remove it. Header key matching is case-insensitive. Windows uses DPAPI for the saved configuration.
 
-Skills accept ZIP with exactly one SKILL.md and reference files. Enabled instructions are low-trust L3 reference data. `read_skill_file(skill_id,path,offset=0)` pages UTF-8 references, 8,000 characters with `next_offset`. Importing/enabling never runs bundled scripts. Imported executable tools are Work-only and require approval; Skill reference reads are read-only in both modes; disabling revokes execution, and changed definitions change their tool identifiers. Windows uses DPAPI to protect the saved configuration.
+New tests, refreshes and enabled form saves require explicit `confirmed: true` through the existing authenticated local API. The client performs MCP initialization and tool discovery. A probe returns `{ok, response_status, tool_count, tools, code, message, http_status, connector}`. `response_status` is `tools_listed` or `failed`. When the endpoint rejects the request, the response can include its HTTP status. Tests preserve saved definitions and enablement. Refresh saves discovered definitions and preserves enablement. When a refresh or enabled save fails, the previous configuration remains registered. Connection state describes the last check in the current process. After a restart, enabled services are `unchecked` until checked. Agent-triggered calls still require Runtime approval in Work mode. An MCP edit changes its tool identity so earlier approvals cannot invoke the edited service.
 
-Errors retain `{code,message,request_id}`: 404 `CONNECTOR_NOT_FOUND`, 409 `CONNECTOR_EXISTS`, 413 `CONNECTOR_TOO_LARGE`, 422 `CONNECTOR_INVALID` / `CONNECTOR_LIMIT` / `VALIDATION_ERROR`, 502 `CONNECTOR_CONNECTION_FAILED`. Limits: 10 MiB import, 20 MiB / 512 extracted entries, 64 imported items and 64 enabled imported tools; 8 enabled skills with 64,000 instruction characters combined.
+A Skill form accepts `{name, description?, instructions, enabled?, revision?, files?, remove_files?}`. Each new file is `{name, data}`, with a plain filename and base64-encoded bytes. The server writes files below `references/`, generates YAML front matter and stores a replacement bundle through the existing registry. `remove_files` contains existing reference paths. Saved ZIP skills can be edited in place by connector ID. Enabled instructions are low-trust reference data. `read_skill_file(skill_id,path,offset=0)` reads UTF-8 references up to 1 MiB in 8,000-character pages. Creating, importing and enabling Skills do not execute bundled scripts.
+
+Local tools still accept JSON or ZIP with `tool.json`. The command uses JSON stdin/stdout, the active workspace as cwd and `${plugin}` for its bundle directory. MCP import accepts `mcpServers` with stdio or HTTP settings. Skill ZIPs must contain one `SKILL.md`. Imports start disabled, and names for newly added MCP services and Skills must be unique within their kind.
+
+Validation and persistence errors use `{code,message,request_id}`, including 404 `CONNECTOR_NOT_FOUND`, 409 `CONNECTOR_EXISTS`, `CONNECTOR_CHANGED` or `CONFIRMATION_REQUIRED`, 413 `CONNECTOR_TOO_LARGE` and 422 `CONNECTOR_INVALID` or `VALIDATION_ERROR`. The legacy enable endpoint retains `CONNECTOR_LIMIT` and `CONNECTOR_CONNECTION_FAILED`. Limits include 10 MiB per import or new references, 20 MiB and 512 entries per bundle, 64 imported or form-created items, 64 enabled imported tools and 8 enabled Skills with 64,000 combined instruction characters.
 
 ## Unified tool contract
 
@@ -322,8 +336,9 @@ Default desktop tools: 10 in Work, 8 in Chat; `read_skill_file` is conditional,
 Hidden aliases never appear in the visible tool lists.
 `workspace_delete` is reviewed in both Chat and Work: paths are workspace-confined,
 links and roots are rejected, and recursive targets are revalidated at execution time.
-Connector records additionally expose `risk`, `platforms`, `available` and per-tool
-`capabilities`; credential/configuration fields remain private.
+Connector list records include `risk`, `platforms`, `available` and per-tool
+`capabilities`. The authenticated detail route supplies editable settings with stored
+header and environment values masked.
 
 ### DeepSeek Search
 

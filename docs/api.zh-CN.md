@@ -111,7 +111,7 @@ superseded_by, scoring_version`。状态为 `active/archived/superseded/invalida
 不复制正文。直接身份问答跳过生成，从有效全局身份事实直答；缺失、待学习、待确认、冲突、关闭、
 读取失败分别提示。
 
-`/runtime` 返回 `storage_version` 和 `data_epoch`。Slothy 0.1.5 在打开已有业务库前核验结构。
+`/runtime` 返回 `storage_version` 和 `data_epoch`。Slothy 0.1.6 在打开已有业务库前核验结构。
 需要恢复时，普通路由返回 `503 STORAGE_RECOVERY_REQUIRED`，存储恢复接口仍可调用。恢复动作
 返回 `restart_required: true` 时，在重启后端后生效。
 
@@ -260,20 +260,34 @@ curl "http://127.0.0.1:8000/api/v1/profile/versions?limit=20"
 
 ## 9. 连接器
 
+表中路径以 `/api/v1` 为前缀。
+
 | 方法 | 路径 | 请求 | 成功响应 |
 | --- | --- | --- | --- |
 | GET | `/connectors` | 无 | `200 {items: Connector[]}` |
+| GET | `/connectors/{id}` | 无 | `200 {item, tools, mcp, skill}` |
 | POST | `/connectors/import?kind=local\|mcp\|skill&filename=...` | `application/octet-stream` 原始文件 | `201 {items: Connector[]}`，默认关闭 |
-| PATCH | `/connectors/{id}` | `{enabled: boolean}`，不接受字符串布尔值 | `200 Connector` |
-| DELETE | `/connectors/{id}` | 无，仅可移除导入项 | `204` |
+| PATCH | `/connectors/{id}` | `{enabled: boolean, revision?: string}` | `200 Connector` |
+| DELETE | `/connectors/{id}` | 导入项或表单创建项 | `204` |
+| POST | `/connectors/mcp` | MCP 表单 | `201 Connector` |
+| PUT | `/connectors/{id}/mcp` | MCP 表单 | `200 Connector` |
+| POST | `/connectors/mcp/test` | `{config, confirmed, connector_id?, revision?}` | `200 MCPResult` |
+| POST | `/connectors/{id}/test` | `{confirmed, revision?}` | `200 MCPResult` |
+| POST | `/connectors/{id}/refresh` | `{confirmed, revision?}` | `200 MCPResult`，成功时含更新后的 `connector` |
+| POST | `/connectors/skills` | Skill 表单 | `201 Connector` |
+| PUT | `/connectors/{id}/skill` | Skill 表单 | `200 Connector` |
 
-Connector 字段为 `id, kind, name, description, enabled, builtin, tools, transport, file_count`；不公开命令配置、环境变量、headers、凭证或解压路径。
+列表保留 `id, kind, name, description, enabled, builtin, tools, transport, file_count, risk, platforms, available, capabilities`。新增可选字段 `revision`、Skill 的 `reference_count`、MCP 的 `connection_status`。详情响应使用 `Cache-Control: no-store`。工具定义包含 `name, description, input_schema`。MCP 详情返回编辑字段，已保存的环境变量和请求头仅返回键名及 `null` 值。Skill 详情包含完整 `markdown`、可编辑 `instructions` 和相对 SKILL.md 的参考文件路径。
 
-本地工具支持 JSON 或含 `tool.json` 的 ZIP：`{name,description,command,args,input_schema}`。程序在当前工作目录运行，以 JSON stdin/stdout 通信；ZIP 中 `${plugin}` 指向清单目录。需预先安装解释器和依赖。MCP 接受标准 `{mcpServers:{name:{command,args,env}}}` 或 `{mcpServers:{name:{url,type,headers}}}`，HTTP type 为 `streamable-http` 或旧 `sse`。Skill ZIP 包含一个 `SKILL.md` 及参考文件，启用后按需注入，`read_skill_file(skill_id,path,offset=0)` 每次返回 8,000 字符与 `next_offset`；导入/启用不会执行脚本。
+MCP 表单接受 `{name, description?, enabled?, revision?, config, confirmed?}`。stdio 使用 `config.type: "stdio"` 和 `command`，可选 `args, cwd, env`。绝对路径 `cwd` 同时用于发现和调用。HTTP 或 SSE 使用 `config.type: "streamable-http" | "sse"` 和 `url`，可选 `headers, timeout`，超时可设为 1 至 30 秒的整数。提交 `null` 保留已存值，提交新值可替换，省略键可删除。请求头键名按大小写不敏感匹配。Windows 使用 DPAPI 保护保存的配置。
 
-新增项默认关闭。MCP 开启时真实连接获取工具，失败保持原状态；关闭再开启可刷新定义。每个导入工具在聊天和工作模式均受审批约束；禁用撤销旧调用，定义改变会改变工具标识。凭证由 Windows DPAPI 保护。
+测试、刷新和保存时启用均使用原有本地认证，并要求显式 `confirmed: true`。MCP 客户端实际完成初始化和工具发现。探测响应为 `{ok, response_status, tool_count, tools, code, message, http_status, connector}`，其中 `response_status` 为 `tools_listed` 或 `failed`，端点拒绝请求时可返回 HTTP 状态码。测试保留原有工具定义与启用状态。刷新保存发现的定义，保留启用状态。刷新或启用保存失败时保留原有记录。连接状态取当前进程最近一次检查结果，应用重启后启用的服务先显示待验证。Agent 在工作模式调用 MCP 工具时仍需 Runtime 审批。编辑 MCP 会更新工具标识，避免旧审批作用于编辑后的连接。
 
-错误沿用 `{code,message,request_id}`：404 `CONNECTOR_NOT_FOUND`；409 `CONNECTOR_EXISTS`；413 `CONNECTOR_TOO_LARGE`；422 `CONNECTOR_INVALID` / `CONNECTOR_LIMIT` / `VALIDATION_ERROR`；502 `CONNECTOR_CONNECTION_FAILED`。最大上传 10 MiB、解压 20 MiB / 512 项、64 个导入项、64 个同时启用的导入工具；Skill 最多启用 8 个、指导合计 64,000 字符。
+Skill 表单接受 `{name, description?, instructions, enabled?, revision?, files?, remove_files?}`。新文件为 `{name, data}`，只接受文件名，内容使用 base64 编码。服务端将文件写入 `references/`，生成 YAML Front Matter，并通过原有注册表提交替换后的技能包。`remove_files` 为待移除的现有参考路径。已导入的 Skill 可用原 ID 编辑。启用后的指令作为低信任度参考进入提示词。`read_skill_file(skill_id,path,offset=0)` 读取不超过 1 MiB 的 UTF-8 文本，每页 8,000 字符。创建、导入和启用 Skill 均不执行包内脚本。
+
+本地工具继续支持 JSON 和 ZIP 内的 `tool.json`，程序在当前工作目录使用 JSON stdin/stdout，`${plugin}` 表示包目录。MCP 继续支持标准 `mcpServers` JSON，Skill ZIP 需包含一个 `SKILL.md`。导入后默认关闭，新添加的 MCP 和 Skill 在同类型中需使用唯一名称。
+
+校验与持久化错误沿用 `{code,message,request_id}`。主要状态包括 404 `CONNECTOR_NOT_FOUND`，409 `CONNECTOR_EXISTS`、`CONNECTOR_CHANGED` 或 `CONFIRMATION_REQUIRED`，413 `CONNECTOR_TOO_LARGE`，422 `CONNECTOR_INVALID` 或 `VALIDATION_ERROR`。原启用接口保留 `CONNECTOR_LIMIT` 和 `CONNECTOR_CONNECTION_FAILED`。单次导入或新增参考文件上限为 10 MiB，每包最多 512 项和 20 MiB，最多保存 64 个连接器、同时启用 64 个导入或表单创建的工具及 8 个 Skill，启用的 Skill 指令合计最多 64,000 字符。
 
 ## 统一工具契约
 
@@ -284,8 +298,8 @@ Connector 字段为 `id, kind, name, description, enabled, builtin, tools, trans
 `deprecated_tools`。默认桌面端 Work 10 个、Chat 8 个内置工具；Skill 引用读取按启用状态提供，
 `deepseek_search` 仅在解析到搜索密钥后出现，`web_fetch` 为可选项，隐藏旧名不进入可见清单。
 `workspace_delete` 在 Chat/Work 均需审批：路径限制在工作区，拒绝链接与根目录，执行时复验
-递归目标。连接器增加 `risk/platforms/available` 与逐工具 `capabilities`；配置、凭据、
-环境变量和包路径不公开。
+递归目标。连接器列表包含 `risk/platforms/available` 与逐工具 `capabilities`。
+已认证的详情接口提供编辑字段，并隐藏已保存的环境变量值和请求头值。
 
 ### DeepSeek 搜索
 

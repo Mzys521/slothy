@@ -7,7 +7,7 @@
 <p align="center"><em>小步迭代，迈向更好未来</em></p>
 
 <p align="center">
-  <img alt="版本 0.1.5" src="https://img.shields.io/badge/version-0.1.5-60DD06" />
+  <img alt="版本 0.1.6" src="https://img.shields.io/badge/version-0.1.6-60DD06" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-95611F" />
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB" />
   <img alt="electron" src="https://img.shields.io/badge/electron-45-47848F" />
@@ -23,8 +23,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.5"><strong>下载 Slothy 0.1.5 正式版（Windows x64）</strong></a> ·
-  <a href="docs/releases/0.1.5.md#简体中文">发布说明</a> ·
+  <a href="https://github.com/Mzys521/slothy/releases/tag/v0.1.6"><strong>下载 Slothy 0.1.6 正式版（Windows x64）</strong></a> ·
+  <a href="docs/releases/0.1.6.md#简体中文">发布说明</a> ·
   <a href="CHANGELOG.md">更新日志</a>
 </p>
 
@@ -46,9 +46,9 @@
 FTS5、别名与一跳关联检索无需 embedding 服务。手动编辑和自动学习写同一事实结构，更正
 撤销旧版本；直接身份问答使用可靠事实直答。上下文面板显示实际提供的证据与未召回原因。
 
-Slothy 0.1.5 会在打开已有数据库前核验存储结构。兼容数据可直接读取，需要处理时会提示用户
+Slothy 0.1.6 会在打开已有数据库前核验存储结构。兼容数据可直接读取，需要处理时会提示用户
 选择恢复方式。通过该提示升级兼容的旧数据时，应用会先创建并验证备份。
-升级与安装包信息见 [0.1.5 发布说明](docs/releases/0.1.5.md#简体中文)。
+升级与安装包信息见 [0.1.6 发布说明](docs/releases/0.1.6.md#简体中文)。
 
 ## 为什么是 Slothy
 
@@ -76,8 +76,11 @@ Slothy 0.1.5 会在打开已有数据库前核验存储结构。兼容数据可�
   插件时自动去掉搜索重试，不影响正常对话。
 - **高危工具统一审批**：模型不得用自然语言询问确认，必须直接调用工具，由运行时立即暂停并
   展示审批弹窗；拒绝写入 `USER_DENIED`，在审计/活动中记为 rejected，且不得重试或绕过。
-- **拖拽上传附件**：可将 TXT、Markdown、PDF、DOCX、JSON、CSV 等文档拖入对话；数量/大小/类型
-  错误会明确提示且不中断本轮；PDF 文本使用有界解析器提取。
+- **任务产物**：已完成的回复下方列出本轮写入或生成的文件。桌面端可点击卡片打开原文件。
+- **上下文监控**：关联记忆、环境上下文和已装载工具以卡片呈现。工作详情显示估算输入环形图、
+  Provider 实际用量和可展开的调用明细。
+- **读取文档**：可将 PDF、DOCX、PPTX 或 UTF-8 文件拖入对话，也可以用 `@` 引用工作区文件。
+  扫描版 PDF 请先做 OCR，旧版 `.doc` 或 `.ppt` 文件请先另存为 `.docx` 或 `.pptx`。
 - **审批后删除**：`workspace_delete` 为 Chat/Work 高风险工具；路径规范化且限制在工作区，
   拒绝符号链接、根目录与私有路径，递归删除需明确审批，执行时再次校验目标。
 - **清除本地数据**：设置 → 关于 Slothy → 本地数据，在输入准确「确认删除」后清理会话、记忆、
@@ -90,8 +93,8 @@ Slothy 0.1.5 会在打开已有数据库前核验存储结构。兼容数据可�
 - **首次启动引导**：居中的主题自适应液态玻璃引导层，提供内置服务商模板（DeepSeek、MiMo、
   OpenAI、Anthropic、Kimi、Qwen）与自定义连接两条路径；仅在未配置服务商时出现，读取失败显示
   重试而不是误判为未配置。
-- **连接器**：导入本地工具（JSON/ZIP）、MCP 服务（stdio、Streamable HTTP、兼容 SSE）与
-  Skills（含 `SKILL.md` 的 ZIP）。启用时通过真实连接发现工具；导入工具调用需审批，停用立即撤销执行。
+- **连接器**：用表单配置和测试 stdio、Streamable HTTP、SSE MCP 服务，或创建带 Markdown 指令
+  和参考文件的 Skill。继续支持 JSON／ZIP 导入，可查看工具定义。Agent 调用导入工具须经审批。
 - **消息预览与复制**：SVG/HTML 预览按会话宽度与内容高度渲染并跟随实时主题；每条消息的复制走
   原生剪贴板桥，浏览器环境自动回退。
 - **外观**：默认思洛绿，支持带 HEX 校验的持久自定义强调色与亮/暗可读对比度，欢迎页可切换语言。
@@ -196,7 +199,7 @@ npm run production:audit                  # 打包资源白名单审查
 | 架构 | [architecture.md](docs/architecture.md) | [architecture.zh-CN.md](docs/architecture.zh-CN.md) |
 | 快速开始 | [getting-started.md](docs/getting-started.md) | [getting-started.zh-CN.md](docs/getting-started.zh-CN.md) |
 | API 参考 | [api.md](docs/api.md) | [api.zh-CN.md](docs/api.zh-CN.md) |
-| 0.1.5 发布说明 | [English](docs/releases/0.1.5.md#english) | [简体中文](docs/releases/0.1.5.md#简体中文) |
+| 0.1.6 发布说明 | [English](docs/releases/0.1.6.md#english) | [简体中文](docs/releases/0.1.6.md#简体中文) |
 | 品牌规范 | [brand.md](docs/brand.md) | [brand.md](docs/brand.md#中文) |
 | 更新日志 | [CHANGELOG.md](CHANGELOG.md) | [CHANGELOG.md](CHANGELOG.md) |
 

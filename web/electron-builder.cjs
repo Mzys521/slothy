@@ -17,6 +17,7 @@ module.exports = {
     'electron/main.cjs',
     'electron/backend.cjs',
     'electron/directory.cjs',
+    'electron/open-artifact.cjs',
     'electron/preload.cjs',
     'electron/purge.cjs',
     'electron/assets/**/*',

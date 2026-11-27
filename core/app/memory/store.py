@@ -249,19 +249,64 @@ class MemoryStore(WorkspaceStore):
             selected.append(item)
         return sorted(selected, key=lambda r: (-r["retrieval_score"], r["id"]))[:limit]
 
+    async def set_link(self, user_id, source, target, relation, relevance, directed=False):
+        """Link active facts or visible concepts without changing legacy fact links."""
+        link = await super().set_link(user_id, source, target, relation, relevance, directed)
+        if link is not None:
+            return link
+        if not directed:
+            source, target = sorted((source, target))
+        async with self.connection.execute(
+            """WITH endpoints AS (
+                   SELECT id FROM workspace_memories WHERE user_id=? AND status='active'
+                     AND id IN (?,?)
+                   UNION
+                   SELECT c.id FROM memory_concepts c
+                   JOIN memory_fact_concepts f ON f.concept_id=c.id
+                   JOIN workspace_memories m ON m.id=f.memory_id AND m.user_id=c.user_id
+                   WHERE c.user_id=? AND c.id IN (?,?) AND m.status='active'
+               )
+               INSERT INTO memory_graph_links
+                   (user_id,source_id,target_id,relation,relevance,directed)
+               SELECT ?,?,?,?,?,? WHERE (SELECT count(*) FROM endpoints)=2
+               ON CONFLICT(user_id,source_id,target_id,directed) DO UPDATE SET
+                   relation=excluded.relation, relevance=excluded.relevance
+               RETURNING source_id,target_id,relation,relevance,directed,'manual' AS origin""",
+            (
+                user_id, source, target, user_id, source, target,
+                user_id, source, target, relation, relevance, directed,
+            ),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
+
+    async def delete_link(self, user_id, source, target, directed=False):
+        """Remove only the chosen manual link."""
+        if not directed:
+            source, target = sorted((source, target))
+        async with self.connection.execute(
+            """DELETE FROM memory_graph_links
+               WHERE user_id=? AND source_id=? AND target_id=? AND directed=?""",
+            (user_id, source, target, directed),
+        ) as cursor:
+            if cursor.rowcount:
+                return True
+        return await super().delete_link(user_id, source, target, directed)
+
     async def graph(self, user_id, limit, focus=None, *, thread_id="", project_id=None):
-        """Semantic edges are fact projections; manual links remain separately identified.
-        / 语义边直接投影事实，手动关联保留独立来源标记。"""
-        facts = [
-            await self.decorate(row)
+        """Project recorded facts, concept membership and user-created links."""
+        facts = {
+            row["id"]: await self.decorate(row)
             for row in await self.rows(
                 "SELECT * FROM workspace_memories WHERE user_id=? AND status='active' ORDER BY id",
                 (user_id,),
             )
             if scope_allowed(row["scope"], row["scope_ref"], thread_id, project_id)
-        ]
+        }
         nodes, edges = {}, []
-        for fact in facts:
+        fact_members = {}
+        for fact in facts.values():
+            members = []
             for cid in fact["concept_ids"]:
                 if cid not in nodes:
                     concept = await self.concept(user_id, cid, thread_id, project_id)
@@ -281,8 +326,11 @@ class MemoryStore(WorkspaceStore):
                         }
                 if cid in nodes:
                     nodes[cid]["fact_ids"].append(fact["id"])
+                    members.append(cid)
+            fact_members[fact["id"]] = members
             source, target = fact["source_concept_id"], fact["target_concept_id"]
-            if source and target and source != target:
+            has_relation = source in members and target in members and source != target
+            if has_relation:
                 edges.append(
                     {
                         "id": fact["id"],
@@ -306,38 +354,58 @@ class MemoryStore(WorkspaceStore):
                         ],
                     }
                 )
-            if not fact["concept_ids"]:
-                nodes[fact["id"]] = {
-                    "id": fact["id"],
-                    "label": fact["title"],
-                    "type": fact["type"],
-                    "importance": fact["importance"],
-                    "node_kind": "fact",
-                    "fact_ids": [fact["id"]],
-                    "effective_frequency": fact["effective_frequency"],
-                    "strength": fact["strength"],
-                }
-        active_ids = {f["id"] for f in facts}
-        manual = await super().graph(user_id, 100000)
-        for edge in manual["edges"]:
-            if edge["source"] in active_ids and edge["target"] in active_ids:
-                for mid in (edge["source"], edge["target"]):
-                    fact = next(f for f in facts if f["id"] == mid)
-                    nodes.setdefault(
-                        mid,
-                        {
-                            "id": mid,
-                            "label": fact["title"],
-                            "type": fact["type"],
-                            "importance": fact["importance"],
-                            "node_kind": "fact",
-                            "fact_ids": [mid],
-                        },
-                    )
-                edges.append(edge)
-        focus_ids = {focus} | {cid for f in facts if f["id"] == focus for cid in f["concept_ids"]}
+            if not has_relation or len(members) > 2:
+                nodes[fact["id"]] = self._fact_node(fact)
+        links = await self.rows(
+            """SELECT l.source_id AS source,l.target_id AS target,
+                      l.relation,l.relevance,l.directed,l.origin
+               FROM workspace_memory_links l JOIN workspace_memories m ON m.id=l.source_id
+               WHERE m.user_id=? AND l.suppressed=0
+               UNION ALL
+               SELECT source_id,target_id,relation,relevance,directed,'manual'
+               FROM memory_graph_links WHERE user_id=?""",
+            (user_id, user_id),
+        )
+        for edge in links:
+            endpoints = (edge["source"], edge["target"])
+            if all(identifier in facts or identifier in nodes for identifier in endpoints):
+                for identifier in endpoints:
+                    if identifier in facts and identifier not in nodes:
+                        nodes[identifier] = self._fact_node(facts[identifier])
+                edges.append({**edge, "directed": bool(edge["directed"])})
+        # Membership is explicit stored evidence, even when no binary predicate was extracted.
+        for fact_id, members in fact_members.items():
+            if fact_id in nodes:
+                edges.extend(
+                    {
+                        "id": f"membership:{fact_id}:{concept_id}",
+                        "fact_id": fact_id,
+                        "source": fact_id,
+                        "target": concept_id,
+                        "relation": "has_concept",
+                        "relevance": facts[fact_id]["importance"],
+                        "directed": False,
+                        "origin": "membership",
+                    }
+                    for concept_id in members
+                )
+        anchors = {focus, *fact_members.get(focus, [])}
+        connected = {identifier for e in edges for identifier in (e["source"], e["target"])}
+        nearby = anchors | {
+            identifier
+            for e in edges
+            if e["source"] in anchors or e["target"] in anchors
+            for identifier in (e["source"], e["target"])
+        }
         ordered = sorted(
-            nodes.values(), key=lambda n: (n["id"] not in focus_ids, -n["importance"], n["id"])
+            nodes.values(),
+            key=lambda n: (
+                n["id"] != focus,
+                n["id"] not in nearby,
+                n["id"] not in connected,
+                -n["importance"],
+                n["id"],
+            ),
         )[:limit]
         included = {n["id"] for n in ordered}
         return {
@@ -346,6 +414,22 @@ class MemoryStore(WorkspaceStore):
             "total": len(nodes),
             "truncated": len(nodes) > limit,
             "limit": limit,
+        }
+
+    @staticmethod
+    def _fact_node(fact):
+        return {
+            "id": fact["id"],
+            "label": fact["title"],
+            "type": fact["type"],
+            "importance": fact["importance"],
+            "node_kind": "fact",
+            "concept_kind": None,
+            "scope": fact["scope"],
+            "scope_ref": fact["scope_ref"],
+            "fact_ids": [fact["id"]],
+            "effective_frequency": fact["effective_frequency"],
+            "strength": fact["strength"],
         }
 
     async def metrics(self, user):

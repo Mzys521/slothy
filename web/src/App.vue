@@ -601,11 +601,7 @@ onUnmounted(() => {
       </SettingsLayout>
       <ChatPage v-if="conversationPage" :key="conversationGeneration" :memory-id="page === 'memory-detail' ? selectedMemory : undefined"
         @memory="openMemory" @evidence="openEvidence" @close-context="navigate(memoryOrigin)"
-        @memory-review="navigate('memories')">
-        <template #memory-actions>
-          <button v-if="selectedMemory" type="button" class="text-link" @click="openGraph(selectedMemory)">{{ t('Open in Graph', '在图谱中打开') }}</button>
-        </template>
-      </ChatPage>
+        @graph="openGraph" @memory-review="navigate('memories')" />
 
       <ServerCollection v-if="page === 'plugins' || page === 'library'" :key="page" :kind="page" />
       <MemoryPage v-else-if="page === 'memories'" @memory="openMemory" @evidence="openEvidence" />

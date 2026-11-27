@@ -4,6 +4,7 @@
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -39,9 +40,11 @@ def proposal(name="report.txt"):
     )
 
 
-def build_app(tmp_path):
+def build_app(tmp_path, responses=None):
     """Build an offline app with builtin work tools. / 构建带内置工作工具的离线应用。"""
-    model = Model(responses=[proposal(), AIMessage(content="Exported."), proposal("two.txt")])
+    if responses is None:
+        responses = [proposal(), AIMessage(content="Exported."), proposal("two.txt")]
+    model = Model(responses=responses)
     return create_app(
         checkpoint_settings=CheckpointSettings(
             sqlite_path=tmp_path / "artifacts.sqlite", _env_file=None
@@ -87,6 +90,8 @@ def test_artifact_survives_moving_the_session_to_another_workspace(tmp_path):
         thread, artifact = export_artifact(client, thread)
         before = client.get(artifact["url"])
         assert before.status_code == 200 and before.content
+        location = client.get(artifact["url"] + "/location").json()["path"]
+        assert Path(location).is_relative_to(first.resolve())
         moved = client.patch(BASE + f"/threads/{thread}", json={"workspace_id": other})
         assert moved.status_code == 200, moved.text
         # The link still points at the producing session and the producing workspace.
@@ -94,6 +99,7 @@ def test_artifact_survives_moving_the_session_to_another_workspace(tmp_path):
         after = client.get(artifact["url"])
         assert after.status_code == 200
         assert after.content == before.content
+        assert client.get(artifact["url"] + "/location").json()["path"] == location
 
 
 def test_forked_session_keeps_the_inherited_artifact_after_source_delete(tmp_path):
@@ -101,6 +107,8 @@ def test_forked_session_keeps_the_inherited_artifact_after_source_delete(tmp_pat
     with TestClient(app) as client:
         thread = client.post(BASE + "/threads", json={"mode": "work"}).json()["thread_id"]
         thread, artifact = export_artifact(client, thread)
+        original = client.get(artifact["url"])
+        location = client.get(artifact["url"] + "/location").json()["path"]
         fork = client.post(
             BASE + f"/threads/{thread}/fork", json={"title": "Forked"}
         ).json()["thread_id"]
@@ -109,7 +117,12 @@ def test_forked_session_keeps_the_inherited_artifact_after_source_delete(tmp_pat
             BASE + f"/threads/{fork}/artifacts/{artifact['id']}"
         )
         assert inherited.status_code == 200
-        assert inherited.content == client.get(artifact["url"]).content or True
+        assert inherited.content == original.content
+        inherited_location = client.get(
+            BASE + f"/threads/{fork}/artifacts/{artifact['id']}/location"
+        )
+        assert inherited_location.status_code == 200, inherited_location.text
+        assert inherited_location.json()["path"] == location
     # Deleting the source never deletes the workspace file it produced.
     assert any(path.name.endswith(".txt") for path in tmp_path.rglob("*.txt"))
 
@@ -125,6 +138,43 @@ def test_unrelated_session_cannot_read_a_registered_artifact(tmp_path):
         blocked = client.get(BASE + f"/threads/{foreign}/artifacts/{artifact['id']}")
         assert blocked.status_code == 404
         assert blocked.json()["code"] == "ARTIFACT_UNAVAILABLE"
+        location = BASE + f"/threads/{foreign}/artifacts/{artifact['id']}/location"
+        assert client.get(location).status_code == 404
+
+
+def test_written_file_location_is_restored_from_history_and_tracks_edits(tmp_path):
+    directory = tmp_path / "workspace"
+    directory.mkdir()
+    file = directory / "changes.md"
+    write = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "workspace_write", "id": "write-changes",
+            "args": {"action": "write_file", "path": file.name, "content": "First version"},
+        }],
+    )
+    app = build_app(tmp_path, [write, AIMessage(content="Wrote the file.")])
+    with TestClient(app) as client:
+        workspace = client.post(
+            BASE + "/workspaces", json={"name": "Documents", "directory": str(directory)}
+        ).json()["id"]
+        thread = client.post(BASE + "/threads", json={
+            "mode": "work", "workspace_id": workspace
+        }).json()["thread_id"]
+        thread, artifact = export_artifact(client, thread, message="Write changes.md")
+        completed = client.get(BASE + f"/threads/{thread}/messages").json()["items"][0]
+        recorded = next(item for item in completed["activity"] if item["name"] == "workspace_write")
+        assert recorded["status"] == "done" and recorded["artifacts"][0]["id"] == artifact["id"]
+        location = artifact["url"] + "/location"
+        assert client.get(location).json()["path"] == str(file.resolve())
+        browser = client.get(location, headers={"Sec-Fetch-Site": "same-origin"})
+        assert browser.status_code == 403 and "path" not in browser.json()
+
+        file.write_text("Edited in an external editor", encoding="utf-8")
+        assert client.get(location).json()["path"] == str(file.resolve())
+        assert client.get(artifact["url"]).status_code == 404
+        file.unlink()
+        assert client.get(location).status_code == 404
 
 
 def test_retention_keeps_manifests_referenced_by_sessions(tmp_path):

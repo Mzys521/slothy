@@ -10,6 +10,7 @@ const fs = require('node:fs/promises')
 const { fileURLToPath } = require('node:url')
 const { startBackend, stopBackend } = require('./backend.cjs')
 const { selectWorkingDirectory } = require('./directory.cjs')
+const { openArtifact } = require('./open-artifact.cjs')
 const { confirmed, purgeManagedData } = require('./purge.cjs')
 const desktop = require('../desktop.config.cjs')
 const { displayVersion } = require('../package.json')
@@ -313,6 +314,10 @@ app.whenReady().then(async () => {
   // 目录选择保留在主进程，渲染进程只会收到路径。
   ipcMain.handle('desktop:select-directory', async event => {
     return selectWorkingDirectory(dialog, fromWindow(event))
+  })
+  ipcMain.handle('desktop:open-artifact', (event, threadId, artifactId) => {
+    fromWindow(event)
+    return openArtifact(shell, api.origin, backend?.token, threadId, artifactId)
   })
   // Clipboard writes are validated and bounded before reaching the native clipboard.
   // 剪贴板写入在进入原生剪贴板前先做类型与长度校验。
